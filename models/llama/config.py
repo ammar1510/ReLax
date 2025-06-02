@@ -19,7 +19,6 @@ class ModelConfig:
     # Positional Embeddings Config
     max_position_embeddings: int = 131072
     rope_theta: float = 500000.0
-    # rope_type: str = "llama3" # Implicitly handled by RoPE implementation choice later
     # rope_scaling: Optional[Dict] = field(default_factory=lambda: {"type": "dynamic", "factor": 32.0})
     # Note: RoPE scaling details often handled within the RoPE implementation itself based on sequence length,
     # rather than a static config dict. Keeping it simple for now.
@@ -32,6 +31,7 @@ class ModelConfig:
     attention_dropout: float = 0.0
 
     mode:str = "inference"
+
 
     def __post_init__(self):
         # Ensure GQA constraints are met

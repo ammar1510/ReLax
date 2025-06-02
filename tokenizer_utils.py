@@ -27,6 +27,8 @@ class Tokenizer:
     special_tokens: Dict[str, int]
     num_reserved_special_tokens = 256
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+    TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+    MAX_NO_WHITESPACES_CHARS = 25_000
 
     def __init__(self, model_path: str):
         """
@@ -103,14 +105,14 @@ class Tokenizer:
             List[int]: The encoded token IDs.
         """
         assert type(s) is str
-        TIKTOKEN_MAX_ENCODE_CHARS = 400_000
-        MAX_NO_WHITESPACES_CHARS = 25_000
+        # TIKTOKEN_MAX_ENCODE_CHARS = 400_000 # Moved to class attribute
+        # MAX_NO_WHITESPACES_CHARS = 25_000 # Moved to class attribute
 
         substrs = (
             substr
-            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for i in range(0, len(s), self.TIKTOKEN_MAX_ENCODE_CHARS)
             for substr in self._split_whitespaces_or_nonwhitespaces(
-                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+                s[i : i + self.TIKTOKEN_MAX_ENCODE_CHARS], self.MAX_NO_WHITESPACES_CHARS
             )
         )
 
@@ -145,23 +147,36 @@ class Tokenizer:
     def _split_whitespaces_or_nonwhitespaces(
         s: str, max_consecutive_slice_len: int
     ) -> Iterator[str]:
-        """
-        Helper to split strings avoiding Tiktoken limits on consecutive whitespace/non-whitespace chars.
-        """
+        if not s: # Handle empty string case
+            yield ""
+            return
+
         current_slice_len = 0
-        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
+        # Initialize based on the first character.
+        current_slice_is_space = s[0].isspace()
         slice_start = 0
 
         for i in range(len(s)):
             is_now_space = s[i].isspace()
 
-            if current_slice_is_space ^ is_now_space:
-                current_slice_len = 1
-                current_slice_is_space = is_now_space
-            else:
-                current_slice_len += 1
+            if current_slice_is_space ^ is_now_space:  # Type of char changed
+                yield s[slice_start:i]  # Yield the segment that just finished
+                slice_start = i         # New segment starts at i
+                current_slice_len = 1   # Length of new segment is 1 (s[i])
+                current_slice_is_space = is_now_space  # Update type for the new segment
+            else:  # Same type as before
+                # The length of the current segment including s[i] is (i - slice_start + 1)
+                current_slice_len = i - slice_start + 1
                 if current_slice_len > max_consecutive_slice_len:
+                    # Yield the part that has hit max_consecutive_slice_len.
+                    # This is s[slice_start : slice_start + max_consecutive_slice_len].
+                    # Since s[i] is the character that made it (slice_start + max_consecutive_slice_len),
+                    # the end of the slice to yield is i.
                     yield s[slice_start:i]
                     slice_start = i
-                    current_slice_len = 1
-        yield s[slice_start:] 
+                    current_slice_len = 1 # Reset for the new segment starting at i
+                    # current_slice_is_space remains the same for the new segment starting at i
+        
+        # Yield any remaining part of the string
+        if slice_start < len(s):
+            yield s[slice_start:] 

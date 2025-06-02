@@ -2,7 +2,9 @@
 import jax
 import jax.numpy as jnp
 import jax.nn as nn # Ensure nn is imported
+import jax.lax as lax
 from flax import struct
+from jax.experimental.pallas.ops.tpu import flash_attention
 from .kvcache import KVCache # Import KVCache
 
 def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> jnp.ndarray:
@@ -62,7 +64,7 @@ def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndar
     Returns:
         Normalized tensor.
     """
-    output = x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    output = x * lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
     return output * weight
 
 def apply_rotary_emb(
@@ -170,8 +172,8 @@ def grouped_query_attention(
     # Slice freqs_cis for the current position(s)
     # Assuming freqs_cis has shape [2, max_seq_len, head_dim//2]
     current_freqs_cis = (
-        jax.lax.dynamic_slice_in_dim(freqs_cis[0], start_pos, seqlen, axis=0),
-        jax.lax.dynamic_slice_in_dim(freqs_cis[1], start_pos, seqlen, axis=0)
+        lax.dynamic_slice_in_dim(freqs_cis[0], start_pos, seqlen, axis=0),
+        lax.dynamic_slice_in_dim(freqs_cis[1], start_pos, seqlen, axis=0)
     )
     # Pass the sliced freqs to RoPE
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=current_freqs_cis)

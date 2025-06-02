@@ -1,13 +1,11 @@
-# Placeholder for LLaMA model definition using shared modules
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from flax import struct # For KVCache potentially if passed around directly
 from dataclasses import dataclass
 
 # Import the building blocks and KVCache
-from .modules import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
-from .kvcache import KVCache # Assuming kvcache.py exists
+from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
+from utils.kvcache import KVCache # Assuming kvcache.py exists
 
 @dataclass
 class ModelArgs:
@@ -76,7 +74,7 @@ class LLaMA(nn.Module):
         )
         # pass # TODO: Remove pass once other sections are filled -> Removing this
 
-    def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache | None = None):
+    def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
