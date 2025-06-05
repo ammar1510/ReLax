@@ -12,7 +12,7 @@ from typing import (
 )
 
 # Import the Tokenizer class (assuming it stays in tokenizer_utils.py)
-from tokenizer_utils import Tokenizer
+from tokenizer import Tokenizer
 
 # Define types for chat messages, needed by ChatFormat
 Role = Literal["system", "user", "assistant"]

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from models.kvcache import KVCache
+from utils.kvcache import KVCache
 
 class TestKVCache:
     def test_new_cache(self):

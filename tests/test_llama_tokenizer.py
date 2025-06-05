@@ -5,7 +5,7 @@ from typing import List
 
 # Adjust the import path according to your project structure
 # This assumes 'tokenizer_utils.py' is in the parent directory of 'tests'
-from tokenizer_utils import Tokenizer
+from models.llama.tokenizer import Tokenizer
 
 
 # Helper to create a dummy tiktoken file for tests
@@ -28,10 +28,15 @@ def tokenizer_model_path(tmp_path_factory):
     # " "       -> IA==
     # "b"       -> Yg==
     # "c"       -> Yw==
-    # "a"       -> YQ== (Corrected from ZQ==)
+    # "a"       -> YQ== 
+    # "e"       -> ZQ==
+    # "o"       -> bw==
+    # "t"       -> dA==
+    # "eo"      -> ZW8=
+    # "ot"      -> b3Q=
+    # "eot"     -> ZW90
     # "<"       -> PA==
     # "|"       -> fA==
-    # "eot"     -> ZW90
     # "_"       -> Xw==
     # "id"      -> aWQ=
     # ">"       -> Pg==
@@ -43,12 +48,17 @@ IA== 3
 Yg== 4
 Yw== 5
 YQ== 6
-PA== 7
-fA== 8
-ZW90 9
-Xw== 10
-aWQ= 11
-Pg== 12
+ZQ== 7
+bw== 8
+dA== 9
+ZW8= 10
+b3Q= 11
+ZW90 12
+PA== 13
+fA== 14
+Xw== 15
+aWQ= 16
+Pg== 17
 """
     create_dummy_model_file(model_file, content)
     return str(model_file)
@@ -82,8 +92,8 @@ def test_tokenizer_initialization(tokenizer: Tokenizer, tokenizer_model_path: st
     assert len(tokenizer.special_tokens) == expected_num_special_tokens
 
     # Test vocab size (base tokens + special tokens)
-    # The dummy model now has 13 base tokens.
-    num_base_tokens = 13
+    # The dummy model now has 18 base tokens.
+    num_base_tokens = 18
     assert tokenizer.get_vocab_size() == num_base_tokens + len(tokenizer.special_tokens)
     assert tokenizer.vocab_size == num_base_tokens + len(tokenizer.special_tokens)
 
@@ -144,7 +154,7 @@ def test_decode_simple(tokenizer: Tokenizer):
 
 def test_get_vocab_size(tokenizer: Tokenizer):
     """Tests the get_vocab_size method."""
-    num_base_tokens = 13 # Updated to 13 base tokens
+    num_base_tokens = 18 # Updated to 18 base tokens
     expected_num_special_tokens = 10 + (tokenizer.num_reserved_special_tokens - 5 - 5)
     assert tokenizer.get_vocab_size() == num_base_tokens + expected_num_special_tokens
 
@@ -220,7 +230,7 @@ def test_encode_long_string_splitting(tokenizer: Tokenizer):
 
 def test_special_tokens_values(tokenizer: Tokenizer):
     """Test that special token IDs are assigned correctly and are unique."""
-    num_base_tokens = 13 # Updated to 13 base tokens
+    num_base_tokens = 18 # Updated to 18 base tokens
     # Ensure the tokens exist (values are checked for uniqueness below)
     assert "<|begin_of_text|>" in tokenizer.special_tokens
     assert "<|end_of_text|>" in tokenizer.special_tokens
@@ -267,8 +277,8 @@ def test_encode_special_token_handling(tokenizer: Tokenizer):
     # --- UPDATED TEST LOGIC ---
     # Now that '<', '|', 'eot', '_', 'id', '>' are in the dummy vocab,
     # encoding "<|eot_id|>" with allowed_special=set() should succeed and produce their tokens.
-    # String "<|eot_id|>" tokenizes as: '<' (7), '|' (8), 'eot' (9), '_' (10), 'id' (11), then the second '|' (8) from input, then '>' (12).
-    expected_tokens_for_disallowed_special = [7, 8, 9, 10, 11, 8, 12]
+    # String "<|eot_id|>" tokenizes as: '<' (13), '|' (14), 'eot' (12), '_' (15), 'id' (16),'|' (14), '>' (17).
+    expected_tokens_for_disallowed_special = [13, 14, 12, 15, 16, 14, 17]
     actual_tokens = tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special=set())
     assert actual_tokens == expected_tokens_for_disallowed_special
 
@@ -277,14 +287,25 @@ def test_encode_special_token_handling(tokenizer: Tokenizer):
     with pytest.raises(ValueError): # tiktoken.encode raises ValueError if disallowed_special is violated
         tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special="all", disallowed_special={special_token_str})
     
-    with pytest.raises(ValueError):
-        tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special="all", disallowed_special="all")
+    # For the case: allowed_special="all", disallowed_special="all"
+    # USER OBSERVED BEHAVIOR: tiktoken encodes as the special token ID, not as natural text, and does not raise ValueError.
+    encoded_val = tokenizer.encode(
+        special_token_str, # This is "<|eot_id|>"
+        bos=False,
+        eos=False,
+        allowed_special="all",
+        disallowed_special="all"
+    )
+    # special_token_id is tokenizer.eot_id, defined earlier in the test function
+    assert encoded_val == [special_token_id]
+    decoded_val = tokenizer.decode(encoded_val)
+    assert decoded_val == special_token_str
 
     # Test 4: Encoding regular text that happens to look like a special token pattern, when special tokens are not allowed.
-    # The string "<eot>" is different from "<|eot_id|>" and its parts are in the dummy vocab.
     text_like_special = "<eot>"
-    # Expected: '<' (7), 'eot' (9), '>' (12)
-    expected_text_like_special_tokens = [7, 9, 12]
+    # Expected: '<' (13), 'eot' (12), '>' (17)
+    expected_text_like_special_tokens = [13, 12, 17]
+    print(tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set()))
     assert tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set()) == expected_text_like_special_tokens
 
     # Test 5: Behavior with a mix of normal text and special tokens

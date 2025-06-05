@@ -3,7 +3,18 @@ name = "ReLax"
 version = "0.1.0"
 dependencies = [
   "tiktoken",
-  "blobfile",
+  "jax",
+  "flax",
+  "numpy",
+  "safetensors"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest"
+]
+dev = [
+  "ipykernel"
 ]
 
 [tool.setuptools.packages.find]

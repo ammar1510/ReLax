@@ -43,6 +43,9 @@ class Tokenizer:
 
         mergeable_ranks = load_tiktoken_bpe(str(model_path_obj))
         num_base_tokens = len(mergeable_ranks)
+
+        print(mergeable_ranks)
+
         special_tokens = [
             "<|begin_of_text|>",
             "<|end_of_text|>",
@@ -147,6 +150,17 @@ class Tokenizer:
     def _split_whitespaces_or_nonwhitespaces(
         s: str, max_consecutive_slice_len: int
     ) -> Iterator[str]:
+        """
+        Splits a string into segments of consecutive characters that are either all spaces or all non-spaces.
+
+        Args:
+            s (str): The input string.
+            max_consecutive_slice_len (int): The maximum length of a consecutive segment.
+
+        Yields:
+            str: The next segment of the string.
+        """
+
         if not s: # Handle empty string case
             yield ""
             return
