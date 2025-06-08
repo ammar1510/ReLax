@@ -159,14 +159,18 @@ def grouped_query_attention(
         Tuple of (Output tensor after attention, Updated KVCache).
     """
     bsz, seqlen, dim = x.shape
-    head_dim = params.wq.shape[-1] // n_heads # Assuming wq shape [dim, n_heads * head_dim]
+    # Assuming parameters are already shaped correctly.
+    # wq: [dim, n_heads, head_dim]
+    # wk: [dim, n_kv_heads, head_dim]
+    # wv: [dim, n_kv_heads, head_dim]
+    head_dim = params.wq.shape[-1]
 
     # Project inputs to queries, keys, values for the current token(s)
     # Shapes: [bsz, seqlen, n_heads, head_dim] for xq
     # Shapes: [bsz, seqlen, n_kv_heads, head_dim] for xk, xv
-    xq = jnp.einsum('bsd,dhc->bshc', x, params.wq.reshape(dim, n_heads, head_dim))
-    xk = jnp.einsum('bsd,dkc->bskc', x, params.wk.reshape(dim, n_kv_heads, head_dim))
-    xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv.reshape(dim, n_kv_heads, head_dim))
+    xq = jnp.einsum('bsd,dhc->bshc', x, params.wq)
+    xk = jnp.einsum('bsd,dkc->bskc', x, params.wk)
+    xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv)
 
     # Apply rotary positional embeddings to the new queries and keys
     # Slice freqs_cis for the current position(s)
