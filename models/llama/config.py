@@ -9,15 +9,15 @@ class ModelConfig:
 
     # Architecture Config
     vocab_size: int = 128256
-    hidden_size: int = 3072
-    intermediate_size: int = 8192  # FFN expansion size
-    num_layers: int = 28
-    num_attention_heads: int = 24
-    num_key_value_heads: int = 8  # Grouped Query Attention
-    hidden_act: str = "silu"
+    dim: int = 3072
+    ffn_hidden_dim: int = 8192  # FFN expansion size
+    n_layers: int = 28
+    n_heads: int = 24
+    n_kv_heads: int = 8  # Grouped Query Attention
+    activation_fn: str = "silu"
 
     # Positional Embeddings Config
-    max_position_embeddings: int = 131072
+    max_seq_len: int = 131072
     rope_theta: float = 500000.0
     # rope_scaling: Optional[Dict] = field(default_factory=lambda: {"type": "dynamic", "factor": 32.0})
     # Note: RoPE scaling details often handled within the RoPE implementation itself based on sequence length,
@@ -27,21 +27,20 @@ class ModelConfig:
     rms_norm_eps: float = 1e-05
 
     # Attention Config
-    # head_dim is calculated: hidden_size // num_attention_heads = 3072 // 24 = 128
-    attention_dropout: float = 0.0
+    # head_dim is calculated: dim // n_heads = 3072 // 24 = 128
 
     mode:str = "inference"
 
 
     def __post_init__(self):
         # Ensure GQA constraints are met
-        if self.num_attention_heads % self.num_key_value_heads != 0:
+        if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
-                f"num_key_value_heads ({self.num_key_value_heads})"
+                f"n_heads ({self.n_heads}) must be divisible by "
+                f"n_kv_heads ({self.n_kv_heads})"
             )
 
     @property
     def head_dim(self) -> int:
         """Dimension of each attention head."""
-        return self.hidden_size // self.num_attention_heads 
+        return self.dim // self.n_heads

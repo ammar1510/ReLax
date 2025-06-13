@@ -44,8 +44,6 @@ class Tokenizer:
         mergeable_ranks = load_tiktoken_bpe(str(model_path_obj))
         num_base_tokens = len(mergeable_ranks)
 
-        print(mergeable_ranks)
-
         special_tokens = [
             "<|begin_of_text|>",
             "<|end_of_text|>",

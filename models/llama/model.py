@@ -6,28 +6,10 @@ from dataclasses import dataclass
 # Import the building blocks and KVCache
 from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
 from utils.kvcache import KVCache # Assuming kvcache.py exists
-
-@dataclass
-class ModelArgs:
-    dim: int = 3072
-    n_layers: int = 32
-    n_heads: int = 24
-    n_kv_heads: int | None = 8 # Use None for MHA, specify for GQA/MQA
-    vocab_size: int = 128256 
-    ffn_hidden_dim: int = 8192 
-    activation_fn: str = 'silu' # Added: 'silu', 'relu', 'gelu', etc.
-    rms_norm_eps: float = 1e-5
-    rope_theta: float = 500000.0
-    max_seq_len: int = 2048 # Max sequence length for precomputed freqs & KV cache
-
-    def __post_init__(self):
-        if self.n_kv_heads is None:
-            self.n_kv_heads = self.n_heads
-        assert self.dim % self.n_heads == 0
-        self.head_dim = self.dim // self.n_heads
+from .config import ModelConfig
 
 class TransformerBlock(nn.Module):
-    args: ModelArgs
+    args: ModelConfig
 
     def setup(self):
         # Attention parameters
@@ -75,7 +57,7 @@ class TransformerBlock(nn.Module):
 
 
 class LLaMA(nn.Module):
-    args: ModelArgs
+    args: ModelConfig
 
     def setup(self):
         # Token embeddings
