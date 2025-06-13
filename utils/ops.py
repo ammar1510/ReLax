@@ -84,7 +84,7 @@ def apply_rotary_emb(
         Tuple of query and key tensors with applied RoPE.
     """
     # xq_ and xk_ have shape [batch_size, seq_len, n_heads, head_dim]
-    # freqs_cis has shape [seq_len, head_dim // 2 * 2] or similar complex format
+    # freqs_cis has shape [2, seq_len, head_dim // 2]
 
     # Reshape xq and xk to view the last dimension as pairs of real/imaginary parts
     xq_r, xq_i = jnp.split(xq, 2, axis=-1)
@@ -94,12 +94,13 @@ def apply_rotary_emb(
     # Input freqs_cis shape: (2, seq_len_slice, head_dim // 2)
     # Need to broadcast to: (bs, seq_len_slice, n_heads, head_dim // 2)
     # Add batch and head dims, expand last dim
-    freqs_cos = freqs_cis[0][None, :, None, :].repeat(xq_r.shape[-1] // freqs_cis[0].shape[-1], axis=-1)
-    freqs_sin = freqs_cis[1][None, :, None, :].repeat(xq_r.shape[-1] // freqs_cis[1].shape[-1], axis=-1)
+    # 1,seq_len_slice,1,head_dim//2
+    freqs_cos = freqs_cis[0][None, :, None, :] # 1,seq_len_slice,1,head_dim//2
+    freqs_sin = freqs_cis[1][None, :, None, :] # 1,seq_len_slice,1,head_dim//2
 
     freqs_cos = jnp.broadcast_to(freqs_cos, xq_r.shape) # Real part
     freqs_sin = jnp.broadcast_to(freqs_sin, xq_r.shape) # Imaginary part
-
+    # batch_size,seq_len_slice,n_heads,head_dim//2
 
     # Apply rotation
     xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
