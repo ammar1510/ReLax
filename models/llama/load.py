@@ -9,14 +9,15 @@ from pathlib import Path
 import numpy as np
 
 from .config import ModelConfig
+from .model import LLaMA
 
-def load_llama_weights(model_path: str, config: ModelConfig) -> flax.core.FrozenDict:
+def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
     """
-    Loads Llama3 model weights from .safetensors files into a Flax parameter structure.
+    Loads Llama3 model weights from .safetensors files into a Flax parameter structure
+    that is compatible with the LLaMA model in model.py.
 
     Args:
-        model_path: Path to the directory containing .safetensors files.
-        config: The model configuration.
+        model_path: Path to the directory containing .safetensors files and config.json.
 
     Returns:
         A Flax FrozenDict containing the model parameters.
@@ -28,11 +29,13 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> flax.core.Frozen
         raise ValueError(f"No .safetensors files found in {model_path}")
 
     for filepath in paths:
-        with safe_open(filepath, framework="jax") as f:
+        with safe_open(filepath, framework="flax") as f:
             for key in f.keys():
                 tensors[key] = f.get_tensor(key)
+    
+    config = ModelConfig.from_json_file(model_path)
 
-    # This will be the final Flax parameter dictionary
+    # This will be the final Flax parameter dictionary, structured to match model.py
     params = {}
 
     # Token embeddings
@@ -41,54 +44,44 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> flax.core.Frozen
     # Final normalization
     params['norm_weight'] = tensors['model.norm.weight']
 
-    # Language model head
-    params['output'] = {'kernel': tensors['lm_head.weight'].T}
+    # Language model head (output layer)
+    # The nn.Dense layer in LLaMA expects a kernel of shape (features_in, features_out)
+    # which is (dim, vocab_size). The embedding weight is (vocab_size, dim), so we transpose it.
+    params['output'] = {'kernel': tensors['model.embed_tokens.weight'].T}
 
     # Transformer layers
     for i in range(config.n_layers):
         layer_prefix = f'model.layers.{i}.'
         
-        # Normalization weights
-        attention_norm_weight = tensors[layer_prefix + 'input_layernorm.weight']
-        ffn_norm_weight = tensors[layer_prefix + 'post_attention_layernorm.weight']
-
-        # Attention projection weights
+        # Get all weights from the tensor dict
         q_proj = tensors[layer_prefix + 'self_attn.q_proj.weight']
         k_proj = tensors[layer_prefix + 'self_attn.k_proj.weight']
         v_proj = tensors[layer_prefix + 'self_attn.v_proj.weight']
         o_proj = tensors[layer_prefix + 'self_attn.o_proj.weight']
         
-        # Reshape and transpose attention weights to match our model's expected format
+        # Reshape attention weights to match the model's expected format (dim, n_heads, head_dim)
         wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim)
         wk = k_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
         wv = v_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
         wo = o_proj.T
 
-        # Feed-forward network weights
-        gate_proj = tensors[layer_prefix + 'mlp.gate_proj.weight']
-        up_proj = tensors[layer_prefix + 'mlp.up_proj.weight']
-        down_proj = tensors[layer_prefix + 'mlp.down_proj.weight']
-
-        # Transpose FFN weights
-        w1_gate = gate_proj.T
-        w2_up = up_proj.T
-        w3_down = down_proj.T
+        # Get feed-forward weights
+        gate_proj = tensors[layer_prefix + 'mlp.gate_proj.weight'].T
+        up_proj = tensors[layer_prefix + 'mlp.up_proj.weight'].T
+        down_proj = tensors[layer_prefix + 'mlp.down_proj.weight'].T
 
         # Assign weights to the layer's parameter dictionary
+        # The key 'layers_i' is automatically created by Flax for lists of modules.
         params[f'layers_{i}'] = {
-            'attention_norm_weight': attention_norm_weight,
-            'ffn_norm_weight': ffn_norm_weight,
-            'attention': {
-                'wq': wq,
-                'wk': wk,
-                'wv': wv,
-                'wo': wo,
-            },
-            'feed_forward': {
-                'w1_gate': w1_gate,
-                'w2_up': w2_up,
-                'w3_down': w3_down,
-            }
+            'attention_norm_weight': tensors[layer_prefix + 'input_layernorm.weight'],
+            'ffn_norm_weight': tensors[layer_prefix + 'post_attention_layernorm.weight'],
+            'wq': wq,
+            'wk': wk,
+            'wv': wv,
+            'wo': wo,
+            'w1_gate': gate_proj,
+            'w2_up': up_proj,
+            'w3_down': down_proj,
         }
 
     return flax.core.freeze(params) 

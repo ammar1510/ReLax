@@ -21,7 +21,7 @@ from models.llama.model import LLaMA
 from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache
 from sampling import Sampler, GreedySampler
-from load_utils import FlaxModelParams
+from utils.load import FlaxModelParams
 
 # --- Type Definitions ---
 
