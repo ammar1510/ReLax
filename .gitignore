@@ -60,3 +60,11 @@ __pypackages__/
 
 # Cython debug symbols
 cython_debug/ 
+
+
+#MacOS specifics
+.DS_Store
+
+
+
+artifacts

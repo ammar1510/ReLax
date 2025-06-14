@@ -16,10 +16,27 @@ class KVCache:
     )
 
   def update(self, xk: jax.Array, xv: jax.Array, layer_idx: int, start_pos: int):
-    """Updates the cache at the given layer and position using dynamic_update_slice."""
+    """Updates the Key and Value cache for a specific layer.
+
+    This method takes the newly computed key and value tensors for a single layer
+    and updates the cache at the correct position. This is used during the forward
+    pass of the transformer to store the context for subsequent generation steps.
+
+    Args:
+      xk: The new key tensor to be added to the cache.
+          Shape: `(bsz, seqlen, n_kv_heads, head_dim)`
+      xv: The new value tensor to be added to the cache.
+          Shape: `(bsz, seqlen, n_kv_heads, head_dim)`
+      layer_idx: The index of the layer to update.
+      start_pos: The starting position in the sequence dimension where the update
+                 should be applied. This is used to correctly place the new keys
+                 and values in the cache.
+
+    Returns:
+      A new KVCache object with the updated key and value tensors.
+    """
     # xk, xv shapes: [bsz, seqlen, n_kv_heads, head_dim]
     # self.k, self.v shapes: [layers, bsz, max_seq_len, n_kv_heads, head_dim]
-    bsz, seqlen, n_kv_heads, head_dim = xk.shape # Get dimensions from input
 
     # Ensure xk/xv have the same dtype as cache
     xk = xk.astype(self.k.dtype)

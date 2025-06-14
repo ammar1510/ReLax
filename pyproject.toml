@@ -1,0 +1,27 @@
+[project]
+name = "ReLax"
+version = "0.1.0"
+dependencies = [
+  "tiktoken",
+  "jax",
+  "flax",
+  "numpy",
+  "safetensors"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest"
+]
+dev = [
+  "ipykernel"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "."
+] 

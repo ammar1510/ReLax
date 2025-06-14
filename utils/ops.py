@@ -2,7 +2,9 @@
 import jax
 import jax.numpy as jnp
 import jax.nn as nn # Ensure nn is imported
+import jax.lax as lax
 from flax import struct
+from jax.experimental.pallas.ops.tpu import flash_attention
 from .kvcache import KVCache # Import KVCache
 
 def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> jnp.ndarray:
@@ -62,7 +64,7 @@ def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndar
     Returns:
         Normalized tensor.
     """
-    output = x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    output = x * lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
     return output * weight
 
 def apply_rotary_emb(
@@ -82,7 +84,7 @@ def apply_rotary_emb(
         Tuple of query and key tensors with applied RoPE.
     """
     # xq_ and xk_ have shape [batch_size, seq_len, n_heads, head_dim]
-    # freqs_cis has shape [seq_len, head_dim // 2 * 2] or similar complex format
+    # freqs_cis has shape [2, seq_len, head_dim // 2]
 
     # Reshape xq and xk to view the last dimension as pairs of real/imaginary parts
     xq_r, xq_i = jnp.split(xq, 2, axis=-1)
@@ -92,12 +94,13 @@ def apply_rotary_emb(
     # Input freqs_cis shape: (2, seq_len_slice, head_dim // 2)
     # Need to broadcast to: (bs, seq_len_slice, n_heads, head_dim // 2)
     # Add batch and head dims, expand last dim
-    freqs_cos = freqs_cis[0][None, :, None, :].repeat(xq_r.shape[-1] // freqs_cis[0].shape[-1], axis=-1)
-    freqs_sin = freqs_cis[1][None, :, None, :].repeat(xq_r.shape[-1] // freqs_cis[1].shape[-1], axis=-1)
+    # 1,seq_len_slice,1,head_dim//2
+    freqs_cos = freqs_cis[0][None, :, None, :] # 1,seq_len_slice,1,head_dim//2
+    freqs_sin = freqs_cis[1][None, :, None, :] # 1,seq_len_slice,1,head_dim//2
 
     freqs_cos = jnp.broadcast_to(freqs_cos, xq_r.shape) # Real part
     freqs_sin = jnp.broadcast_to(freqs_sin, xq_r.shape) # Imaginary part
-
+    # batch_size,seq_len_slice,n_heads,head_dim//2
 
     # Apply rotation
     xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
@@ -157,21 +160,25 @@ def grouped_query_attention(
         Tuple of (Output tensor after attention, Updated KVCache).
     """
     bsz, seqlen, dim = x.shape
-    head_dim = params.wq.shape[-1] // n_heads # Assuming wq shape [dim, n_heads * head_dim]
+    # Assuming parameters are already shaped correctly.
+    # wq: [dim, n_heads, head_dim]
+    # wk: [dim, n_kv_heads, head_dim]
+    # wv: [dim, n_kv_heads, head_dim]
+    head_dim = params.wq.shape[-1]
 
     # Project inputs to queries, keys, values for the current token(s)
     # Shapes: [bsz, seqlen, n_heads, head_dim] for xq
     # Shapes: [bsz, seqlen, n_kv_heads, head_dim] for xk, xv
-    xq = jnp.einsum('bsd,dhc->bshc', x, params.wq.reshape(dim, n_heads, head_dim))
-    xk = jnp.einsum('bsd,dkc->bskc', x, params.wk.reshape(dim, n_kv_heads, head_dim))
-    xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv.reshape(dim, n_kv_heads, head_dim))
+    xq = jnp.einsum('bsd,dhc->bshc', x, params.wq)
+    xk = jnp.einsum('bsd,dkc->bskc', x, params.wk)
+    xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv)
 
     # Apply rotary positional embeddings to the new queries and keys
     # Slice freqs_cis for the current position(s)
     # Assuming freqs_cis has shape [2, max_seq_len, head_dim//2]
     current_freqs_cis = (
-        jax.lax.dynamic_slice_in_dim(freqs_cis[0], start_pos, seqlen, axis=0),
-        jax.lax.dynamic_slice_in_dim(freqs_cis[1], start_pos, seqlen, axis=0)
+        lax.dynamic_slice_in_dim(freqs_cis[0], start_pos, seqlen, axis=0),
+        lax.dynamic_slice_in_dim(freqs_cis[1], start_pos, seqlen, axis=0)
     )
     # Pass the sliced freqs to RoPE
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=current_freqs_cis)
