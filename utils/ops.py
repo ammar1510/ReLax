@@ -1,11 +1,11 @@
 # Placeholder for shared, reusable Flax modules (RMSNorm, FFN, Attention, etc.) 
 import jax
 import jax.numpy as jnp
-import jax.nn as nn # Ensure nn is imported
+import jax.nn as nn 
 import jax.lax as lax
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
-from .kvcache import KVCache # Import KVCache
+from .kvcache import KVCache 
 
 def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> jax.Array:
     """
