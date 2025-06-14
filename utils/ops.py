@@ -288,6 +288,7 @@ def feed_forward(
         activated_gate = nn.gelu(gate, approximate=False)
     else:
         raise ValueError(f"Unsupported activation function: {activation_fn}")
+        # replace error handling with chex 
    
     fused_activation = activated_gate * up
 
