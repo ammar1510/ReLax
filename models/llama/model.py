@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from dataclasses import dataclass
 
 from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
 from utils.kvcache import KVCache 
@@ -55,7 +54,7 @@ class TransformerBlock(nn.Module):
         return x, kv_cache
 
 
-class LLaMA(nn.Module):
+class LLaMa(nn.Module):
     args: ModelConfig
 
     def setup(self):
@@ -63,7 +62,7 @@ class LLaMA(nn.Module):
         self.tok_embeddings = nn.Embed(
             num_embeddings=self.args.vocab_size,
             features=self.args.dim,
-            embedding_init=nn.initializers.normal(stddev=0.02) # Common initialization
+            embedding_init=nn.initializers.normal(stddev=0.02) 
         )
 
         # Initialize transformer blocks
@@ -75,13 +74,13 @@ class LLaMA(nn.Module):
         # Output layer (Language Model head)
         self.output = nn.Dense(
             features=self.args.vocab_size,
-            use_bias=False, # LLaMA usually doesn't use bias in the LM head
-            kernel_init=nn.initializers.normal(stddev=0.02) # Consistent init
+            use_bias=False, 
+            kernel_init=nn.initializers.normal(stddev=0.02) 
         )
 
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
-            self.args.head_dim, # Use head_dim here
+            self.args.head_dim, 
             self.args.max_seq_len,
             self.args.rope_theta
         )

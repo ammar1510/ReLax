@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import ModelConfig
-from .model import LLaMA
+from .model import LLaMa
 
 def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
     """
