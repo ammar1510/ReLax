@@ -57,19 +57,17 @@ class KVCache:
 
     return KVCache(k=k, v=v)
 
-  def get_layer(self, layer_idx: int, start_pos: int, seqlen: int):
-        """Retrieves K/V for a specific layer up to the current sequence length."""
-        # Fetch slice up to start_pos + seqlen
-        current_seq_len = start_pos + seqlen
+  def get_layer(self, layer_idx: int, seq_len: int):
+        """Retrieves K/V for a specific layer up to the specified sequence length."""
         # Use dynamic_slice for retrieval. Indices: (layer, batch, seq, head, dim)
-        # Slice shape: [1, bsz, current_seq_len, n_kv_heads, head_dim]
+        # Slice shape: [1, bsz, seq_len, n_kv_heads, head_dim]
         start_indices_k = (layer_idx, 0, 0, 0, 0)
-        slice_sizes_k = (1, self.k.shape[1], current_seq_len, self.k.shape[3], self.k.shape[4])
+        slice_sizes_k = (1, self.k.shape[1], seq_len, self.k.shape[3], self.k.shape[4])
         start_indices_v = (layer_idx, 0, 0, 0, 0)
-        slice_sizes_v = (1, self.v.shape[1], current_seq_len, self.v.shape[3], self.v.shape[4])
+        slice_sizes_v = (1, self.v.shape[1], seq_len, self.v.shape[3], self.v.shape[4])
 
         keys = jax.lax.dynamic_slice(self.k, start_indices_k, slice_sizes_k)[0] # Remove leading layer dim
         values = jax.lax.dynamic_slice(self.v, start_indices_v, slice_sizes_v)[0] # Remove leading layer dim
 
-        # keys/values shape: [bsz, current_seq_len, n_kv_heads, head_dim]
+        # keys/values shape: [bsz, seq_len, n_kv_heads, head_dim]
         return keys, values 
