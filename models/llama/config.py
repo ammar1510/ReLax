@@ -75,6 +75,6 @@ class ModelConfig:
             vocab_size=hf_config['vocab_size'],
             rms_norm_eps=hf_config['rms_norm_eps'],
             rope_theta=hf_config.get('rope_theta', 10000.0),
-            max_seq_len=hf_config.get('max_position_embeddings', 2048),
+            max_seq_len=hf_config['rope_scaling']['original_max_position_embeddings'],
             activation_fn=hf_config.get('hidden_act', 'silu')
         )
