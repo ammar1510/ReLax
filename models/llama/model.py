@@ -3,9 +3,8 @@ import jax.numpy as jnp
 import flax.linen as nn
 from dataclasses import dataclass
 
-# Import the building blocks and KVCache
 from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
-from utils.kvcache import KVCache # Assuming kvcache.py exists
+from utils.kvcache import KVCache 
 from .config import ModelConfig
 
 class TransformerBlock(nn.Module):

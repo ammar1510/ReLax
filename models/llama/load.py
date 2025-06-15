@@ -72,7 +72,7 @@ def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
 
         # Assign weights to the layer's parameter dictionary
         # The key 'layers_i' is automatically created by Flax for lists of modules.
-        params[f'layers_{i}'] = {
+        params[f'layer_{i}'] = {
             'attention_norm_weight': tensors[layer_prefix + 'input_layernorm.weight'],
             'ffn_norm_weight': tensors[layer_prefix + 'post_attention_layernorm.weight'],
             'wq': wq,
