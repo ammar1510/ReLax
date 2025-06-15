@@ -163,13 +163,12 @@ def grouped_query_attention(
 
     # Apply rotary positional embeddings to the new queries and keys
     # Slice freqs_cis for the current position(s)
-    # Assuming freqs_cis has shape [2, max_seqlen, head_dim//2]
-    current_freqs_cis = (
-        lax.dynamic_slice_in_dim(freqs_cis[0], start_pos, seqlen, axis=0),
-        lax.dynamic_slice_in_dim(freqs_cis[1], start_pos, seqlen, axis=0)
-    )
-    # Pass the sliced freqs to RoPE
-    xq, xk = apply_rotary_emb(xq, xk, freqs_cis=current_freqs_cis)
+    # freqs_cis has shape [max_seqlen, head_dim // 2, 2]
+    current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0)
+
+    # Pass the sliced freqs to RoPE, applying to query and key separately
+    xq = apply_rotary_emb(xq, freqs_cis=current_freqs_cis)
+    xk = apply_rotary_emb(xk, freqs_cis=current_freqs_cis)
 
     # Update the KV cache
     updated_cache = kv_cache.update(xk, xv, layer_idx, start_pos)
