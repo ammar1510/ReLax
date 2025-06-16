@@ -14,14 +14,11 @@ from typing import (
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 
-# Assuming these imports from the project structure
 from models.llama.model import LLaMA
 from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache
 from sampling import Sampler, GreedySampler
-from utils.load import FlaxModelParams
 
 # --- Type Definitions ---
 
