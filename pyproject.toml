@@ -14,7 +14,11 @@ test = [
   "pytest"
 ]
 dev = [
-  "ipykernel"
+  "ipykernel",
+  "torch",
+  "huggingface_hub",
+  "fire",
+  "blobfile",
 ]
 
 [tool.setuptools.packages.find]
