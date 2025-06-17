@@ -12,18 +12,6 @@ from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache
 from sampling import TopPSampler
 
-@partial(jax.jit, static_argnames=('model',))
-def _model_step(model: LLaMa, params, tokens, kv_cache, start_pos):
-    """
-    A JIT-compiled function for a single model forward pass.
-    """
-    logits, updated_kv_cache = model.apply(
-        {'params': params},
-        tokens,
-        start_pos=start_pos,
-        kv_cache=kv_cache
-    )
-    return logits[:, -1, :], updated_kv_cache
 
 def generate(
     model: LLaMa,
@@ -49,13 +37,24 @@ def generate(
         dtype=jnp.bfloat16,
     )
 
-    # 2. Encode prompt and pre-fill KV cache
+    # 2. Define and JIT-compile the model step function for performance
+    @partial(jax.jit)
+    def _model_step(params, tokens, kv_cache, start_pos):
+        logits, updated_kv_cache = model.apply(
+            {'params': params},
+            tokens,
+            start_pos=start_pos,
+            kv_cache=kv_cache
+        )
+        return logits[:, -1, :], updated_kv_cache
+
+    # 3. Encode prompt and pre-fill KV cache
     prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
     tokens = jnp.array([prompt_tokens], dtype=jnp.int32)
-    
-    logits, kv_cache = _model_step(model, params, tokens, kv_cache, 0)
 
-    # 3. Autoregressive generation loop
+    logits, kv_cache = _model_step(params, tokens, kv_cache, 0)
+
+    # 4. Autoregressive generation loop
     generated_tokens = []
     # Sample the first token from the pre-fill logits
     rng_key, sample_key = random.split(rng_key)
@@ -64,13 +63,13 @@ def generate(
     for _ in range(max_gen_len - 1):
         if next_token.item() in tokenizer.stop_tokens:
             break
-        
+
         generated_tokens.append(next_token.item())
-        
+
         current_pos = tokens.shape[1]
         tokens = jnp.concatenate([tokens, next_token.reshape(1,1)], axis=1)
 
-        logits, kv_cache = _model_step(model, params, next_token.reshape(1,1), kv_cache, current_pos)
+        logits, kv_cache = _model_step(params, next_token.reshape(1,1), kv_cache, current_pos)
 
         rng_key, sample_key = random.split(rng_key)
         next_token = sampler.sample(logits, sample_key)
@@ -96,15 +95,15 @@ def main(
 
     model_config = ModelConfig.from_json_file(ckpt_dir)
     model_config.max_seq_len = max_seq_len
-    
+
     tokenizer = Tokenizer(tokenizer_path)
-    
+
     # Load model weights
     params = load_llama_weights(ckpt_dir)
-    
+
     # Initialize the model
     model = LLaMa(model_config)
-    
+
     # Create a JAX random key
     rng_key = random.PRNGKey(seed)
 
