@@ -6,6 +6,7 @@ import jax.lax as lax
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
 from .kvcache import KVCache 
+from typing import Optional
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False) -> jax.Array:
     """
@@ -123,13 +124,11 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
 def grouped_query_attention(
     x: jnp.ndarray,
     freqs_cis: jnp.ndarray, # Precomputed freqs for max_seqlen
-    # mask: jnp.ndarray | None, # Mask is implicitly causal up to start_pos+seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
     start_pos: int,
-    n_heads: int,
-    n_kv_heads: int,
+    prefill_mask: Optional[jax.Array] = None, # padding mask during prefill stage
 ) -> tuple[jax.Array, KVCache]: # Return output and updated cache
     """
     Compute Grouped Query Attention with KV Caching.
@@ -141,93 +140,62 @@ def grouped_query_attention(
         kv_cache: The current KV Cache.
         layer_idx: The index of the current layer.
         start_pos: The starting position index for the current computation.
-        n_heads: Number of query heads.
-        n_kv_heads: Number of key/value heads.
+        prefill_mask: Optional padding mask for the prefill stage.
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
     """
     bsz, seqlen, dim = x.shape
-    # Assuming parameters are already shaped correctly.
-    # wq: [dim, n_heads, head_dim]
-    # wk: [dim, n_kv_heads, head_dim]
-    # wv: [dim, n_kv_heads, head_dim]
-    head_dim = params.wq.shape[-1]
 
     # Project inputs to queries, keys, values for the current token(s)
-    # Shapes: [bsz, seqlen, n_heads, head_dim] for xq
-    # Shapes: [bsz, seqlen, n_kv_heads, head_dim] for xk, xv
     xq = jnp.einsum('bsd,dhc->bshc', x, params.wq)
     xk = jnp.einsum('bsd,dkc->bskc', x, params.wk)
     xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv)
 
-    # Apply rotary positional embeddings to the new queries and keys
-    # Slice freqs_cis for the current position(s)
-    # freqs_cis has shape [max_seqlen, head_dim // 2, 2]
+    # Apply rotary positional embeddings
     current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0)
-
-    # Pass the sliced freqs to RoPE, applying to query and key separately
     xq = apply_rotary_emb(xq, freqs_cis=current_freqs_cis)
     xk = apply_rotary_emb(xk, freqs_cis=current_freqs_cis)
 
+    # During prefill, mask out padding tokens before caching
+    if prefill_mask is not None:
+        prefill_mask_expanded = prefill_mask[:, :, None, None]
+        xk = xk * prefill_mask_expanded
+        xv = xv * prefill_mask_expanded
+
     # Update the KV cache
     updated_cache = kv_cache.update(xk, xv, layer_idx, start_pos)
+    keys, values = updated_cache.get_layer(layer_idx)
 
-    # Retrieve the full key/value sequences for this layer from cache
-    # keys/values shape: [bsz, current_seqlen, n_kv_heads, head_dim]
-    current_seqlen = start_pos + seqlen
-    keys, values = updated_cache.get_layer(layer_idx, current_seqlen)
+    max_seqlen = keys.shape[1]
 
+    # Build attention mask
+    query_positions = jnp.arange(seqlen) + start_pos
+    key_positions = jnp.arange(max_seqlen)
 
-    # Repeat KV heads if n_kv_heads < n_heads (GQA)
-    n_rep = n_heads // n_kv_heads
-    keys = repeat_kv(keys, n_rep) # Shape: [bsz, current_seqlen, n_heads, head_dim]
-    values = repeat_kv(values, n_rep) # Shape: [bsz, current_seqlen, n_heads, head_dim]
+    mask = query_positions[:, None] >= key_positions[None, :][None, :, :] # [1, seqlen, max_seqlen]
 
-    # Transpose query: [bsz, n_heads, seqlen, head_dim]
-    xq = xq.transpose(0, 2, 1, 3)
-    # Transpose keys/values: [bsz, n_heads, current_seqlen, head_dim]
-    keys = keys.transpose(0, 2, 1, 3)
-    values = values.transpose(0, 2, 1, 3)
+    if prefill_mask is not None:
+        # Mask out queries at padding positions
+        query_mask = prefill_mask[:, :, None] # [bsz, seqlen, 1]
+        mask = mask & query_mask
 
-    # Calculate attention scores
-    # xq: [bsz, n_heads, seqlen, head_dim]
-    # keys: [bsz, n_heads, current_seqlen, head_dim] -> keys.transpose: [bsz, n_heads, head_dim, current_seqlen]
-    scores = jnp.matmul(xq, keys.transpose(0, 1, 3, 2)) / jnp.sqrt(head_dim)
+    # Add head dimension for broadcasting
+    mask = mask[:, None, :, :]
 
-    # Apply causal mask (implicit via sequence lengths during decoding)
-    # During decoding (seqlen=1), scores shape is [bsz, n_heads, 1, current_seqlen].
-    # Softmax over the last dim (current_seqlen) naturally handles causality
-    # as keys/values only contain past and current tokens.
-    # For prefill (seqlen > 1), an explicit mask might be needed if not handled upstream.
-    # Let's add an explicit causal mask for generality, assuming needed for prefill.
-    if seqlen > 1:
-      # Adjust mask based on start_pos. This assumes query positions are [start_pos..start_pos+seqlen-1]
-      # and key positions are [0..current_seqlen-1].
-      # A query at pos q_idx = start_pos + i can attend to key at pos k_idx if k_idx <= q_idx.
-      # The mask needs to be [bsz, n_heads, seqlen, current_seqlen]
-      query_indices = jnp.arange(seqlen) + start_pos
-      key_indices = jnp.arange(current_seqlen)
-      causal_mask = key_indices <= query_indices[:, None]
-      scores = jnp.where(causal_mask[None, None, :, :], scores, jnp.finfo(scores.dtype).min)
+    # Perform attention using JAX's optimized dot-product attention
+    attn_output = nn.dot_product_attention(
+        query=xq,
+        key=keys,
+        value=values,
+        mask=mask,
+    )
 
-    # Softmax scores
-    attn_weights = jax.nn.softmax(scores, axis=-1)
-    attn_weights = attn_weights.astype(values.dtype) # Ensure consistent dtype
+    # Zero out outputs for padded tokens to prevent NaNs
+    if prefill_mask is not None:
+        attn_output = jnp.where(prefill_mask[:, :, None, None], attn_output, 0)
 
-    # Apply attention weights to values
-    # attn_weights: [bsz, n_heads, seqlen, current_seqlen]
-    # values: [bsz, n_heads, current_seqlen, head_dim] -> output: [bsz, n_heads, seqlen, head_dim]
-    attn_output = jnp.matmul(attn_weights, values)
-
-    # Concatenate heads and project output
-    # attn_output: [bsz, n_heads, seqlen, head_dim] -> [bsz, seqlen, n_heads, head_dim]
-    attn_output = attn_output.transpose(0, 2, 1, 3)
-    # attn_output: -> [bsz, seqlen, n_heads * head_dim]
     attn_output = attn_output.reshape(bsz, seqlen, -1)
-
-    # Final linear projection
-    # attn_output: [bsz, seqlen, dim], params.wo: [n_heads * head_dim, dim]
     output = jnp.einsum('bsd,do->bso', attn_output, params.wo)
 
     return output, updated_cache

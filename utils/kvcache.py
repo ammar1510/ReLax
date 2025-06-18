@@ -57,17 +57,15 @@ class KVCache:
 
     return KVCache(k=k, v=v)
 
-  def get_layer(self, layer_idx: int, seq_len: int):
-        """Retrieves K/V for a specific layer up to the specified sequence length."""
-        # Use dynamic_slice for retrieval. Indices: (layer, batch, seq, head, dim)
-        # Slice shape: [1, bsz, seq_len, n_kv_heads, head_dim]
-        start_indices_k = (layer_idx, 0, 0, 0, 0)
-        slice_sizes_k = (1, self.k.shape[1], seq_len, self.k.shape[3], self.k.shape[4])
-        start_indices_v = (layer_idx, 0, 0, 0, 0)
-        slice_sizes_v = (1, self.v.shape[1], seq_len, self.v.shape[3], self.v.shape[4])
+  def get_layer(self, layer_idx: int):
+        """Retrieves K/V for a specific layer.
+        
+        Note: This returns the full cache up to max_seq_len. The caller is
+        responsible for masking for attention computation.
+        """
+        # self.k, self.v shapes: [layers, bsz, max_seq_len, n_kv_heads, head_dim]
+        keys = self.k[layer_idx]
+        values = self.v[layer_idx]
 
-        keys = jax.lax.dynamic_slice(self.k, start_indices_k, slice_sizes_k)[0] # Remove leading layer dim
-        values = jax.lax.dynamic_slice(self.v, start_indices_v, slice_sizes_v)[0] # Remove leading layer dim
-
-        # keys/values shape: [bsz, seq_len, n_kv_heads, head_dim]
+        # keys/values shape: [bsz, max_seq_len, n_kv_heads, head_dim]
         return keys, values 

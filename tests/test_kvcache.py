@@ -108,45 +108,26 @@ class TestKVCache:
 
         # Parameters for get_layer
         layer_idx_to_get = 0
-        start_pos_get = 0 # This start_pos is for the generation step, not the initial update
-        seqlen_get = 3 # We want to get a slice of the updated data
 
-        retrieved_k, retrieved_v = cache.get_layer(layer_idx_to_get, start_pos_get, seqlen_get)
+        retrieved_k, retrieved_v = cache.get_layer(layer_idx_to_get)
 
-        # Expected shapes: [bsz, current_seq_len, kv_heads, head_dim]
-        # current_seq_len for get_layer is start_pos_get + seqlen_get
-        current_seq_len_get = start_pos_get + seqlen_get
-        assert retrieved_k.shape == (bsz, current_seq_len_get, kv_heads, head_dim)
-        assert retrieved_v.shape == (bsz, current_seq_len_get, kv_heads, head_dim)
+        # Expected shapes: [bsz, max_seq_len, kv_heads, head_dim]
+        assert retrieved_k.shape == (bsz, max_seq_len, kv_heads, head_dim)
+        assert retrieved_v.shape == (bsz, max_seq_len, kv_heads, head_dim)
 
         # Verify the content of the retrieved k
-        # The retrieved slice should correspond to the beginning of xk_update_val
-        expected_k_slice = xk_update_val[:, :current_seq_len_get, :, :]
-        np.testing.assert_array_equal(retrieved_k, expected_k_slice)
+        # The first part should contain the updated values
+        np.testing.assert_array_equal(retrieved_k[:, :seqlen_update, :, :], xk_update_val)
+        # The rest should be zeros
+        assert jnp.all(retrieved_k[:, seqlen_update:, :, :] == 0)
 
         # Verify the content of the retrieved v
-        expected_v_slice = xv_update_val[:, :current_seq_len_get, :, :]
-        np.testing.assert_array_equal(retrieved_v, expected_v_slice)
-
-        # Test getting a slice that includes both updated and non-updated (zero) parts
-        seqlen_get_longer = seqlen_update + 2 # Get more than what was updated
-        if seqlen_get_longer <= max_seq_len:
-            retrieved_k_longer, retrieved_v_longer = cache.get_layer(layer_idx_to_get, start_pos_get, seqlen_get_longer)
-            
-            current_seq_len_longer = start_pos_get + seqlen_get_longer
-            assert retrieved_k_longer.shape == (bsz, current_seq_len_longer, kv_heads, head_dim)
-
-            # First part should be the updated values
-            np.testing.assert_array_equal(retrieved_k_longer[:, :seqlen_update, :, :], xk_update_val)
-            # Second part (beyond the update) should be zeros
-            assert jnp.all(retrieved_k_longer[:, seqlen_update:, :, :] == 0)
-
-            np.testing.assert_array_equal(retrieved_v_longer[:, :seqlen_update, :, :], xv_update_val)
-            assert jnp.all(retrieved_v_longer[:, seqlen_update:, :, :] == 0)
-
+        np.testing.assert_array_equal(retrieved_v[:, :seqlen_update, :, :], xv_update_val)
+        assert jnp.all(retrieved_v[:, seqlen_update:, :, :] == 0)
+        
         # Test getting from a different layer (should be all zeros)
         if n_layers > 1:
             layer_idx_other = 1
-            retrieved_k_other, retrieved_v_other = cache.get_layer(layer_idx_other, start_pos_get, seqlen_get)
+            retrieved_k_other, retrieved_v_other = cache.get_layer(layer_idx_other)
             assert jnp.all(retrieved_k_other == 0)
             assert jnp.all(retrieved_v_other == 0) 
