@@ -10,12 +10,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
-  "pytest"
-]
 dev = [
+  "pytest"
   "ipykernel",
   "torch",
+  "chex"
   "huggingface_hub",
   "fire",
   "blobfile",

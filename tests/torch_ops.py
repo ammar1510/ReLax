@@ -281,7 +281,8 @@ class Transformer(nn.Module):
             params.max_seq_len * 2,
             params.rope_theta,
             params.use_scaled_rope,
-        )
+            dtype=torch.float64
+        ).to(torch.float32)
 
     def forward_inference(self, tokens: torch.Tensor, start_pos: int):
         # for use during inference

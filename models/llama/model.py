@@ -6,6 +6,9 @@ from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_atten
 from utils.kvcache import KVCache 
 from .config import ModelConfig
 
+jax.config.update("jax_enable_x64", True)
+
+
 class TransformerBlock(nn.Module):
     args: ModelConfig
 
@@ -37,8 +40,6 @@ class TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             layer_idx=layer_idx,
             start_pos=start_pos,
-            n_heads=self.args.n_heads,
-            n_kv_heads=self.args.n_kv_heads,
         )
         x = x + attn_output  # Residual connection
 
@@ -82,8 +83,9 @@ class LLaMa(nn.Module):
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim, 
             self.args.max_seq_len,
-            self.args.rope_theta
-        )
+            self.args.rope_theta,
+            dtype= jnp.float64
+        ).astype(jnp.float32)
 
     def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape

@@ -13,8 +13,8 @@ from tests.torch_ops import Transformer as Llama_torch, ModelArgs, KVCache as KV
 
 def test_transformer_forward_pass():
     # 1. Shared Configuration
-    dim = 128
-    n_layers = 2
+    dim = 192
+    n_layers = 8
     n_heads = 4
     n_kv_heads = 2
     vocab_size = 512
@@ -39,6 +39,7 @@ def test_transformer_forward_pass():
     jax_args = ModelConfig(
         dim=dim, n_layers=n_layers, n_heads=n_heads, n_kv_heads=n_kv_heads, 
         vocab_size=vocab_size, ffn_hidden_dim=ffn_hidden_dim, max_seq_len=max_seq_len,
+        rope_theta=500000.0, rms_norm_eps=1e-5,
         activation_fn='silu'
     )
 
