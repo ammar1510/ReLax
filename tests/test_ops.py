@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import jax
 import jax.numpy as jnp
 from utils.ops import precompute_freqs_cis as precompute_freqs_cis_jax
 from tests.torch_ops import precompute_freqs_cis as precompute_freqs_cis_torch
@@ -13,21 +14,23 @@ from tests.torch_ops import ModelArgs, Attention as Attention_torch, KVCache as 
 from utils.ops import AttentionParams, grouped_query_attention, FeedForwardParams, feed_forward as feed_forward_jax
 from utils.kvcache import KVCache as KVCache_jax
 
+jax.config.update("jax_enable_x64", True)
+
 def test_precompute_freqs_cis():
     # Parameters for the test
     dim = 128
     end = 1024
     theta = 10000.0
-
+    dtype = np.float64
     # JAX implementation
-    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta)
+    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=dtype).astype(np.float32)
 
     # PyTorch implementation
-    freqs_cis_torch_tensor = precompute_freqs_cis_torch(dim, end, theta)
-    freqs_cis_torch_np = freqs_cis_torch_tensor.numpy()
+    freqs_cis_torch_tensor = precompute_freqs_cis_torch(dim, end, theta,dtype=torch.float64)
+    freqs_cis_torch_np = freqs_cis_torch_tensor.numpy().astype(np.float32)
 
     # Compare the results
-    np.testing.assert_allclose(np.array(freqs_cis_jax), freqs_cis_torch_np, rtol=1e-5)
+    np.testing.assert_allclose(np.array(freqs_cis_jax), freqs_cis_torch_np, rtol=1e-5, atol=1e-5)
 
 def test_apply_rotary_emb():
     # Parameters

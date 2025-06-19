@@ -6,27 +6,27 @@ from typing import Dict, Optional
 import json
 from pathlib import Path
 
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
 
     # Architecture Config
-    vocab_size: int = 128256
-    dim: int = 3072
-    ffn_hidden_dim: int = 8192  # FFN expansion size
-    n_layers: int = 28
-    n_heads: int = 24
-    n_kv_heads: int = 8  # Grouped Query Attention
-    activation_fn: str = "silu"
+    vocab_size: int 
+    dim: int 
+    ffn_hidden_dim: int  # FFN expansion size
+    n_layers: int 
+    n_heads: int 
+    n_kv_heads: int  # Grouped Query Attention
+    activation_fn: str 
 
     # Positional Embeddings Config
-    max_seq_len: int = 131072
-    rope_theta: float = 500000.0
+    max_seq_len: int 
+    rope_theta: float 
     # rope_scaling: Optional[Dict] = field(default_factory=lambda: {"type": "dynamic", "factor": 32.0})
     # Note: RoPE scaling details often handled within the RoPE implementation itself based on sequence length,
     # rather than a static config dict. Keeping it simple for now.
 
     # Normalization Config
-    rms_norm_eps: float = 1e-05
+    rms_norm_eps: float 
 
     # Attention Config
     # head_dim is calculated: dim // n_heads = 3072 // 24 = 128

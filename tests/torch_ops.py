@@ -98,9 +98,9 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: torch.dtype = torch.float32):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].to(dtype) / dim))
+    t = torch.arange(end, device=freqs.device, dtype=dtype)
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)

@@ -3,12 +3,15 @@ import jax
 import jax.numpy as jnp
 import jax.nn as nn 
 import jax.lax as lax
+from jax import jit
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
 from .kvcache import KVCache 
 from typing import Optional
+from functools import partial
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False) -> jax.Array:
+@partial(jit, static_argnames=['dim', 'end', 'theta', 'use_scaled', 'dtype'])
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """
     Precompute the rotational frequency embeddings.
     This function is a JAX implementation of the PyTorch code snippet provided by the user.
@@ -26,8 +29,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
     if use_scaled:
         raise NotImplementedError("`use_scaled` is not implemented.")
 
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(end, dtype=jnp.float32)
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = jnp.arange(end, dtype=dtype)
     freqs = jnp.outer(t, freqs)
 
     # In JAX, torch.polar(torch.ones_like(freqs), freqs) is equivalent to jnp.cos(freqs) + 1j * jnp.sin(freqs)
@@ -52,6 +55,7 @@ class FeedForwardParams:
     w3_down: jax.Array # Corresponds to down_proj
 
 
+@jit
 def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-6) -> jax.Array:
     """
     Apply Root Mean Square Normalization.
@@ -68,6 +72,7 @@ def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-6) -> jax.Array:
     return output * weight
 
 
+@jit
 def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     """
     Apply Rotary Positional Embeddings (RoPE) to a tensor.
@@ -103,6 +108,7 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
     return x_out
 
+@partial(jit, static_argnames=['n_rep'])
 def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     """
     Repeat Key/Value heads for Grouped Query Attention.
@@ -120,7 +126,7 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     # equivalent to torch.repeat_interleave(x, repeats=n_rep, dim=2)
     return jnp.broadcast_to(x[:, :, :, None, :], (bs, slen, n_kv_heads, n_rep, head_dim)).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 
-
+@jit
 def grouped_query_attention(
     x: jnp.ndarray,
     freqs_cis: jnp.ndarray, # Precomputed freqs for max_seqlen
@@ -201,6 +207,7 @@ def grouped_query_attention(
     return output, updated_cache
 
 
+@partial(jit, static_argnames=['activation_fn'])
 def feed_forward(
     x: jax.Array,
     params: FeedForwardParams,
