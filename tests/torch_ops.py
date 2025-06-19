@@ -45,7 +45,7 @@ class ModelArgs:
     rope_theta: float = 500000
     use_scaled_rope: bool = False
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seqlen: int = 2048
     flash: bool = False # use flash attention?
     device: str = "cuda"
 
@@ -63,10 +63,10 @@ class ModelArgs:
 # Transformer
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, device: str = "cuda"):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, device=device))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -98,9 +98,9 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: torch.dtype = torch.float32):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].to(dtype) / dim))
-    t = torch.arange(end, device=freqs.device, dtype=dtype)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: torch.dtype = torch.float32, device: str = "cuda"):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].to(dtype) / dim))
+    t = torch.arange(end, device=device, dtype=dtype)
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
@@ -269,19 +269,20 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim, device=params.device)
         self.layers = nn.ModuleList(
             TransformerBlock(params) for _ in range(params.n_layers)
         )
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps, device=params.device)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False, device=params.device)
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
-            params.max_seq_len * 2,
+            params.max_seqlen,
             params.rope_theta,
             params.use_scaled_rope,
-            dtype=torch.float64
+            dtype=torch.float64,
+            device=params.device
         ).to(torch.float32)
 
     def forward_inference(self, tokens: torch.Tensor, start_pos: int):
@@ -382,7 +383,7 @@ class Llama:
     def build(
         ckpt_dir: str,
         tokenizer_path: str,
-        max_seq_len: int,
+        max_seqlen: int,
         max_batch_size: int,
         device: str,
         seed: int = 1,
@@ -402,7 +403,7 @@ class Llama:
             params = json.loads(f.read())
         
         model_args: ModelArgs = ModelArgs(
-            max_seq_len=max_seq_len,
+            max_seqlen=max_seqlen,
             max_batch_size=max_batch_size,
             device=device,
             **params,
@@ -441,7 +442,7 @@ class Llama:
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
-        self.max_seq_len = model.params.max_seq_len
+        self.max_seqlen = model.params.max_seqlen
 
     def setup_caches(self, batch_size: int, dtype: torch.dtype):
         # Initialize KV Caches for each layer
@@ -449,7 +450,7 @@ class Llama:
             if hasattr(layer.attention, 'cache') and layer.attention.cache is None:  # type: ignore
                 layer.attention.cache = KVCache(  # type: ignore
                     batch_size=batch_size,
-                    seq_length=self.max_seq_len,
+                    seq_length=self.max_seqlen,
                     n_kv_heads=self.model.params.n_kv_heads,
                     head_dim=self.model.params.dim // self.model.params.n_heads,
                     dtype=dtype,
@@ -488,7 +489,7 @@ class Llama:
         generated_tokens = []
         for cur_pos in range(len(prompt_tokens), len(prompt_tokens) + max_gen_len):
             
-            if cur_pos >= self.max_seq_len:
+            if cur_pos >= self.max_seqlen:
                 break # sequence length limit
 
             # The input to the model is the last token generated
@@ -517,7 +518,7 @@ def main(
     prompt: str = "The capital of France is",
     temperature: float = 0.6,
     top_p: float = 0.9,
-    max_seq_len: int = 128,
+    max_seqlen: int = 128,
     max_batch_size: int = 1,
     max_gen_len: int = 64,
     device: str = 'cuda'
@@ -528,7 +529,7 @@ def main(
     llama = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
-        max_seq_len=max_seq_len,
+        max_seqlen=max_seqlen,
         max_batch_size=max_batch_size,
         device=device,
     )

@@ -82,7 +82,7 @@ class LLaMa(nn.Module):
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim, 
-            self.args.max_seq_len,
+            self.args.max_seqlen,
             self.args.rope_theta,
             dtype= jnp.float64
         ).astype(jnp.float32)

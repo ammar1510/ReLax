@@ -19,7 +19,7 @@ class ModelConfig:
     activation_fn: str 
 
     # Positional Embeddings Config
-    max_seq_len: int 
+    max_seqlen: int 
     rope_theta: float 
     # rope_scaling: Optional[Dict] = field(default_factory=lambda: {"type": "dynamic", "factor": 32.0})
     # Note: RoPE scaling details often handled within the RoPE implementation itself based on sequence length,
@@ -75,6 +75,6 @@ class ModelConfig:
             vocab_size=hf_config['vocab_size'],
             rms_norm_eps=hf_config['rms_norm_eps'],
             rope_theta=hf_config.get('rope_theta', 10000.0),
-            max_seq_len=hf_config['rope_scaling']['original_max_position_embeddings'],
+            max_seqlen=hf_config['rope_scaling']['original_max_position_embeddings'],
             activation_fn=hf_config.get('hidden_act', 'silu')
         )

@@ -11,10 +11,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest"
+  "pytest",
   "ipykernel",
   "torch",
-  "chex"
+  "chex",
   "huggingface_hub",
   "fire",
   "blobfile",
