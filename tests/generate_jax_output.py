@@ -2,11 +2,18 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import os
+import torch
+from jax.dlpack import from_dlpack
 
 # JAX/Flax model components
 from models.llama.model import LLaMa as Llama_jax
 from models.llama.config import ModelConfig
 from utils.kvcache import KVCache as KVCache_jax
+
+def torch_to_jax(torch_tensor):
+    """Converts a PyTorch tensor to a JAX array without copying data."""
+    dlpack_capsule = torch.utils.dlpack.to_dlpack(torch_tensor)
+    return from_dlpack(dlpack_capsule)
 
 def generate_jax_output():
     # 1. Shared Configuration
@@ -21,7 +28,7 @@ def generate_jax_output():
     seqlen = 64
     start_pos = 10 # this will be the size of our pre-filled cache
     activation_fn = 'silu'
-    dtype = np.float64
+    dtype_torch = torch.float32
 
     
     jax_args = ModelConfig(
@@ -34,56 +41,75 @@ def generate_jax_output():
     head_dim = dim // n_heads
 
     # 2. Weight Generation
-    np.random.seed(0)
+    print("Generating Torch weights for JAX...")
+    torch.cuda.manual_seed(0)
     jax_weights = {'params': {}}
-    tok_embeddings_np = np.random.randn(vocab_size, dim).astype(dtype)
-    jax_weights['params']['tok_embeddings'] = {'embedding': tok_embeddings_np}
+
+    tok_embeddings_torch = torch.randn(vocab_size, dim, device='cuda', dtype=dtype_torch)
+    jax_weights['params']['tok_embeddings'] = {'embedding': torch_to_jax(tok_embeddings_torch)}
+    print(f"  tok_embeddings shape: {tok_embeddings_torch.shape}")
 
     for i in range(n_layers):
         layer_key = f'layer_{i}'
         # This structure must be flat to match how Flax registers params with self.param(), fixing the ScopeParamNotFoundError
         jax_weights['params'][layer_key] = {
-            'wq': np.random.randn(dim, n_heads, head_dim).astype(dtype),
-            'wk': np.random.randn(dim, n_kv_heads, head_dim).astype(dtype),
-            'wv': np.random.randn(dim, n_kv_heads, head_dim).astype(dtype),
-            'wo': np.random.randn(n_heads * head_dim, dim).astype(dtype),
-            'w1_gate': np.random.randn(dim, hidden_dim).astype(dtype),
-            'w2_up': np.random.randn(dim, hidden_dim).astype(dtype),
-            'w3_down': np.random.randn(hidden_dim, dim).astype(dtype),
-            'attention_norm_weight': np.random.randn(dim).astype(dtype),
-            'ffn_norm_weight': np.random.randn(dim).astype(dtype),
+            'wq': torch_to_jax(torch.randn(dim, n_heads, head_dim, device='cuda', dtype=dtype_torch)),
+            'wk': torch_to_jax(torch.randn(dim, n_kv_heads, head_dim, device='cuda', dtype=dtype_torch)),
+            'wv': torch_to_jax(torch.randn(dim, n_kv_heads, head_dim, device='cuda', dtype=dtype_torch)),
+            'wo': torch_to_jax(torch.randn(n_heads * head_dim, dim, device='cuda', dtype=dtype_torch)),
+            'w1_gate': torch_to_jax(torch.randn(dim, hidden_dim, device='cuda', dtype=dtype_torch)),
+            'w2_up': torch_to_jax(torch.randn(dim, hidden_dim, device='cuda', dtype=dtype_torch)),
+            'w3_down': torch_to_jax(torch.randn(hidden_dim, dim, device='cuda', dtype=dtype_torch)),
+            'attention_norm_weight': torch_to_jax(torch.randn(dim, device='cuda', dtype=dtype_torch)),
+            'ffn_norm_weight': torch_to_jax(torch.randn(dim, device='cuda', dtype=dtype_torch)),
         }
     
-    jax_weights['params']['norm_weight'] = np.random.randn(dim).astype(dtype)
-    jax_weights['params']['output'] = {'kernel': np.random.randn(dim, vocab_size).astype(dtype)}
+    jax_weights['params']['norm_weight'] = torch_to_jax(torch.randn(dim, device='cuda', dtype=dtype_torch))
+    jax_weights['params']['output'] = {'kernel': torch_to_jax(torch.randn(dim, vocab_size, device='cuda', dtype=dtype_torch))}
+    print("JAX weights generated.")
 
     # 3. JAX Model Initialization
+    print("\nInitializing JAX model...")
     jax_model = Llama_jax(jax_args)
+    print("JAX model initialized.")
     
     # 4. Input token generation
-    tokens_np = np.random.randint(0, vocab_size, (batch_size, seqlen))
-    tokens_jax = jnp.array(tokens_np)
+    print("\nGenerating input tokens...")
+    tokens_torch = torch.randint(0, vocab_size, (batch_size, seqlen), device='cuda')
+    tokens_jax = torch_to_jax(tokens_torch.to(torch.int32)) # JAX requires int32 for tokens
+    print(f"  Input tokens shape: {tokens_jax.shape}")
     
     # 5. Pre-fill KV Caches to be non-empty
+    print("\nPre-filling KV cache...")
     prefill_len = start_pos
-    prefill_k = np.random.randn(n_layers, batch_size, prefill_len, n_kv_heads, head_dim).astype(dtype)
-    prefill_v = np.random.randn(n_layers, batch_size, prefill_len, n_kv_heads, head_dim).astype(dtype)
+
+    prefill_k_torch = torch.randn(n_layers, batch_size, prefill_len, n_kv_heads, head_dim, device='cuda', dtype=dtype_torch)
+    prefill_v_torch = torch.randn(n_layers, batch_size, prefill_len, n_kv_heads, head_dim, device='cuda', dtype=dtype_torch)
+    prefill_k_jax = torch_to_jax(prefill_k_torch)
+    prefill_v_jax = torch_to_jax(prefill_v_torch)
+
+    print(f"  Prefill K cache shape: {prefill_k_jax.shape}")
+    print(f"  Prefill V cache shape: {prefill_v_jax.shape}")
 
     # JAX KV Cache
-    k_init_jax = jnp.zeros((n_layers, batch_size, max_seqlen, n_kv_heads, head_dim), dtype=jnp.float64)
-    v_init_jax = jnp.zeros((n_layers, batch_size, max_seqlen, n_kv_heads, head_dim), dtype=jnp.float64)
-    k_updated_jax = k_init_jax.at[:, :, :prefill_len, :, :].set(jnp.array(prefill_k))
-    v_updated_jax = v_init_jax.at[:, :, :prefill_len, :, :].set(jnp.array(prefill_v))
+    k_init_jax = jnp.zeros((n_layers, batch_size, max_seqlen, n_kv_heads, head_dim), dtype=jnp.float32)
+    v_init_jax = jnp.zeros((n_layers, batch_size, max_seqlen, n_kv_heads, head_dim), dtype=jnp.float32)
+    k_updated_jax = k_init_jax.at[:, :, :prefill_len, :, :].set(prefill_k_jax)
+    v_updated_jax = v_init_jax.at[:, :, :prefill_len, :, :].set(prefill_v_jax)
     kv_cache_jax = KVCache_jax(k=k_updated_jax, v=v_updated_jax)
+    print("KV cache pre-filled.")
 
     # 6. JAX execution
+    print("\nExecuting JAX model...")
     logits_jax, _ = jax_model.apply({'params': jax_weights['params']}, tokens=tokens_jax, start_pos=start_pos, kv_cache=kv_cache_jax)
+    print(f"  Output logits shape: {logits_jax.shape}")
+    print("JAX model execution complete.")
 
     # 7. Save output
     output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
     np.save(os.path.join(output_dir, "jax_logits.npy"), logits_jax)
-    print(f"JAX logits saved to {os.path.join(output_dir, 'jax_logits.npy')}")
+    print(f"\nJAX logits saved to {os.path.join(output_dir, 'jax_logits.npy')}")
 
 if __name__ == "__main__":
     generate_jax_output() 
