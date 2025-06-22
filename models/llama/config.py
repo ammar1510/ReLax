@@ -32,6 +32,7 @@ class ModelConfig:
     # head_dim is calculated: dim // n_heads = 3072 // 24 = 128
 
     mode:str = "inference"
+    dtype:str = "bfloat16"
 
 
     def __post_init__(self):
@@ -76,5 +77,6 @@ class ModelConfig:
             rms_norm_eps=hf_config['rms_norm_eps'],
             rope_theta=hf_config.get('rope_theta', 10000.0),
             max_seqlen=hf_config['rope_scaling']['original_max_position_embeddings'],
-            activation_fn=hf_config.get('hidden_act', 'silu')
+            activation_fn=hf_config.get('hidden_act', 'silu'),
+            dtype=hf_config.get('torch_dtype', 'bfloat16')
         )

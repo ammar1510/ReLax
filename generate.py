@@ -31,10 +31,10 @@ def generate(
     kv_cache = KVCache.new(
         n_layers=model.args.n_layers,
         bsz=1,
-        max_seq_len=model.args.max_seq_len,
+        max_seq_len=model.args.max_seqlen,
         kv_heads=model.args.n_kv_heads,
         head_dim=model.args.head_dim,
-        dtype=jnp.bfloat16,
+        dtype=model.args.dtype,
     )
 
     # 2. Define and JIT-compile the model step function for performance
@@ -94,7 +94,7 @@ def main(
     start_time = time.time()
 
     model_config = ModelConfig.from_json_file(ckpt_dir)
-    model_config.max_seq_len = max_seq_len
+    model_config.max_seqlen = max_seq_len
 
     tokenizer = Tokenizer(tokenizer_path)
 

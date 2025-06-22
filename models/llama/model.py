@@ -2,11 +2,9 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from utils.ops import rms_norm, apply_rotary_emb, repeat_kv, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
+from utils.ops import rms_norm, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
 from utils.kvcache import KVCache 
 from .config import ModelConfig
-
-jax.config.update("jax_enable_x64", True)
 
 
 class TransformerBlock(nn.Module):
@@ -15,20 +13,20 @@ class TransformerBlock(nn.Module):
     def setup(self):
         # Attention parameters
         self.attention = AttentionParams(
-            wq=self.param('wq', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_heads, self.args.head_dim)),
-            wk=self.param('wk', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim)),
-            wv=self.param('wv', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim)),
-            wo=self.param('wo', nn.initializers.normal(stddev=0.02), (self.args.n_heads * self.args.head_dim, self.args.dim)),
+            wq=self.param('wq', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_heads, self.args.head_dim), dtype=self.args.dtype),
+            wk=self.param('wk', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim), dtype=self.args.dtype),
+            wv=self.param('wv', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim), dtype=self.args.dtype),
+            wo=self.param('wo', nn.initializers.normal(stddev=0.02), (self.args.n_heads * self.args.head_dim, self.args.dim), dtype=self.args.dtype),
         )
         # Feed-forward parameters
         self.feed_forward = FeedForwardParams(
-            w1_gate=self.param('w1_gate', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim)),
-            w2_up=self.param('w2_up', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim)),
-            w3_down=self.param('w3_down', nn.initializers.normal(stddev=0.02), (self.args.ffn_hidden_dim, self.args.dim)),
+            w1_gate=self.param('w1_gate', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
+            w2_up=self.param('w2_up', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
+            w3_down=self.param('w3_down', nn.initializers.normal(stddev=0.02), (self.args.ffn_hidden_dim, self.args.dim), dtype=self.args.dtype),
         )
         # Normalization layer parameters
-        self.attention_norm_weight = self.param('attention_norm_weight', nn.initializers.ones, (self.args.dim,))
-        self.ffn_norm_weight = self.param('ffn_norm_weight', nn.initializers.ones, (self.args.dim,))
+        self.attention_norm_weight = self.param('attention_norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
+        self.ffn_norm_weight = self.param('ffn_norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
 
     def __call__(self, x: jax.Array, freqs_cis: jax.Array, kv_cache: KVCache, layer_idx: int, start_pos: int) -> tuple[jax.Array, KVCache]:
         # Attention block
@@ -63,20 +61,22 @@ class LLaMa(nn.Module):
         self.tok_embeddings = nn.Embed(
             num_embeddings=self.args.vocab_size,
             features=self.args.dim,
-            embedding_init=nn.initializers.normal(stddev=0.02) 
+            embedding_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.args.dtype
         )
 
         # Initialize transformer blocks
         self.layers = [TransformerBlock(self.args, name=f'layer_{i}') for i in range(self.args.n_layers)]
 
         # Final normalization weight
-        self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,))
+        self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
 
         # Output layer (Language Model head)
         self.output = nn.Dense(
             features=self.args.vocab_size,
             use_bias=False, 
-            kernel_init=nn.initializers.normal(stddev=0.02) 
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.args.dtype
         )
 
         # Precompute RoPE frequencies
@@ -85,7 +85,7 @@ class LLaMa(nn.Module):
             self.args.max_seqlen,
             self.args.rope_theta,
             dtype= jnp.float64
-        ).astype(jnp.float32)
+        ).astype(self.args.dtype)
 
     def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape
