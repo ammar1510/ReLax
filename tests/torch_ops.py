@@ -31,7 +31,6 @@ from models.llama.tokenizer import Tokenizer
 
 # -----------------------------------------------------------------------------
 # ModelArgs
-
 @dataclass
 class ModelArgs:
     dim: int = 3072
@@ -39,22 +38,15 @@ class ModelArgs:
     n_heads: int = 24
     n_kv_heads: Optional[int] = None
     vocab_size: int = 128256
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     rope_theta: float = 500000
     use_scaled_rope: bool = False
+    max_batch_size: int = 32
     max_seqlen: int = 8192
+    flash: bool = False # use flash attention?
     device: str = "cuda"
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-        if self.n_kv_heads is None:
-            self.n_kv_heads = self.n_heads
-        assert self.n_kv_heads <= self.n_heads
-        assert self.n_heads % self.n_kv_heads == 0
-        assert self.dim % self.n_heads == 0
-
 # -----------------------------------------------------------------------------
 # Transformer
 

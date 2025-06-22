@@ -125,7 +125,7 @@ def main(
         params,
         tokenizer,
         prompt,
-        max_gen_len=64,
+        max_gen_len=1,
         temperature=0.6,
         top_p=0.9,
         rng_key=rng_key,
