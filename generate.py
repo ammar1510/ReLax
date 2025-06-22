@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from jax import random
 from functools import partial
 import time
+import dataclasses
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
@@ -11,6 +12,7 @@ from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache
 from sampling import TopPSampler
+from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
 
 def generate(
@@ -36,6 +38,7 @@ def generate(
         head_dim=model.args.head_dim,
         dtype=model.args.dtype,
     )
+    print(f"KVCache size: {format_bytes(estimate_pytree_memory_footprint(kv_cache))}")
 
     # 2. Define and JIT-compile the model step function for performance
     @partial(jax.jit)
@@ -83,7 +86,7 @@ def main(
     prompt: str = "The capital of France is",
     temperature: float = 0.6,
     top_p: float = 0.9,
-    max_seq_len: int = 128,
+    max_seqlen: int = 128,
     max_gen_len: int = 64,
     seed: int = 1,
 ):
@@ -94,7 +97,7 @@ def main(
     start_time = time.time()
 
     model_config = ModelConfig.from_json_file(ckpt_dir)
-    model_config.max_seqlen = max_seq_len
+    model_config = dataclasses.replace(model_config, max_seqlen=max_seqlen)
 
     tokenizer = Tokenizer(tokenizer_path)
 
@@ -108,6 +111,10 @@ def main(
     rng_key = random.PRNGKey(seed)
 
     print(f"Loaded model and tokenizer in {time.time() - start_time:.2f} seconds")
+
+    # Estimate and print memory usage
+    params_size_bytes = estimate_pytree_memory_footprint(params)
+    print(f"Estimated model params size: {format_bytes(params_size_bytes)}")
 
     # Generate text
     result = generate(

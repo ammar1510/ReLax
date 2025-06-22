@@ -6,6 +6,7 @@ from utils.ops import rms_norm, grouped_query_attention, feed_forward, precomput
 from utils.kvcache import KVCache 
 from .config import ModelConfig
 
+jax.config.update("jax_enable_x64", True)
 
 class TransformerBlock(nn.Module):
     args: ModelConfig
@@ -65,8 +66,11 @@ class LLaMa(nn.Module):
             dtype=self.args.dtype
         )
 
-        # Initialize transformer blocks
-        self.layers = [TransformerBlock(self.args, name=f'layer_{i}') for i in range(self.args.n_layers)]
+        # Initialize transformer blocks with rematerialization
+        self.layers = [
+            nn.remat(TransformerBlock)(self.args, name=f'layer_{i}') 
+            for i in range(self.args.n_layers)
+        ]
 
         # Final normalization weight
         self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)

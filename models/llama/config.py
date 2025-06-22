@@ -75,7 +75,7 @@ class ModelConfig:
             ffn_hidden_dim=hf_config['intermediate_size'],
             vocab_size=hf_config['vocab_size'],
             rms_norm_eps=hf_config['rms_norm_eps'],
-            rope_theta=hf_config.get('rope_theta', 10000.0),
+            rope_theta=hf_config.get('rope_theta', 500000.0),
             max_seqlen=hf_config['rope_scaling']['original_max_position_embeddings'],
             activation_fn=hf_config.get('hidden_act', 'silu'),
             dtype=hf_config.get('torch_dtype', 'bfloat16')
