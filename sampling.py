@@ -58,50 +58,45 @@ def sample_top_p(logits: jax.Array, p: float, key: random.PRNGKey, temperature: 
     whose cumulative probability exceeds p, scales by temperature, and then samples.
 
     Args:
-        logits: The input logits array (usually shape [vocab_size]).
+        logits: The input logits array, shape [B, vocab_size].
         p: The cumulative probability threshold for nucleus sampling.
         key: JAX PRNG key for random sampling.
         temperature: Sampling temperature, applied before sampling.
 
     Returns:
-        The sampled token ID (scalar integer array).
+        The sampled token IDs, shape [B,].
     """
     # Apply temperature scaling first
     scaled_logits = temperature_scale(logits, temperature)
 
-    # Sort logits in descending order
-    sorted_indices = jnp.argsort(scaled_logits)[::-1]
-    sorted_logits = scaled_logits[sorted_indices]
+    # Sort logits in descending order along the vocabulary axis
+    sorted_indices = jnp.flip(jnp.argsort(scaled_logits, axis=-1), axis=-1)
+    sorted_logits = jnp.take_along_axis(scaled_logits, sorted_indices, axis=-1)
 
     # Calculate cumulative probabilities
-    probs = jax.nn.softmax(sorted_logits)
+    probs = jax.nn.softmax(sorted_logits, axis=-1)
     cumulative_probs = jnp.cumsum(probs, axis=-1)
 
     # Find indices where cumulative probability exceeds p
     # We include the first element always, and then elements where the *previous*
     # cumulative probability was less than p.
     indices_to_remove = cumulative_probs > p
-    # Shift right and insert True at the beginning
-    indices_to_remove = jnp.roll(indices_to_remove, 1)
-    indices_to_remove = indices_to_remove.at[0].set(False)
+    # Shift right and insert True at the beginning for each row
+    indices_to_remove = jnp.roll(indices_to_remove, 1, axis=-1)
+    indices_to_remove = indices_to_remove.at[:, 0].set(False)
 
     # Set logits for removed tokens to negative infinity
-    # Need to use the *original* indices to modify the *scaled* logits
-    # We create a mask based on the sorted order removal criteria
-    # Use scatter update to set the logits of removed tokens
-    # First, create a large negative value
     neg_inf = jnp.finfo(scaled_logits.dtype).min
-    # Create an array of updates, setting removed indices to neg_inf
     updates = jnp.where(indices_to_remove, neg_inf, sorted_logits)
-    # Scatter these updates back to the original logit positions based on sorted_indices
-    # Need to create the inverse permutation of sorted_indices
-    scatter_indices = jnp.argsort(sorted_indices)
-    logits_filtered = updates[scatter_indices]
 
+    # Scatter these updates back to the original logit positions
+    scatter_indices = jnp.argsort(sorted_indices, axis=-1)
+    logits_filtered = jnp.take_along_axis(updates, scatter_indices, axis=-1)
 
     # Sample from the filtered distribution
-    sampled_token_id = random.categorical(key, logits_filtered)
-    return sampled_token_id 
+    # This will return a token ID for each item in the batch, shape [B,]
+    sampled_token_ids = random.categorical(key, logits_filtered, axis=-1)
+    return sampled_token_ids
 
 class Sampler(abc.ABC):
     @abc.abstractmethod

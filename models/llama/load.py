@@ -39,15 +39,10 @@ def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
     params = {}
 
     # Token embeddings
-    params['tok_embeddings'] = {'embedding': tensors['model.embed_tokens.weight']}
+    params['tok_embeddings'] = {'embedding': tensors['model.embed_tokens.weight'].astype(config.dtype)}
 
     # Final normalization
-    params['norm_weight'] = tensors['model.norm.weight']
-
-    # Language model head (output layer)
-    # The nn.Dense layer in LLaMA expects a kernel of shape (features_in, features_out)
-    # which is (dim, vocab_size). The embedding weight is (vocab_size, dim), so we transpose it.
-    params['output'] = {'kernel': tensors['model.embed_tokens.weight'].T}
+    params['norm_weight'] = tensors['model.norm.weight'].astype(config.dtype)
 
     # Transformer layers
     for i in range(config.n_layers):
@@ -60,21 +55,21 @@ def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
         o_proj = tensors[layer_prefix + 'self_attn.o_proj.weight']
         
         # Reshape attention weights to match the model's expected format (dim, n_heads, head_dim)
-        wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim)
-        wk = k_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
-        wv = v_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
-        wo = o_proj.T
+        wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim).astype(config.dtype)
+        wk = k_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim).astype(config.dtype)
+        wv = v_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim).astype(config.dtype)
+        wo = o_proj.T.astype(config.dtype)
 
         # Get feed-forward weights
-        gate_proj = tensors[layer_prefix + 'mlp.gate_proj.weight'].T
-        up_proj = tensors[layer_prefix + 'mlp.up_proj.weight'].T
-        down_proj = tensors[layer_prefix + 'mlp.down_proj.weight'].T
+        gate_proj = tensors[layer_prefix + 'mlp.gate_proj.weight'].T.astype(config.dtype)
+        up_proj = tensors[layer_prefix + 'mlp.up_proj.weight'].T.astype(config.dtype)
+        down_proj = tensors[layer_prefix + 'mlp.down_proj.weight'].T.astype(config.dtype)
 
         # Assign weights to the layer's parameter dictionary
         # The key 'layers_i' is automatically created by Flax for lists of modules.
         params[f'layer_{i}'] = {
-            'attention_norm_weight': tensors[layer_prefix + 'input_layernorm.weight'],
-            'ffn_norm_weight': tensors[layer_prefix + 'post_attention_layernorm.weight'],
+            'attention_norm_weight': tensors[layer_prefix + 'input_layernorm.weight'].astype(config.dtype),
+            'ffn_norm_weight': tensors[layer_prefix + 'post_attention_layernorm.weight'].astype(config.dtype),
             'wq': wq,
             'wk': wk,
             'wv': wv,

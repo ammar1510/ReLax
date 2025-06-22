@@ -34,19 +34,15 @@ from models.llama.tokenizer import Tokenizer
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
+    dim: int = 3072
+    n_layers: int = 28
+    n_heads: int = 24
     n_kv_heads: Optional[int] = None
-    vocab_size: int = -1
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
+    vocab_size: int = 128256
     norm_eps: float = 1e-5
     rope_theta: float = 500000
     use_scaled_rope: bool = False
-    max_batch_size: int = 32
-    max_seqlen: int = 2048
-    flash: bool = False # use flash attention?
+    max_seqlen: int = 8192
     device: str = "cuda"
 
     def __init__(self, **kwargs):
@@ -471,7 +467,7 @@ class Llama:
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-    ) -> str:
+    ) -> Tuple[str, Optional[torch.Tensor]]:
         """
         Generate a text completion for a single prompt.
         """
@@ -487,6 +483,7 @@ class Llama:
         
         # Generate tokens one by one
         generated_tokens = []
+        logits = None
         for cur_pos in range(len(prompt_tokens), len(prompt_tokens) + max_gen_len):
             
             if cur_pos >= self.max_seqlen:
@@ -510,17 +507,13 @@ class Llama:
             tokens = torch.cat((tokens, next_token.unsqueeze(0)), dim=1)
 
         self.cleanup_caches()
-        return self.tokenizer.decode(generated_tokens)
+        return self.tokenizer.decode(generated_tokens), logits
 
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
     prompt: str = "The capital of France is",
-    temperature: float = 0.6,
-    top_p: float = 0.9,
     max_seqlen: int = 128,
-    max_batch_size: int = 1,
-    max_gen_len: int = 64,
     device: str = 'cuda'
 ):
     """
@@ -530,20 +523,22 @@ def main(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
         max_seqlen=max_seqlen,
-        max_batch_size=max_batch_size,
+        max_batch_size=1,
         device=device,
     )
 
-    result = llama.generate(
+    result, logits = llama.generate(
         prompt,
-        max_gen_len=max_gen_len,
-        temperature=temperature,
-        top_p=top_p,
+        max_gen_len=1,
     )
 
     print(f"Prompt: {prompt}")
     print(f"Generated: {result}")
     print("-" * 20)
+
+    if logits is not None:
+        np.save("logits_torch.npy", logits.cpu().numpy())
+        print("Logits saved to logits_torch.npy")
 
 if __name__ == "__main__":
     fire.Fire(main)

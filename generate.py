@@ -5,6 +5,7 @@ from jax import random
 from functools import partial
 import time
 import dataclasses
+import numpy as np
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
@@ -63,6 +64,11 @@ def generate(
     rng_key, sample_key = random.split(rng_key)
     next_token = sampler.sample(logits, sample_key)
 
+    if max_gen_len == 1:
+        if next_token.item() not in tokenizer.stop_tokens:
+            generated_tokens.append(next_token.item())
+        return tokenizer.decode(generated_tokens), logits
+
     for _ in range(max_gen_len - 1):
         if next_token.item() in tokenizer.stop_tokens:
             break
@@ -77,17 +83,14 @@ def generate(
         rng_key, sample_key = random.split(rng_key)
         next_token = sampler.sample(logits, sample_key)
 
-    return tokenizer.decode(generated_tokens)
+    return tokenizer.decode(generated_tokens), None
 
 
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
     prompt: str = "The capital of France is",
-    temperature: float = 0.6,
-    top_p: float = 0.9,
     max_seqlen: int = 128,
-    max_gen_len: int = 64,
     seed: int = 1,
 ):
     """
@@ -117,21 +120,25 @@ def main(
     print(f"Estimated model params size: {format_bytes(params_size_bytes)}")
 
     # Generate text
-    result = generate(
+    result, logits = generate(
         model,
         params,
         tokenizer,
         prompt,
-        max_gen_len,
-        temperature,
-        top_p,
-        rng_key,
+        max_gen_len=64,
+        temperature=0.6,
+        top_p=0.9,
+        rng_key=rng_key,
     )
 
     # Print the result
     print(f"\nPrompt: {prompt}")
     print(f"Generated: {result}")
     print("-" * 20)
+
+    if logits is not None:
+        np.save("logits_jax.npy", np.array(logits))
+        print("Logits saved to logits_jax.npy")
 
 
 if __name__ == "__main__":

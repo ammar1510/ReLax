@@ -179,7 +179,7 @@ def grouped_query_attention(
     query_positions = jnp.arange(seqlen) + start_pos
     key_positions = jnp.arange(max_seqlen)
 
-    mask = query_positions[:, None] >= key_positions[None, :][None, :, :] # [1, seqlen, max_seqlen]
+    mask = (query_positions[:, None] >= key_positions[None, :])[None, :, :] # [1, seqlen, max_seqlen] 
 
     if prefill_mask is not None:
         # Mask out queries at padding positions

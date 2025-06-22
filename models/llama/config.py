@@ -78,5 +78,5 @@ class ModelConfig:
             rope_theta=hf_config.get('rope_theta', 500000.0),
             max_seqlen=hf_config['rope_scaling']['original_max_position_embeddings'],
             activation_fn=hf_config.get('hidden_act', 'silu'),
-            dtype=hf_config.get('torch_dtype', 'bfloat16')
+            dtype=hf_config.get('dtype', 'bfloat16')
         )

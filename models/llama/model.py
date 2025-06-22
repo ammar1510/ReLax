@@ -75,14 +75,6 @@ class LLaMa(nn.Module):
         # Final normalization weight
         self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
 
-        # Output layer (Language Model head)
-        self.output = nn.Dense(
-            features=self.args.vocab_size,
-            use_bias=False, 
-            kernel_init=nn.initializers.normal(stddev=0.02),
-            dtype=self.args.dtype
-        )
-
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim, 
@@ -101,6 +93,8 @@ class LLaMa(nn.Module):
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
-        logits = self.output(h)
+        # Tie weights: use the token embedding matrix for the final linear layer
+        output_kernel = self.tok_embeddings.embedding.T
+        logits = jnp.einsum('bsd,dv->bsv', h, output_kernel)
 
         return logits, kv_cache # Return logits and the updated KVCache 
