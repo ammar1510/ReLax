@@ -29,16 +29,16 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
     if use_scaled:
         raise NotImplementedError("`use_scaled` is not implemented.")
 
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = jnp.arange(end, dtype=dtype)
-    freqs = jnp.outer(t, freqs)
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim)) # Shape: (dim // 2,)
+    t = jnp.arange(end, dtype=dtype) # Shape: (end,)
+    freqs = jnp.outer(t, freqs) # Shape: (end, dim // 2)
 
     # In JAX, torch.polar(torch.ones_like(freqs), freqs) is equivalent to jnp.cos(freqs) + 1j * jnp.sin(freqs)
-    freqs_cos = jnp.cos(freqs)
-    freqs_sin = jnp.sin(freqs)
+    freqs_cos = jnp.cos(freqs) # Shape: (end, dim // 2)
+    freqs_sin = jnp.sin(freqs) # Shape: (end, dim // 2)
 
     # Stack on the last dimension to create a shape of [end, dim // 2, 2]
-    freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1)
+    freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1) # Shape: (end, dim // 2, 2)
     return freqs_cis
 
 @struct.dataclass
@@ -94,7 +94,7 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
     # freqs_cis: [seqlen, head_dim//2, 2] -> [1, seqlen, 1, head_dim//2, 2]
     # This reshapes freqs_cis to be broadcastable with the x tensor.
-    freqs_cis = jnp.expand_dims(freqs_cis, axis=(0, 2))
+    freqs_cis = jnp.reshape(freqs_cis, (1, x_shaped.shape[1], 1, x_shaped.shape[3], 2))
     freqs_cos, freqs_sin = freqs_cis[..., 0], freqs_cis[..., 1]
 
     # Apply the rotation using complex number multiplication logic.
@@ -128,8 +128,8 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
 
 @jit
 def grouped_query_attention(
-    x: jnp.ndarray,
-    freqs_cis: jnp.ndarray, # Precomputed freqs for max_seqlen
+    x: jax.Array,
+    freqs_cis: jax.Array, # Precomputed freqs for max_seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
@@ -141,7 +141,7 @@ def grouped_query_attention(
 
     Args:
         x: Input tensor of shape [batch_size, seqlen, dim] (seqlen=1 for decoding).
-        freqs_cis: Precomputed rotary frequency embeddings (complex format, shape like [2, max_seqlen, head_dim//2]).
+        freqs_cis: Precomputed rotary frequency embeddings (complex format, shape like [max_seqlen, head_dim//2, 2]).
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
         kv_cache: The current KV Cache.
         layer_idx: The index of the current layer.
@@ -160,8 +160,8 @@ def grouped_query_attention(
 
     # Apply rotary positional embeddings
     current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0)
-    xq = apply_rotary_emb(xq, freqs_cis=current_freqs_cis)
-    xk = apply_rotary_emb(xk, freqs_cis=current_freqs_cis)
+    xq = apply_rotary_emb(xq, freqs_cis=current_freqs_cis) # Shape: (bsz, seqlen, n_heads, head_dim)
+    xk = apply_rotary_emb(xk, freqs_cis=current_freqs_cis) # Shape: (bsz, seqlen, n_kv_heads, head_dim)
 
     # During prefill, mask out padding tokens before caching
     if prefill_mask is not None:

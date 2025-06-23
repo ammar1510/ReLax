@@ -66,11 +66,7 @@ class LLaMa(nn.Module):
             dtype=self.args.dtype
         )
 
-        # Initialize transformer blocks with rematerialization
-        self.layers = [
-            nn.remat(TransformerBlock)(self.args, name=f'layer_{i}') 
-            for i in range(self.args.n_layers)
-        ]
+        self.layers = [TransformerBlock(self.args, name=f'layer_{i}') for i in range(self.args.n_layers)]
 
         # Final normalization weight
         self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
