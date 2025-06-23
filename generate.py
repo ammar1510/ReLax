@@ -60,37 +60,30 @@ def generate(
 
     # 4. Autoregressive generation loop
     generated_tokens = []
-    # Sample the first token from the pre-fill logits
+
     rng_key, sample_key = random.split(rng_key)
     next_token = sampler.sample(logits, sample_key)
+    generated_tokens.append(next_token.item())
 
-    if max_gen_len == 1:
-        if next_token.item() not in tokenizer.stop_tokens:
-            generated_tokens.append(next_token.item())
-        return tokenizer.decode(generated_tokens), logits
+    current_pos = tokens.shape[1]
+    tokens = jnp.concatenate([tokens, next_token.reshape(1,1)], axis=1)
 
-    for _ in range(max_gen_len - 1):
-        if next_token.item() in tokenizer.stop_tokens:
-            break
-
+    for _ in range(max_gen_len):
         generated_tokens.append(next_token.item())
-
-        current_pos = tokens.shape[1]
-        tokens = jnp.concatenate([tokens, next_token.reshape(1,1)], axis=1)
 
         logits, kv_cache = _model_step(params, next_token.reshape(1,1), kv_cache, current_pos)
 
         rng_key, sample_key = random.split(rng_key)
         next_token = sampler.sample(logits, sample_key)
 
-    return tokenizer.decode(generated_tokens), None
+    return tokenizer.decode(generated_tokens)
 
 
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    prompt: str = "The capital of France is",
-    max_seqlen: int = 128,
+    prompt: str = "",
+    max_seqlen: int = 512,
     seed: int = 1,
 ):
     """
@@ -120,12 +113,12 @@ def main(
     print(f"Estimated model params size: {format_bytes(params_size_bytes)}")
 
     # Generate text
-    result, logits = generate(
+    result = generate(
         model,
         params,
         tokenizer,
         prompt,
-        max_gen_len=1,
+        max_gen_len=500,
         temperature=0.6,
         top_p=0.9,
         rng_key=rng_key,
@@ -135,11 +128,6 @@ def main(
     print(f"\nPrompt: {prompt}")
     print(f"Generated: {result}")
     print("-" * 20)
-
-    if logits is not None:
-        np.save("logits_jax.npy", np.array(logits))
-        print("Logits saved to logits_jax.npy")
-
-
+    
 if __name__ == "__main__":
     fire.Fire(main) 
