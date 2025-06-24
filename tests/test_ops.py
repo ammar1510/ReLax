@@ -15,6 +15,8 @@ from utils.ops import AttentionParams, grouped_query_attention, FeedForwardParam
 from utils.kvcache import KVCache as KVCache_jax
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_default_matmul_precision", "float32")
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def test_precompute_freqs_cis():
@@ -287,7 +289,7 @@ def test_attention_with_padding():
     output_torch = torch_attention.forward(x_torch, start_pos, freqs_cis_torch_sliced, final_torch_mask)
 
     # Manually zero out the output for padded tokens in the torch output to match the JAX behavior
-    output_torch = torch.where(torch.tensor(prefill_mask_np).unsqueeze(-1), output_torch, 0.0)
+    output_torch = torch.where(torch_prefill_mask.unsqueeze(-1), output_torch, 0.0)
 
     # 6. Compare output tensors
     np.testing.assert_allclose(np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=1e-5, atol=5e-3)

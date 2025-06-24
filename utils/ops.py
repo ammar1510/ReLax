@@ -11,7 +11,7 @@ from typing import Optional
 from functools import partial
 
 @partial(jit, static_argnames=['dim', 'end', 'theta', 'use_scaled', 'dtype'])
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """
     Precompute the rotational frequency embeddings.
     This function is a JAX implementation of the PyTorch code snippet provided by the user.

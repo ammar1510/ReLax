@@ -11,15 +11,17 @@ from utils.kvcache import KVCache as KVCache_jax
 # PyTorch model components
 from tests.torch_ops import Transformer as Llama_torch, ModelArgs, KVCache as KVCache_torch
 
+jax.config.update("jax_default_matmul_precision", "highest")
+
 def test_transformer_forward_pass():
     # 1. Shared Configuration
     dim = 3072
-    n_layers = 24
+    n_layers = 28
     n_heads = 24
-    n_kv_heads = 24
-    vocab_size = 512
-    multiple_of = 32
-    max_seqlen = 256
+    n_kv_heads = 8
+    vocab_size = 128256
+    multiple_of = 256
+    max_seqlen = 8192
     batch_size = 4 # Increased batch size
     seqlen = 64
     start_pos = 10 # This will be the size of our pre-filled cache

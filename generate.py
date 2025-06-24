@@ -15,6 +15,8 @@ from utils.kvcache import KVCache
 from sampling import TopPSampler
 from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
+jax.config.update("jax_default_matmul_precision", "float32")
+
 
 def generate(
     model: LLaMa,
@@ -82,7 +84,7 @@ def generate(
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    prompt: str = "",
+    prompt: str = "Hi, what's your name?",
     max_seqlen: int = 512,
     seed: int = 1,
 ):
