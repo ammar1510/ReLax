@@ -1,6 +1,8 @@
+from functools import partial
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from jax import jit
 
 from utils.ops import rms_norm, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
 from utils.kvcache import KVCache 

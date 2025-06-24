@@ -56,7 +56,7 @@ class FeedForwardParams:
 
 
 @jit
-def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-6) -> jax.Array:
+def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
     """
     Apply Root Mean Square Normalization.
 

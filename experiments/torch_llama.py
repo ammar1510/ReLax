@@ -31,30 +31,41 @@ from models.llama.tokenizer import Tokenizer
 
 # -----------------------------------------------------------------------------
 # ModelArgs
+
 @dataclass
 class ModelArgs:
-    dim: int = 3072
-    n_layers: int = 28
-    n_heads: int = 24
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = 128256
+    vocab_size: int = -1
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     rope_theta: float = 500000
     use_scaled_rope: bool = False
     max_batch_size: int = 32
-    max_seqlen: int = 8192
+    max_seq_len: int = 2048
     flash: bool = False # use flash attention?
-    device: str = "cuda"
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        if self.n_kv_heads is None:
+            self.n_kv_heads = self.n_heads
+        assert self.n_kv_heads <= self.n_heads
+        assert self.n_heads % self.n_kv_heads == 0
+        assert self.dim % self.n_heads == 0
+
 # -----------------------------------------------------------------------------
 # Transformer
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, device: str = "cuda"):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, device=device))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -86,9 +97,9 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False, dtype: torch.dtype = torch.float32, device: str = "cuda"):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].to(dtype) / dim))
-    t = torch.arange(end, device=device, dtype=dtype)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
@@ -134,7 +145,7 @@ class KVCache(nn.Module):
         self.register_buffer("cache_k", torch.zeros(cache_shape, dtype=dtype, device=device))
         self.register_buffer("cache_v", torch.zeros(cache_shape, dtype=dtype, device=device))
 
-    def update(self, start_pos, xk, xv) -> Tuple[torch.Tensor, torch.Tensor]:
+    def update(self, start_pos, xk, xv):
         seqlen = xk.size(1)
         self.cache_k[:, start_pos : start_pos + seqlen] = xk
         self.cache_v[:, start_pos : start_pos + seqlen] = xv
@@ -145,7 +156,7 @@ class KVCache(nn.Module):
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.flash = False # use flash attention?
+        self.flash = args.flash # use flash attention?
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         # model_parallel_size = fs_init.get_model_parallel_world_size()
         model_parallel_size = 1 # AK: model parallel size is 1 for 1 GPU
@@ -160,7 +171,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         # will be KVCache object managed by inference context manager
-        self.cache: Optional[KVCache] = None
+        self.cache = None
 
     def forward(
         self,
@@ -257,21 +268,19 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim, device=params.device)
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.layers = nn.ModuleList(
             TransformerBlock(params) for _ in range(params.n_layers)
         )
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps, device=params.device)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False, device=params.device)
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
-            params.max_seqlen,
+            params.max_seq_len * 2,
             params.rope_theta,
             params.use_scaled_rope,
-            dtype=torch.float64,
-            device=params.device
-        ).to(torch.float32)
+        )
 
     def forward_inference(self, tokens: torch.Tensor, start_pos: int):
         # for use during inference
@@ -367,170 +376,345 @@ class Transformer(nn.Module):
 # Llama wrapper
 
 class Llama:
+
     @staticmethod
     def build(
         ckpt_dir: str,
         tokenizer_path: str,
-        max_seqlen: int,
+        max_seq_len: int,
         max_batch_size: int,
-        device: str,
+        flash: bool = False,
+        model_parallel_size: Optional[int] = 1,
         seed: int = 1,
     ) -> "Llama":
-        """
-        Build a Llama instance by loading the model weights and tokenizer.
-        """
-        start_time = time.time()
-        
-        # Seed for reproducibility
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+        assert 1 <= max_seq_len <= 8192, f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
+        assert os.path.isdir(ckpt_dir), f"Checkpoint directory '{ckpt_dir}' does not exist."
+        assert os.path.isfile(tokenizer_path), f"Tokenizer file '{tokenizer_path}' does not exist."
 
-        # Load model parameters from params.json
+        local_rank = 0
+        torch.cuda.set_device(local_rank)
+        torch.manual_seed(seed) # seed must be the same in all processes
+
+        start_time = time.time()
+        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
+        assert model_parallel_size == len(checkpoints)
+        ckpt_path = checkpoints[0]
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
-        
+
         model_args: ModelArgs = ModelArgs(
-            max_seqlen=max_seqlen,
+            max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
-            device=device,
+            flash=flash,
             **params,
         )
-
-        # Initialize the tokenizer
-        tokenizer = Tokenizer(tokenizer_path)
-        model_args.vocab_size = tokenizer.vocab_size
-        
-        # Determine the compute dtype
-        compute_dtype = torch.float16
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            compute_dtype = torch.bfloat16
-
-        # Create the model
-        model = Transformer(model_args).to(device, dtype=compute_dtype)
-
-        # Load the checkpoint
-        checkpoints = sorted(glob.glob(str(Path(ckpt_dir) / "consolidated.*.pth")))
-        if not checkpoints:
-            raise FileNotFoundError(f"No checkpoint files found in {ckpt_dir}")
-
-        state_dict = {}
-        for ckpt_path in checkpoints:
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            state_dict.update(checkpoint)
-            del checkpoint
-        
-        model.load_state_dict(state_dict, strict=False)
-        del state_dict
-
-        print(f"Loaded model in {time.time() - start_time:.2f} seconds")
+        tokenizer = Tokenizer(model_path=tokenizer_path)
+        assert model_args.vocab_size == tokenizer.vocab_size
+        if torch.cuda.is_bf16_supported():
+            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        else:
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        model = Transformer(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded in {time.time() - start_time:.2f} seconds")
         return Llama(model, tokenizer)
 
     def __init__(self, model: Transformer, tokenizer: Tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = next(model.parameters()).device
-        self.max_seqlen = model.params.max_seqlen
-
-    def setup_caches(self, batch_size: int, dtype: torch.dtype):
-        # Initialize KV Caches for each layer
-        for layer in self.model.layers:
-            if hasattr(layer.attention, 'cache') and layer.attention.cache is None:  # type: ignore
-                layer.attention.cache = KVCache(  # type: ignore
-                    batch_size=batch_size,
-                    seq_length=self.max_seqlen,
-                    n_kv_heads=self.model.params.n_kv_heads,
-                    head_dim=self.model.params.dim // self.model.params.n_heads,
-                    dtype=dtype,
-                    device=self.device
-                )
-
-    def cleanup_caches(self):
-        # Free up memory by deleting caches
-        for layer in self.model.layers:
-            if hasattr(layer.attention, 'cache'):  # type: ignore
-                layer.attention.cache = None  # type: ignore
-        torch.cuda.empty_cache()
 
     @torch.inference_mode()
     def generate(
         self,
-        prompt: str,
+        prompt_tokens: List[List[int]],
+        sample_rng: torch.Generator,
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-    ) -> Tuple[str, Optional[torch.Tensor]]:
+        echo: bool = False,
+    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
-        Generate a text completion for a single prompt.
+        prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+        max_gen_len (int): Maximum length of the generated text sequence.
+        temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+        top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+        logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+        echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
         """
-        self.setup_caches(batch_size=1, dtype=self.model.tok_embeddings.weight.dtype)
+        params = self.model.params
+        bsz = len(prompt_tokens)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
-        prompt_tokens = self.tokenizer.encode(prompt, bos=True, eos=False)
-        
-        # The tokens tensor starts with the prompt tokens
-        tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-        
-        # Pre-fill the KV cache with the prompt tokens
-        self.model.forward_inference(tokens, 0)
-        
-        # Generate tokens one by one
-        generated_tokens = []
-        logits = None
-        for cur_pos in range(len(prompt_tokens), len(prompt_tokens) + max_gen_len):
-            
-            if cur_pos >= self.max_seqlen:
-                break # sequence length limit
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.max_seq_len
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
-            # The input to the model is the last token generated
-            # The start_pos is the position of that token in the sequence
-            logits = self.model.forward_inference(tokens[:, cur_pos-1:cur_pos], cur_pos-1)
-            
-            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-            
-            next_token_val = next_token.item()
+        # install KV cache in all the Attention layers
+        for block in self.model.layers:
+            layer_dtype = block.attention.wq.weight.dtype
+            layer_device = block.attention.wq.weight.device
+            block.attention.cache = KVCache(
+                batch_size=bsz,
+                seq_length=total_len,
+                n_kv_heads=params.n_kv_heads,
+                head_dim=params.dim // params.n_heads,
+                dtype=layer_dtype,
+                device=layer_device,
+            )
 
-            # Stop if the End of Sequence token is generated
-            if next_token_val == self.tokenizer.eos_id:
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        input_text_mask = tokens != pad_id
+
+        if min_prompt_len == total_len:
+            logits = self.model.forward_inference(tokens, prev_pos)
+
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
+
+        for cur_pos in range(min_prompt_len, total_len):
+            # get the logits for the next token in all the batch rows
+            logits = self.model.forward_inference(tokens[:, prev_pos:cur_pos], prev_pos)
+            # sample the next token
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = sample_top_p(probs, top_p, sample_rng)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+            next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            )
+            tokens[:, cur_pos] = next_token
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                torch.isin(next_token, stop_tokens)
+            )
+            prev_pos = cur_pos
+            if all(eos_reached):
                 break
-            
-            # Add the generated token to our lists
-            generated_tokens.append(next_token_val)
-            tokens = torch.cat((tokens, next_token.unsqueeze(0)), dim=1)
 
-        self.cleanup_caches()
-        return self.tokenizer.decode(generated_tokens), logits
+        out_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = 0 if echo else len(prompt_tokens[i])
+            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = toks.index(stop_token)
+                    toks = toks[:eos_idx]
+                except ValueError:
+                    pass
+            out_tokens.append(toks)
+
+        # clean up the KV cache in all the layers
+        for block in self.model.layers:
+            block.attention.cache = None
+
+        return out_tokens
+
+    def text_completion(
+        self,
+        prompts: List[str],
+        sample_rng: torch.Generator,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        max_gen_len: Optional[int] = None,
+        echo: bool = False,
+    ):
+        if max_gen_len is None:
+            max_gen_len = self.model.params.max_seq_len - 1
+        # encode the (string) prompts to tokens
+        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        # generate the completions in tokens space
+        generation_tokens = self.generate(
+            prompt_tokens=prompt_tokens,
+            sample_rng=sample_rng,
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            echo=echo,
+        )
+        # decode the completions back to strings
+        completions = [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
+        return completions
+
+def sample_top_p(probs, p, generator):
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1, generator=generator)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
+# -----------------------------------------------------------------------------
+# distributed and sharded data loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240801:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        exit(1)
+    assert header[1] == 7, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
+        assert header[1] == 7, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedShardedDataLoader:
+    """
+    This DataLoader is both:
+    - distributed (works correctly in case of multiple processes in DDP)
+    - sharded (supports datasets that are broken up into multiple data shards)
+    It is not *permuted*, meaning that it itearates over the data in the order
+    of the dataset on disk, so the user should make sure to shuffle their examples
+    during the creation of their data shards for best performance.
+    """
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+
+        # kick things off
+        self.current_shard = None
+        self.reset()
+
+    def reset(self):
+        # we're being a bit clever here: if we already had shard 0 loaded,
+        # then don't do the work to reload it, just reset the pointer
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.process_rank * self.B * self.T
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf, dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the start pointer in current shard
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x, y
+
+# -----------------------------------------------------------------------------
+# int main
 
 def main(
-    ckpt_dir: str,
-    tokenizer_path: str,
-    prompt: str = "The capital of France is",
-    max_seqlen: int = 128,
-    device: str = 'cuda'
+    ckpt_dir: str = "llama-models/models/llama3_1/Meta-Llama-3.1-8B",
+    tokenizer_path: str = "llama-models/models/llama3_1/Meta-Llama-3.1-8B/tokenizer.model",
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+    max_seq_len: int = 256,
+    max_gen_len: int = 256,
+    max_batch_size: int = 8,
+    flash: bool = True,
 ):
-    """
-    Entry point for running the Llama 3.1 model for text generation.
-    """
+
+    # load the val data shard
+    data_loader = DistributedShardedDataLoader(
+        filename_pattern="tinystories/*_val.bin",
+        B=max_batch_size,
+        T=max_seq_len,
+        process_rank=0,
+        num_processes=1,
+    )
+
     llama = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
-        max_seqlen=max_seqlen,
-        max_batch_size=1,
-        device=device,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        flash=flash,
     )
 
-    result, logits = llama.generate(
-        prompt,
-        max_gen_len=1,
+    total_batch_size = max_batch_size * max_seq_len
+    print(f"total_batch_size: {total_batch_size}")
+
+    # super simple training loop to start
+    model = llama.model
+    model.train()
+    optimizer = model.configure_optimizers(learning_rate=1e-5, weight_decay=0.0)
+    for step in range(20):
+        optimizer.zero_grad()
+        x, y = data_loader.next_batch()
+        x, y = x.cuda(), y.cuda()
+        loss = model.forward_loss(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {step}, loss: {loss.item()}")
+
+    # and now generate
+    model.eval()
+    prompts: List[str] = [
+        "Once upon a time",
+        "One day",
+        "Lily and George were best friends",
+        "On a dark and stormy night",
+    ]
+
+    sample_rng = torch.Generator(device='cuda')
+    sample_rng.manual_seed(1337)
+    t0 = time.time()
+    results = llama.text_completion(
+        prompts,
+        sample_rng=sample_rng,
+        max_gen_len=max_gen_len,
+        temperature=temperature,
+        top_p=top_p,
     )
-
-    print(f"Prompt: {prompt}")
-    print(f"Generated: {result}")
-    print("-" * 20)
-
-    if logits is not None:
-        np.save("logits_torch.npy", logits.cpu().numpy())
-        print("Logits saved to logits_torch.npy")
+    t1 = time.time()
+    print(f"Generated in {t1 - t0:.2f} seconds")
+    for prompt, result in zip(prompts, results):
+        print(prompt, end="") # AK: change end="\n" to end=""
+        print(f"{result['generation']}")
+        print("\n==================================\n")
 
 if __name__ == "__main__":
     fire.Fire(main)

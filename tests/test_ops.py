@@ -3,14 +3,14 @@ import torch
 import jax
 import jax.numpy as jnp
 from utils.ops import precompute_freqs_cis as precompute_freqs_cis_jax
-from tests.torch_ops import precompute_freqs_cis as precompute_freqs_cis_torch
+from experiments.torch_llama import precompute_freqs_cis as precompute_freqs_cis_torch
 from utils.ops import apply_rotary_emb as apply_rotary_emb_jax
-from tests.torch_ops import apply_rotary_emb as apply_rotary_emb_torch
+from experiments.torch_llama import apply_rotary_emb as apply_rotary_emb_torch
 from utils.ops import repeat_kv as repeat_kv_jax
-from tests.torch_ops import repeat_kv as repeat_kv_torch
+from experiments.torch_llama import repeat_kv as repeat_kv_torch
 from utils.ops import rms_norm as rms_norm_jax
-from tests.torch_ops import RMSNorm as RMSNorm_torch
-from tests.torch_ops import ModelArgs, Attention as Attention_torch, KVCache as KVCache_torch, FeedForward as FeedForward_torch
+from experiments.torch_llama import RMSNorm as RMSNorm_torch
+from experiments.torch_llama import ModelArgs, Attention as Attention_torch, KVCache as KVCache_torch, FeedForward as FeedForward_torch
 from utils.ops import AttentionParams, grouped_query_attention, FeedForwardParams, feed_forward as feed_forward_jax
 from utils.kvcache import KVCache as KVCache_jax
 

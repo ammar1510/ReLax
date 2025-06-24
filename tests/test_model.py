@@ -9,7 +9,7 @@ from models.llama.config import ModelConfig
 from utils.kvcache import KVCache as KVCache_jax
 
 # PyTorch model components
-from tests.torch_ops import Transformer as Llama_torch, ModelArgs, KVCache as KVCache_torch
+from experiments.torch_llama import Transformer as Llama_torch, ModelArgs, KVCache as KVCache_torch
 
 jax.config.update("jax_default_matmul_precision", "highest")
 

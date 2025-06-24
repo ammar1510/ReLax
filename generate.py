@@ -1,7 +1,7 @@
 import fire
 import jax
 import jax.numpy as jnp
-from jax import random
+from jax import random, jit
 from functools import partial
 import time
 import dataclasses
@@ -44,8 +44,8 @@ def generate(
     print(f"KVCache size: {format_bytes(estimate_pytree_memory_footprint(kv_cache))}")
 
     # 2. Define and JIT-compile the model step function for performance
-    @partial(jax.jit)
-    def _model_step(params, tokens, kv_cache, start_pos):
+    @partial(jit, static_argnames=['model'])
+    def _model_step(model, params, tokens, kv_cache, start_pos):
         logits, updated_kv_cache = model.apply(
             {'params': params},
             tokens,
@@ -55,29 +55,20 @@ def generate(
         return logits[:, -1, :], updated_kv_cache
 
     # 3. Encode prompt and pre-fill KV cache
-    prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
+    prompt_tokens = tokenizer.encode(prompt, bos=False, eos=False)
     tokens = jnp.array([prompt_tokens], dtype=jnp.int32)
-
-    logits, kv_cache = _model_step(params, tokens, kv_cache, 0)
-
-    # 4. Autoregressive generation loop
-    generated_tokens = []
-
-    rng_key, sample_key = random.split(rng_key)
-    next_token = sampler.sample(logits, sample_key)
-    generated_tokens.append(next_token.item())
-
-    current_pos = tokens.shape[1]
-    tokens = jnp.concatenate([tokens, next_token.reshape(1,1)], axis=1)
+    current_pos = 0
+    generated_tokens = list(prompt_tokens)
 
     for _ in range(max_gen_len):
-        generated_tokens.append(next_token.item())
 
-        logits, kv_cache = _model_step(params, next_token.reshape(1,1), kv_cache, current_pos)
-        current_pos += 1
+        logits, kv_cache = _model_step(model, params, tokens, kv_cache, current_pos)
+        current_pos += tokens.shape[1]
 
         rng_key, sample_key = random.split(rng_key)
         next_token = sampler.sample(logits, sample_key)
+        generated_tokens.append(next_token.item())
+        tokens = next_token[:,None]
 
     return tokenizer.decode(generated_tokens)
 
@@ -85,7 +76,7 @@ def generate(
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    prompt: str = "Hi, what's your name?",
+    prompt: str = "In order to bake a cake, you need to follow these steps: ",
     max_seqlen: int = 512,
     seed: int = 1,
 ):
