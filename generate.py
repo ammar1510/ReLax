@@ -74,6 +74,7 @@ def generate(
         generated_tokens.append(next_token.item())
 
         logits, kv_cache = _model_step(params, next_token.reshape(1,1), kv_cache, current_pos)
+        current_pos += 1
 
         rng_key, sample_key = random.split(rng_key)
         next_token = sampler.sample(logits, sample_key)
