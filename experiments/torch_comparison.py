@@ -11,7 +11,7 @@ def create_mock_torch_model_and_inputs():
     This function creates a mock LLaMa model using PyTorch, runs a forward pass
     with mock inputs, and saves the model weights and output logits.
     """
-    config_path = 'artifacts/weights/Llama-3.2-3B/config.json'
+    config_path = "experiments/config.json"
     with open(config_path, 'r') as f:
         config = json.load(f)
 

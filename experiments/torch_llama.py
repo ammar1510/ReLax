@@ -273,7 +273,6 @@ class Transformer(nn.Module):
             TransformerBlock(params) for _ in range(params.n_layers)
         )
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
@@ -304,7 +303,8 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
-        output = self.output(h).float()
+        # Use weight tying: transpose embedding weights for output projection
+        output = torch.matmul(h, self.tok_embeddings.weight.T).float()
         return output
 
     def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100):
@@ -322,7 +322,8 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
-        logits = self.output(h).float()
+        # Use weight tying: transpose embedding weights for output projection
+        logits = torch.matmul(h, self.tok_embeddings.weight.T).float()
         # and then loss
         loss = F.cross_entropy(
             input=logits.transpose(1, 2),
@@ -346,21 +347,16 @@ class Transformer(nn.Module):
             for param in self.parameters():
                 train_params.append(param)
         elif finetune_type == "all_no_pos":
-            # let's train all parameters except the positional embeddings and lm_head
-            n, m = 0, 0
+            # let's train all parameters except the positional embeddings and embeddings
+            m = 0
             for name, param in self.named_parameters():
-                if name == "output.weight":
-                    # do not include
-                    n += 1
-                    continue
-                elif name == "tok_embeddings.weight":
+                if name == "tok_embeddings.weight":
                     # do not include and also does not require grad
                     m += 1
                     param.requires_grad = False
                 else:
                     # do include
                     train_params.append(param)
-            assert n == 1, "did not find output.weight"
             assert m == 1, "did not find tok_embeddings.weight"
 
         print("number of parameters: ", sum(p.numel() for p in self.parameters()))
