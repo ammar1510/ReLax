@@ -10,35 +10,34 @@ from .kvcache import KVCache
 from typing import Optional
 from functools import partial
 
-@partial(jit, static_argnames=['dim', 'end', 'theta', 'use_scaled', 'dtype'])
-def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
+@partial(jit, static_argnames=['head_dim', 'end', 'theta', 'use_scaled', 'dtype'])
+def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """
     Precompute the rotational frequency embeddings.
-    This function is a JAX implementation of the PyTorch code snippet provided by the user.
 
     Args:
-        dim: Dimension of each attention head.
+        head_dim: Dimension of each attention head.
         end: Maximum sequence length supported by the model.
         theta: Base parameter for frequency calculation.
         use_scaled: Whether to apply scaling to frequencies. Not implemented.
 
     Returns:
         A JAX array of shape for the rotary embeddings.
-        The shape is `[end, dim // 2, 2]` containing the cosine and sine components.
+        The shape is `[end, head_dim // 2, 2]` containing the cosine and sine components.
     """
     if use_scaled:
         raise NotImplementedError("`use_scaled` is not implemented.")
 
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim)) # Shape: (dim // 2,)
+    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)) # Shape: (head_dim // 2,)
     t = jnp.arange(end, dtype=dtype) # Shape: (end,)
-    freqs = jnp.outer(t, freqs) # Shape: (end, dim // 2)
+    freqs = jnp.outer(t, freqs) # Shape: (end, head_dim // 2)
 
     # In JAX, torch.polar(torch.ones_like(freqs), freqs) is equivalent to jnp.cos(freqs) + 1j * jnp.sin(freqs)
-    freqs_cos = jnp.cos(freqs) # Shape: (end, dim // 2)
-    freqs_sin = jnp.sin(freqs) # Shape: (end, dim // 2)
+    freqs_cos = jnp.cos(freqs) # Shape: (end, head_dim // 2)
+    freqs_sin = jnp.sin(freqs) # Shape: (end, head_dim // 2)
 
-    # Stack on the last dimension to create a shape of [end, dim // 2, 2]
-    freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1) # Shape: (end, dim // 2, 2)
+    # Stack on the last dimension to create a shape of [end, head_dim // 2, 2]
+    freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1) # Shape: (end, head_dim // 2, 2)
     return freqs_cis
 
 @struct.dataclass
@@ -77,8 +76,6 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     """
     Apply Rotary Positional Embeddings (RoPE) to a tensor.
 
-    This function is a JAX implementation of the PyTorch code snippet provided by the user.
-
     Args:
         x: Input tensor, shape [bsz, seqlen, n_heads, head_dim] or [bsz, seqlen, n_kv_heads, head_dim].
         freqs_cis: Precomputed rotary frequency embeddings. A JAX array of shape
@@ -94,7 +91,7 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
     # freqs_cis: [seqlen, head_dim//2, 2] -> [1, seqlen, 1, head_dim//2, 2]
     # This reshapes freqs_cis to be broadcastable with the x tensor.
-    freqs_cis = jnp.reshape(freqs_cis, (1, x_shaped.shape[1], 1, x_shaped.shape[3], 2))
+    freqs_cis = freqs_cis[None, :, None, :, :]
     freqs_cos, freqs_sin = freqs_cis[..., 0], freqs_cis[..., 1]
 
     # Apply the rotation using complex number multiplication logic.

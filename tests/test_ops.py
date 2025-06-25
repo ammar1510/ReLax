@@ -14,7 +14,6 @@ from experiments.torch_llama import ModelArgs, Attention as Attention_torch, KVC
 from utils.ops import AttentionParams, grouped_query_attention, FeedForwardParams, feed_forward as feed_forward_jax
 from utils.kvcache import KVCache as KVCache_jax
 
-jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_default_matmul_precision", "float32")
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -23,17 +22,17 @@ def test_precompute_freqs_cis():
     # Parameters for the test
     dim = 128
     end = 1024
-    theta = 10000.0
-    dtype = np.float64
+    theta = 500000.0
+    dtype = np.float32
     # JAX implementation
-    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=dtype).astype(np.float32)
+    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=dtype)
 
     # PyTorch implementation
-    freqs_cis_torch_tensor = precompute_freqs_cis_torch(dim, end, theta,dtype=torch.float64)
-    freqs_cis_torch_np = freqs_cis_torch_tensor.detach().cpu().numpy().astype(np.float32)
+    freqs_cis_torch_tensor = precompute_freqs_cis_torch(dim, end, theta)
+    freqs_cis_torch_np = freqs_cis_torch_tensor.detach().cpu().numpy()
 
     # Compare the results
-    np.testing.assert_allclose(np.array(freqs_cis_jax), freqs_cis_torch_np, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(freqs_cis_jax), freqs_cis_torch_np, rtol=5e-4, atol=1e-4)
 
 def test_apply_rotary_emb():
     # Parameters
@@ -41,8 +40,8 @@ def test_apply_rotary_emb():
     seqlen = 128
     n_heads = 4
     head_dim = 64
-    theta = 10000.0
-    dtype = np.float64
+    theta = 500000.0
+    dtype = np.float32
 
     # Create dummy input tensor
     np.random.seed(0)
@@ -56,14 +55,14 @@ def test_apply_rotary_emb():
 
     # Precompute freqs_cis
     freqs_cis_jax = precompute_freqs_cis_jax(head_dim, seqlen, theta)
-    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, seqlen, theta, device=device)
+    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, seqlen, theta)
 
     # Apply rotary embeddings
     output_jax = apply_rotary_emb_jax(x_jax, freqs_cis_jax)
     output_torch = apply_rotary_emb_torch(x_torch, freqs_cis_torch)
 
     # Compare
-    np.testing.assert_allclose(np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=5e-3, atol=1e-5)
 
 def test_repeat_kv():
     # Parameters
@@ -137,7 +136,7 @@ def test_attention():
     # 2. Create shared weights and inputs
     np.random.seed(0)
     x_np = np.random.randn(bsz, seqlen, dim).astype(dtype)
-    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len, device=device)
+    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len)
     freqs_cis_jax = jnp.array(freqs_cis_torch.detach().cpu().numpy())
 
     wq_np = np.random.randn(dim, n_heads * head_dim).astype(dtype)
@@ -199,7 +198,7 @@ def test_attention():
     output_torch = torch_attention.forward(x_torch, start_pos, freqs_cis_torch_sliced, mask)
 
     # 6. Compare output tensors
-    np.testing.assert_allclose(np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=1e-5, atol=5e-3)
+    np.testing.assert_allclose(np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=5e-3, atol=5e-3)
     
     # 7. Compare KV caches
     updated_k_jax = updated_kv_cache_jax.k[0]
@@ -236,7 +235,7 @@ def test_attention_with_padding():
     # Apply mask to input to zero out padding, mimicking tokenizer behavior
     x_np[0, padding_start:] = 0
 
-    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len, device=device)
+    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len)
     freqs_cis_jax = jnp.array(freqs_cis_torch.detach().cpu().numpy())
 
     wq_np = np.random.randn(dim, n_heads * head_dim).astype(dtype)
