@@ -7,6 +7,7 @@ from safetensors.torch import safe_open
 import flax
 from pathlib import Path
 import numpy as np
+import torch
 
 from .config import ModelConfig
 from .model import LLaMa
@@ -37,22 +38,28 @@ def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
 
     # This will be the final Flax parameter dictionary, structured to match model.py
     params = {}
+    torch_dtypes = {}
+    torch_dtypes["float32"] = torch.float32
+    torch_dtypes["float64"] = torch.float64
+    torch_dtypes["float16"] = torch.float16
+    torch_dtypes["bfloat16"] = torch.bfloat16
+    torch_dtypes["int8"] = torch.int8
 
     # Token embeddings
-    params['tok_embeddings'] = {'embedding': jnp.asarray(tensors['model.embed_tokens.weight'],dtype=config.dtype)}
+    params['tok_embeddings'] = {'embedding': jnp.asarray(tensors['model.embed_tokens.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)}
 
     # Final normalization
-    params['norm_weight'] = jnp.asarray(tensors['model.norm.weight'],dtype=config.dtype)
+    params['norm_weight'] = jnp.asarray(tensors['model.norm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
 
     # Transformer layers
     for i in range(config.n_layers):
         layer_prefix = f'model.layers.{i}.'
         
         # Get all weights from the tensor dict
-        q_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.q_proj.weight'],dtype=config.dtype)
-        k_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.k_proj.weight'],dtype=config.dtype)
-        v_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.v_proj.weight'],dtype=config.dtype)
-        o_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.o_proj.weight'],dtype=config.dtype)
+        q_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.q_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
+        k_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.k_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
+        v_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.v_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
+        o_proj = jnp.asarray(tensors[layer_prefix + 'self_attn.o_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
         
         # Reshape attention weights to match the model's expected format (dim, n_heads, head_dim)
         wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim)
@@ -61,15 +68,15 @@ def load_llama_weights(model_path: str) -> flax.core.FrozenDict:
         wo = o_proj.T
 
         # Get feed-forward weights
-        gate_proj = jnp.asarray(tensors[layer_prefix + 'mlp.gate_proj.weight'],dtype=config.dtype).T
-        up_proj = jnp.asarray(tensors[layer_prefix + 'mlp.up_proj.weight'],dtype=config.dtype).T
-        down_proj = jnp.asarray(tensors[layer_prefix + 'mlp.down_proj.weight'],dtype=config.dtype).T
+        gate_proj = jnp.asarray(tensors[layer_prefix + 'mlp.gate_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+        up_proj = jnp.asarray(tensors[layer_prefix + 'mlp.up_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+        down_proj = jnp.asarray(tensors[layer_prefix + 'mlp.down_proj.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
 
         # Assign weights to the layer's parameter dictionary
         # The key 'layers_i' is automatically created by Flax for lists of modules.
         params[f'layer_{i}'] = {
-            'attention_norm_weight': jnp.asarray(tensors[layer_prefix + 'input_layernorm.weight'],dtype=config.dtype),
-            'ffn_norm_weight': jnp.asarray(tensors[layer_prefix + 'post_attention_layernorm.weight'],dtype=config.dtype),
+            'attention_norm_weight': jnp.asarray(tensors[layer_prefix + 'input_layernorm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype),
+            'ffn_norm_weight': jnp.asarray(tensors[layer_prefix + 'post_attention_layernorm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype),
             'wq': wq,
             'wk': wk,
             'wv': wv,

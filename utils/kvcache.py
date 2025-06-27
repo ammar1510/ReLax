@@ -9,10 +9,10 @@ class KVCache:
 
   @classmethod
   # @functools.partial(jax.jit, static_argnums=(0,1,2,3,4,5)) # Jitting classmethod might be tricky, usually jit the function calling this
-  def new(cls, n_layers: int, bsz: int, max_seq_len: int, kv_heads: int, head_dim: int, dtype=jnp.bfloat16) -> 'KVCache':
+  def new(cls, n_layers: int, bsz: int, max_seqlen: int, kv_heads: int, head_dim: int, dtype=jnp.bfloat16) -> 'KVCache':
     return cls(
-        k=jnp.zeros((n_layers, bsz, max_seq_len, kv_heads, head_dim), dtype=dtype),
-        v=jnp.zeros((n_layers, bsz, max_seq_len, kv_heads, head_dim), dtype=dtype)
+        k=jnp.zeros((n_layers, bsz, max_seqlen, kv_heads, head_dim), dtype=dtype),
+        v=jnp.zeros((n_layers, bsz, max_seqlen, kv_heads, head_dim), dtype=dtype)
     )
 
   def update(self, xk: jax.Array, xv: jax.Array, layer_idx: int, start_pos: int):
@@ -36,7 +36,7 @@ class KVCache:
       A new KVCache object with the updated key and value tensors.
     """
     # xk, xv shapes: [bsz, seqlen, n_kv_heads, head_dim]
-    # self.k, self.v shapes: [layers, bsz, max_seq_len, n_kv_heads, head_dim]
+    # self.k, self.v shapes: [layers, bsz, max_seqlen, n_kv_heads, head_dim]
 
     # Ensure xk/xv have the same dtype as cache
     xk = xk.astype(self.k.dtype)
@@ -60,12 +60,12 @@ class KVCache:
   def get_layer(self, layer_idx: int):
         """Retrieves K/V for a specific layer.
         
-        Note: This returns the full cache up to max_seq_len. The caller is
+        Note: This returns the full cache up to max_seqlen. The caller is
         responsible for masking for attention computation.
         """
-        # self.k, self.v shapes: [layers, bsz, max_seq_len, n_kv_heads, head_dim]
+        # self.k, self.v shapes: [layers, bsz, max_seqlen, n_kv_heads, head_dim]
         keys = self.k[layer_idx]
         values = self.v[layer_idx]
 
-        # keys/values shape: [bsz, max_seq_len, n_kv_heads, head_dim]
+        # keys/values shape: [bsz, max_seqlen, n_kv_heads, head_dim]
         return keys, values 

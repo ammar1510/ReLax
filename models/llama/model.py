@@ -78,7 +78,8 @@ class LLaMa(nn.Module):
             self.args.head_dim, 
             self.args.max_seqlen*2,
             self.args.rope_theta,
-            dtype= jnp.float64
+            dtype= jnp.float64,
+            use_scaled=self.args.use_scaled_rope
         ).astype(self.args.dtype)
 
     def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):

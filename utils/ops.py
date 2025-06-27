@@ -10,7 +10,7 @@ from .kvcache import KVCache
 from typing import Optional
 from functools import partial
 
-@partial(jit, static_argnames=['head_dim', 'end', 'theta', 'use_scaled', 'dtype'])
+@partial(jit, static_argnames=['head_dim', 'end', 'use_scaled', 'dtype'])
 def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """
     Precompute the rotational frequency embeddings.
@@ -26,7 +26,7 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
         The shape is `[end, head_dim // 2, 2]` containing the cosine and sine components.
     """
     if use_scaled:
-        raise NotImplementedError("`use_scaled` is not implemented.")
+        freqs = apply_scaling(freqs)
 
     freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)) # Shape: (head_dim // 2,)
     t = jnp.arange(end, dtype=dtype) # Shape: (end,)
@@ -39,6 +39,47 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
     # Stack on the last dimension to create a shape of [end, head_dim // 2, 2]
     freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1) # Shape: (end, head_dim // 2, 2)
     return freqs_cis
+
+@jit
+def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
+    """
+    Apply RoPE scaling to frequencies based on Llama 3 implementation.
+    The scaling is done to extend the context length.
+
+    Args:
+        freqs: The original frequencies.
+        scale_factor: The scaling factor.
+        low_freq_factor: The factor for the low frequency.
+        high_freq_factor: The factor for the high frequency.
+        old_context_len: The original context length.
+
+    Returns:
+        The scaled frequencies.
+    """
+    # RoPE scaling (values obtained from grid search)
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    wavelen = 2 * jnp.pi / freqs
+    
+    # This is the smooth transition part from the original implementation.
+    smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    freqs_for_mid_range = (1 - smooth) * freqs / scale_factor + smooth * freqs
+    
+    # Conditions to select which scaling to apply.
+    # 1. if wavelen > low_freq_wavelen, new_freqs = freqs / scale_factor
+    # 2. if wavelen < high_freq_wavelen, new_freqs = freqs
+    # 3. otherwise, new_freqs = freqs_for_mid_range
+    new_freqs = jnp.where(
+        wavelen > low_freq_wavelen,
+        freqs / scale_factor,
+        jnp.where(
+            wavelen < high_freq_wavelen,
+            freqs,
+            freqs_for_mid_range
+        )
+    )
+    return new_freqs
 
 @struct.dataclass
 class AttentionParams:

@@ -33,6 +33,7 @@ class ModelConfig:
 
     mode:str = "inference"
     dtype:str = "bfloat16"
+    use_scaled_rope: bool = False
 
 
     def __post_init__(self):

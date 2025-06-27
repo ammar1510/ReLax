@@ -13,6 +13,9 @@ from experiments.torch_llama import RMSNorm as RMSNorm_torch
 from experiments.torch_llama import ModelArgs, Attention as Attention_torch, KVCache as KVCache_torch, FeedForward as FeedForward_torch
 from utils.ops import AttentionParams, grouped_query_attention, FeedForwardParams, feed_forward as feed_forward_jax
 from utils.kvcache import KVCache as KVCache_jax
+from utils.ops import apply_scaling as apply_scaling_jax
+from experiments.torch_llama import apply_scaling as apply_scaling_torch
+import math
 
 jax.config.update("jax_default_matmul_precision", "float32")
 
@@ -309,6 +312,43 @@ def test_attention_with_padding():
 
     np.testing.assert_allclose(np.array(updated_k_jax), updated_k_torch.detach().cpu().numpy(), rtol=1e-5, atol=1e-4)
     np.testing.assert_allclose(np.array(updated_v_jax), updated_v_torch.detach().cpu().numpy(), rtol=1e-5, atol=1e-4)
+
+def test_apply_scaling():
+    # Parameters
+    head_dim = 128
+    theta = 500000.0
+    dtype = np.float32
+
+    # Generate frequencies like in precompute_freqs_cis
+    freqs_np = 1.0 / (theta ** (np.arange(0, head_dim, 2).astype(dtype) / head_dim))
+    
+    # JAX and PyTorch inputs
+    freqs_jax = jnp.array(freqs_np)
+    freqs_torch = torch.tensor(freqs_np)
+
+    # Get the reference output from the torch implementation
+    output_torch_reference = apply_scaling_torch(freqs_torch)
+    torch_result_np = output_torch_reference.detach().cpu().numpy()
+
+    # 1. Test JAX implementation with default parameters
+    output_jax_default = apply_scaling_jax(freqs_jax)
+    np.testing.assert_allclose(np.array(output_jax_default), torch_result_np, rtol=1e-5, atol=1e-5)
+
+    # 2. Test JAX implementation with explicit parameters that match the torch hardcoded values
+    scale_factor = 8.0
+    low_freq_factor = 1.0
+    high_freq_factor = 4.0
+    old_context_len = 8192.0
+
+    output_jax_explicit = apply_scaling_jax(
+        freqs_jax,
+        scale_factor=scale_factor,
+        low_freq_factor=low_freq_factor,
+        high_freq_factor=high_freq_factor,
+        old_context_len=old_context_len
+    )
+    
+    np.testing.assert_allclose(np.array(output_jax_explicit), torch_result_np, rtol=1e-6, atol=1e-11)
 
 def test_feed_forward():
     # 1. Setup Parameters

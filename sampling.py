@@ -3,12 +3,12 @@ import jax.numpy as jnp
 from jax import random
 from jax import jit
 import abc # For Abstract Base Class
-
+from functools import partial
 """Sampling functions for the model.
 This entire file needs to be JIT compatible.
 """
 
-#@jit
+@jit
 def temperature_scale(logits: jax.Array, temperature: float) -> jax.Array:
     """
     Scales logits by temperature.
@@ -26,7 +26,7 @@ def temperature_scale(logits: jax.Array, temperature: float) -> jax.Array:
     safe_temperature = jnp.maximum(temperature, 1e-6)
     return logits / safe_temperature
 
-#@jit
+@jit
 def sample_top_k(logits: jax.Array, k: int, key: random.PRNGKey) -> jax.Array:
     """
     Samples from the top-k logits.
@@ -49,7 +49,7 @@ def sample_top_k(logits: jax.Array, k: int, key: random.PRNGKey) -> jax.Array:
     sampled_token_id = jnp.take(top_k_indices, sampled_index)
     return sampled_token_id
 
-#@jit
+@jit
 def sample_top_p(logits: jax.Array, p: float, key: random.PRNGKey, temperature: float = 1.0) -> jax.Array:
     """
     Samples using nucleus sampling (top-p).
