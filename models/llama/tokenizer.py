@@ -49,16 +49,20 @@ class Tokenizer:
             "<|end_of_text|>",
             "<|reserved_special_token_0|>",
             "<|reserved_special_token_1|>",
-            "<|reserved_special_token_2|>",
-            "<|reserved_special_token_3|>",
+            "<|finetune_right_pad_id|>",
+            "<|step_id|>",
             "<|start_header_id|>",
             "<|end_header_id|>",
-            "<|reserved_special_token_4|>",
+            "<|eom_id|>",
             "<|eot_id|>",  # end of turn
-        ] + [
-            f"<|reserved_special_token_{i}|>"
-            for i in range(5, self.num_reserved_special_tokens - 5)
+            "<|python_tag|>"
+        ] 
+        reserved_tokens = [
+            f"<|reserved_special_token_{2+i}|>"
+            for i in range(self.num_reserved_special_tokens - len(special_tokens))
         ]
+        special_tokens = special_tokens + reserved_tokens
+
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
@@ -70,12 +74,14 @@ class Tokenizer:
             special_tokens=self.special_tokens,
         )
 
-        self.vocab_size: int = self.model.n_vocab
+        self.vocab_size: int = num_base_tokens + len(special_tokens)
         # BOS / EOS token IDs
         self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
         self.eos_id: int = self.special_tokens["<|end_of_text|>"]
         self.eot_id: int = self.special_tokens["<|eot_id|>"]
-        self.pad_id: int = -1 # Tiktoken doesn't usually have a pad token
+        self.eom_id: int = self.special_tokens["<|eom_id|>"]
+        self.python_tag_id: int = self.special_tokens["<|python_tag|>"]
+        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
 
         # Tokens that signify the end of a model's turn
         self.stop_tokens = {

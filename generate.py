@@ -15,7 +15,7 @@ from utils.kvcache import KVCache
 from sampling import TopPSampler
 from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
-jax.config.update("jax_default_matmul_precision", "float32")
+jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def generate(
@@ -82,8 +82,9 @@ def main(
     """
     Entry point for running the Llama JAX model for text generation.
     """
-    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful and friendly assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather like today?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
-    print(prompt)
+    system_prompt = "You are a knowledgeable, efficient, and direct AI assistant. Provide concise answers, focusing on the key information needed. Offer suggestions tactfully when appropriate to improve outcomes. Engage in productive collaboration with the user."
+    user_prompt = "James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?"
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
     print("Loading model and tokenizer...")
     start_time = time.time()
 

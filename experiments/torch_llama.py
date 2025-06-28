@@ -412,7 +412,7 @@ class Llama:
             **params,
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
-        assert model_args.vocab_size == tokenizer.n_words
+        assert model_args.vocab_size == tokenizer.vocab_size
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
