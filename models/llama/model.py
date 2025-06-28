@@ -92,7 +92,6 @@ class LLaMa(nn.Module):
         # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
             h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, start_pos)
-            jax.debug.print(f"Output after layer {layer_idx}: {h[:, :, :20]}")
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)

@@ -75,9 +75,9 @@ def pth_to_safetensors(pth_model_path: str, config_dir: str, output_dir: str):
         wo = o_proj.T
 
         # Get feed-forward weights
-        w_up = jnp.asarray(tensors[layer_prefix + 'feed_forward.w1.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+        w_gate= jnp.asarray(tensors[layer_prefix + 'feed_forward.w1.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
         w_down = jnp.asarray(tensors[layer_prefix + 'feed_forward.w2.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
-        w_gate = jnp.asarray(tensors[layer_prefix + 'feed_forward.w3.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+        w_up = jnp.asarray(tensors[layer_prefix + 'feed_forward.w3.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
 
         # Assign weights to the layer's parameter dictionary
         # The key 'layers_i' is automatically created by Flax for lists of modules.

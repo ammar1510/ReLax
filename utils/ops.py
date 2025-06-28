@@ -40,7 +40,7 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
     return freqs_cis
 
 @jit
-def apply_scaling(freqs: jax.Array,scale_factor: float = 32.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
+def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
     """
     Apply RoPE scaling to frequencies based on Llama 3 implementation.
     The scaling is done to extend the context length.

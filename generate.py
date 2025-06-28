@@ -15,7 +15,7 @@ from utils.kvcache import KVCache
 from sampling import TopPSampler
 from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
-jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update("jax_default_matmul_precision", "float32")
 
 
 def generate(
@@ -55,7 +55,7 @@ def generate(
         return logits[:, -1, :], updated_kv_cache
 
     # 3. Encode prompt and pre-fill KV cache
-    prompt_tokens = tokenizer.encode(prompt, bos=False, eos=False)
+    prompt_tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special="all")
     tokens = jnp.array([prompt_tokens], dtype=jnp.int32)
     current_pos = 0
     generated_tokens = list(prompt_tokens)
@@ -76,13 +76,14 @@ def generate(
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    prompt: str = "In order to bake a cake, you need to follow these steps: ",
     max_seqlen: int = 8192,
     seed: int = 1,
 ):
     """
     Entry point for running the Llama JAX model for text generation.
     """
+    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful and friendly assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather like today?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
+    print(prompt)
     print("Loading model and tokenizer...")
     start_time = time.time()
 
