@@ -23,9 +23,9 @@ class TransformerBlock(nn.Module):
         )
         # Feed-forward parameters
         self.feed_forward = FeedForwardParams(
-            w1_gate=self.param('w1_gate', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
-            w2_up=self.param('w2_up', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
-            w3_down=self.param('w3_down', nn.initializers.normal(stddev=0.02), (self.args.ffn_hidden_dim, self.args.dim), dtype=self.args.dtype),
+            w_gate=self.param('w_gate', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
+            w_up=self.param('w_up', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
+            w_down=self.param('w_down', nn.initializers.normal(stddev=0.02), (self.args.ffn_hidden_dim, self.args.dim), dtype=self.args.dtype),
         )
         # Normalization layer parameters
         self.attention_norm_weight = self.param('attention_norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
@@ -73,6 +73,9 @@ class LLaMa(nn.Module):
         # Final normalization weight
         self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
 
+        # Final output layer
+        self.output = self.param('output', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.vocab_size), self.args.dtype)
+
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim, 
@@ -93,7 +96,6 @@ class LLaMa(nn.Module):
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
         # Tie weights: use the token embedding matrix for the final linear layer
-        output_kernel = self.tok_embeddings.embedding.T
-        logits = jnp.einsum('bsd,dv->bsv', h, output_kernel)
+        logits = jnp.einsum('bsd,dv->bsv', h, self.output)
 
         return logits, kv_cache # Return logits and the updated KVCache 

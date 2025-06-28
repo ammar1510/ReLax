@@ -25,10 +25,9 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
         A JAX array of shape for the rotary embeddings.
         The shape is `[end, head_dim // 2, 2]` containing the cosine and sine components.
     """
+    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)) # Shape: (head_dim // 2,)
     if use_scaled:
         freqs = apply_scaling(freqs)
-
-    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)) # Shape: (head_dim // 2,)
     t = jnp.arange(end, dtype=dtype) # Shape: (end,)
     freqs = jnp.outer(t, freqs) # Shape: (end, head_dim // 2)
 
@@ -41,7 +40,7 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
     return freqs_cis
 
 @jit
-def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
+def apply_scaling(freqs: jax.Array,scale_factor: float = 32.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
     """
     Apply RoPE scaling to frequencies based on Llama 3 implementation.
     The scaling is done to extend the context length.
@@ -90,9 +89,9 @@ class AttentionParams:
 
 @struct.dataclass
 class FeedForwardParams:
-    w1_gate: jax.Array # Corresponds to gate_proj
-    w2_up: jax.Array   # Corresponds to up_proj
-    w3_down: jax.Array # Corresponds to down_proj
+    w_gate: jax.Array # Corresponds to gate_proj
+    w_up: jax.Array   # Corresponds to up_proj
+    w_down: jax.Array # Corresponds to down_proj
 
 
 @jit
@@ -256,7 +255,7 @@ def feed_forward(
 
     Args:
         x: Input tensor of shape [batch_size, seqlen, dim].
-        params: Dataclass containing weight matrices (w1_gate, w2_up, w3_down).
+        params: Dataclass containing weight matrices (w_gate, w_up, w_down).
         activation_fn: Name of the activation function ('silu', 'relu', 'gelu').
 
     Returns:
@@ -264,9 +263,9 @@ def feed_forward(
     """
 
     # Project input: x -> gate, up
-    # x: [bs, seqlen, dim], w1_gate: [dim, hidden_dim], w2_up: [dim, hidden_dim]
-    gate = jnp.einsum('bsd,dh->bsh', x, params.w1_gate)
-    up = jnp.einsum('bsd,dh->bsh', x, params.w2_up)
+    # x: [bs, seqlen, dim], w_gate: [dim, hidden_dim], w_up: [dim, hidden_dim]
+    gate = jnp.einsum('bsd,dh->bsh', x, params.w_gate)
+    up = jnp.einsum('bsd,dh->bsh', x, params.w_up)
 
     # Apply the specified activation function (SwiGLU style)
     if activation_fn == 'silu':
@@ -283,7 +282,7 @@ def feed_forward(
     fused_activation = activated_gate * up
 
     # Project down
-    # fused_swiglu: [bs, seqlen, hidden_dim], w3_down: [hidden_dim, dim]
-    output = jnp.einsum('bsh,hd->bsd', fused_activation, params.w3_down)
+    # fused_swiglu: [bs, seqlen, hidden_dim], w_down: [hidden_dim, dim]
+    output = jnp.einsum('bsh,hd->bsd', fused_activation, params.w_down)
 
     return output 

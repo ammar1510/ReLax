@@ -33,8 +33,7 @@ class ModelConfig:
 
     mode:str = "inference"
     dtype:str = "bfloat16"
-    use_scaled_rope: bool = False
-
+    use_scaled_rope: bool = True
 
     def __post_init__(self):
         # Ensure GQA constraints are met

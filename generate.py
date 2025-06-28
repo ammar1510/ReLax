@@ -15,7 +15,7 @@ from utils.kvcache import KVCache
 from sampling import TopPSampler
 from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
-jax.config.update("jax_default_matmul_precision", "float32")
+jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def generate(
@@ -36,7 +36,7 @@ def generate(
     kv_cache = KVCache.new(
         n_layers=model.args.n_layers,
         bsz=1,
-        max_seq_len=model.args.max_seqlen,
+        max_seqlen=model.args.max_seqlen,
         kv_heads=model.args.n_kv_heads,
         head_dim=model.args.head_dim,
         dtype=model.args.dtype,
@@ -77,7 +77,7 @@ def main(
     ckpt_dir: str,
     tokenizer_path: str,
     prompt: str = "In order to bake a cake, you need to follow these steps: ",
-    max_seqlen: int = 512,
+    max_seqlen: int = 8192,
     seed: int = 1,
 ):
     """
@@ -90,9 +90,10 @@ def main(
     model_config = dataclasses.replace(model_config, max_seqlen=max_seqlen)
 
     tokenizer = Tokenizer(tokenizer_path)
+    print("Model config: ", model_config)
 
     # Load model weights
-    params = load_llama_weights(ckpt_dir)
+    params = load_llama_weights(ckpt_dir+"/model.safetensors", model_config)
 
     # Initialize the model
     model = LLaMa(model_config)
