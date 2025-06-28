@@ -83,7 +83,7 @@ def main(
     Entry point for running the Llama JAX model for text generation.
     """
     system_prompt = "You are a knowledgeable, efficient, and direct AI assistant. Provide concise answers, focusing on the key information needed. Offer suggestions tactfully when appropriate to improve outcomes. Engage in productive collaboration with the user."
-    user_prompt = "James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?"
+    user_prompt = "Explain relativity to me in a concise illustraive manner."
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
     print("Loading model and tokenizer...")
     start_time = time.time()
