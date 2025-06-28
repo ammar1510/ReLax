@@ -301,8 +301,9 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             h = layer(h, start_pos, freqs_cis, mask)
+            print(f"Output after layer {i}: {h[:, :, :20]}")
         h = self.norm(h)
         output = self.output(h).float()
         return output
