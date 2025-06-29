@@ -1,10 +1,12 @@
 import jax
 from jax.tree_util import tree_leaves
 
+
 def estimate_pytree_memory_footprint(pytree):
     """Estimates the memory footprint of a PyTree in bytes."""
     total_bytes = sum(leaf.nbytes for leaf in tree_leaves(pytree))
     return total_bytes
+
 
 def format_bytes(num_bytes: int) -> str:
     """Formats bytes into a human-readable string (KB, MB, GB, etc.)."""
@@ -17,4 +19,4 @@ def format_bytes(num_bytes: int) -> str:
     elif num_bytes < 1024**4:
         return f"{num_bytes / 1024**3:.2f}GB"
     else:
-        return f"{num_bytes / 1024**4:.2f}TB" 
+        return f"{num_bytes / 1024**4:.2f}TB"

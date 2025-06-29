@@ -7,7 +7,7 @@ from jax.dlpack import from_dlpack
 torch.cuda.manual_seed(42)
 
 # 2. Generate a large random tensor on the GPU with PyTorch.
-torch_tensor_gpu = torch.randn(1000, 1000, device='cuda')
+torch_tensor_gpu = torch.randn(1000, 1000, device="cuda")
 
 # 3. Create a DLPack capsule from the PyTorch tensor. This does not copy data.
 dlpack_capsule = torch.utils.dlpack.to_dlpack(torch_tensor_gpu)

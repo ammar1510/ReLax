@@ -1,6 +1,7 @@
 """
 Functions to load model weights.
 """
+
 import jax
 import jax.numpy as jnp
 from safetensors.torch import safe_open
@@ -14,6 +15,7 @@ import torch
 from .config import ModelConfig
 from .model import LLaMa
 
+
 def load_llama_weights(model_path: str, config: ModelConfig) -> LLaMa:
     """
     Loads LLaMa model weights from a .safetensors file into a LLaMa model instance.
@@ -24,9 +26,10 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> LLaMa:
         Parameters for the LLaMa model.
     """
     tensors = load_file(model_path)
-    params = unflatten_dict(tensors, sep='.')
-    
+    params = unflatten_dict(tensors, sep=".")
+
     return params
+
 
 def pth_to_safetensors(pth_model_path: str, config_dir: str, output_dir: str):
     """
@@ -52,22 +55,51 @@ def pth_to_safetensors(pth_model_path: str, config_dir: str, output_dir: str):
     torch_dtypes["int8"] = torch.int8
 
     # Token embeddings
-    params['tok_embeddings'] = {'embedding': jnp.asarray(tensors['tok_embeddings.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)}
+    params["tok_embeddings"] = {
+        "embedding": jnp.asarray(
+            tensors["tok_embeddings.weight"].to(torch_dtypes[config.dtype]),
+            dtype=config.dtype,
+        )
+    }
 
     # Final normalization
-    params['norm_weight'] = jnp.asarray(tensors['norm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
-    params['output'] = jnp.asarray(tensors['output.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+    params["norm_weight"] = jnp.asarray(
+        tensors["norm.weight"].to(torch_dtypes[config.dtype]), dtype=config.dtype
+    )
+    params["output"] = jnp.asarray(
+        tensors["output.weight"].to(torch_dtypes[config.dtype]), dtype=config.dtype
+    ).T
 
     # Transformer layers
     for i in range(config.n_layers):
-        layer_prefix = f'layers.{i}.'
-        
+        layer_prefix = f"layers.{i}."
+
         # Get all weights from the tensor dict
-        q_proj = jnp.asarray(tensors[layer_prefix + 'attention.wq.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
-        k_proj = jnp.asarray(tensors[layer_prefix + 'attention.wk.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
-        v_proj = jnp.asarray(tensors[layer_prefix + 'attention.wv.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
-        o_proj = jnp.asarray(tensors[layer_prefix + 'attention.wo.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype)
-        
+        q_proj = jnp.asarray(
+            tensors[layer_prefix + "attention.wq.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        )
+        k_proj = jnp.asarray(
+            tensors[layer_prefix + "attention.wk.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        )
+        v_proj = jnp.asarray(
+            tensors[layer_prefix + "attention.wv.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        )
+        o_proj = jnp.asarray(
+            tensors[layer_prefix + "attention.wo.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        )
+
         # Reshape attention weights to match the model's expected format (dim, n_heads, head_dim)
         wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim)
         wk = k_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
@@ -75,26 +107,51 @@ def pth_to_safetensors(pth_model_path: str, config_dir: str, output_dir: str):
         wo = o_proj.T
 
         # Get feed-forward weights
-        w_gate= jnp.asarray(tensors[layer_prefix + 'feed_forward.w1.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
-        w_down = jnp.asarray(tensors[layer_prefix + 'feed_forward.w2.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
-        w_up = jnp.asarray(tensors[layer_prefix + 'feed_forward.w3.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype).T
+        w_gate = jnp.asarray(
+            tensors[layer_prefix + "feed_forward.w1.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        ).T
+        w_down = jnp.asarray(
+            tensors[layer_prefix + "feed_forward.w2.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        ).T
+        w_up = jnp.asarray(
+            tensors[layer_prefix + "feed_forward.w3.weight"].to(
+                torch_dtypes[config.dtype]
+            ),
+            dtype=config.dtype,
+        ).T
 
         # Assign weights to the layer's parameter dictionary
         # The key 'layers_i' is automatically created by Flax for lists of modules.
-        params[f'layer_{i}'] = {
-            'attention_norm_weight': jnp.asarray(tensors[layer_prefix + 'attention_norm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype),
-            'ffn_norm_weight': jnp.asarray(tensors[layer_prefix + 'ffn_norm.weight'].to(torch_dtypes[config.dtype]),dtype=config.dtype),
-            'wq': wq,
-            'wk': wk,
-            'wv': wv,
-            'wo': wo,
-            'w_gate': w_gate,
-            'w_up': w_up,
-            'w_down': w_down,
+        params[f"layer_{i}"] = {
+            "attention_norm_weight": jnp.asarray(
+                tensors[layer_prefix + "attention_norm.weight"].to(
+                    torch_dtypes[config.dtype]
+                ),
+                dtype=config.dtype,
+            ),
+            "ffn_norm_weight": jnp.asarray(
+                tensors[layer_prefix + "ffn_norm.weight"].to(
+                    torch_dtypes[config.dtype]
+                ),
+                dtype=config.dtype,
+            ),
+            "wq": wq,
+            "wk": wk,
+            "wv": wv,
+            "wo": wo,
+            "w_gate": w_gate,
+            "w_up": w_up,
+            "w_down": w_down,
         }
 
     # Save the parameters to a .safetensors file
     output_path = Path(output_dir) / "model.safetensors"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(flatten_dict(params, sep="."), output_path)
-    print(f"Model weights saved to {output_path}") 
+    print(f"Model weights saved to {output_path}")

@@ -19,6 +19,7 @@ from typing import (
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 
+
 class Tokenizer:
     """
     Tokenizing and encoding/decoding text using the Tiktoken tokenizer based on Llama 3 reference.
@@ -39,7 +40,7 @@ class Tokenizer:
         """
         model_path_obj = Path(model_path)
         if not model_path_obj.is_file():
-             raise FileNotFoundError(f"Tokenizer model not found at {model_path}")
+            raise FileNotFoundError(f"Tokenizer model not found at {model_path}")
 
         mergeable_ranks = load_tiktoken_bpe(str(model_path_obj))
         num_base_tokens = len(mergeable_ranks)
@@ -55,8 +56,8 @@ class Tokenizer:
             "<|end_header_id|>",
             "<|eom_id|>",
             "<|eot_id|>",  # end of turn
-            "<|python_tag|>"
-        ] 
+            "<|python_tag|>",
+        ]
         reserved_tokens = [
             f"<|reserved_special_token_{2+i}|>"
             for i in range(self.num_reserved_special_tokens - len(special_tokens))
@@ -165,7 +166,7 @@ class Tokenizer:
             str: The next segment of the string.
         """
 
-        if not s: # Handle empty string case
+        if not s:  # Handle empty string case
             yield ""
             return
 
@@ -179,8 +180,8 @@ class Tokenizer:
 
             if current_slice_is_space ^ is_now_space:  # Type of char changed
                 yield s[slice_start:i]  # Yield the segment that just finished
-                slice_start = i         # New segment starts at i
-                current_slice_len = 1   # Length of new segment is 1 (s[i])
+                slice_start = i  # New segment starts at i
+                current_slice_len = 1  # Length of new segment is 1 (s[i])
                 current_slice_is_space = is_now_space  # Update type for the new segment
             else:  # Same type as before
                 # The length of the current segment including s[i] is (i - slice_start + 1)
@@ -192,9 +193,9 @@ class Tokenizer:
                     # the end of the slice to yield is i.
                     yield s[slice_start:i]
                     slice_start = i
-                    current_slice_len = 1 # Reset for the new segment starting at i
+                    current_slice_len = 1  # Reset for the new segment starting at i
                     # current_slice_is_space remains the same for the new segment starting at i
-        
+
         # Yield any remaining part of the string
         if slice_start < len(s):
-            yield s[slice_start:] 
+            yield s[slice_start:]

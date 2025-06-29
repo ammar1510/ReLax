@@ -2,11 +2,13 @@ import jax
 import jax.numpy as jnp
 from jax import random
 from jax import jit
-import abc # For Abstract Base Class
+import abc  # For Abstract Base Class
 from functools import partial
+
 """Sampling functions for the model.
 This entire file needs to be JIT compatible.
 """
+
 
 @jit
 def temperature_scale(logits: jax.Array, temperature: float) -> jax.Array:
@@ -25,6 +27,7 @@ def temperature_scale(logits: jax.Array, temperature: float) -> jax.Array:
     # Small epsilon added for numerical stability if temperature is very close to 0
     safe_temperature = jnp.maximum(temperature, 1e-6)
     return logits / safe_temperature
+
 
 @jit
 def sample_top_k(logits: jax.Array, k: int, key: random.PRNGKey) -> jax.Array:
@@ -49,8 +52,11 @@ def sample_top_k(logits: jax.Array, k: int, key: random.PRNGKey) -> jax.Array:
     sampled_token_id = jnp.take(top_k_indices, sampled_index)
     return sampled_token_id
 
+
 @jit
-def sample_top_p(logits: jax.Array, p: float, key: random.PRNGKey, temperature: float = 1.0) -> jax.Array:
+def sample_top_p(
+    logits: jax.Array, p: float, key: random.PRNGKey, temperature: float = 1.0
+) -> jax.Array:
     """
     Samples using nucleus sampling (top-p).
 
@@ -98,20 +104,25 @@ def sample_top_p(logits: jax.Array, p: float, key: random.PRNGKey, temperature: 
     sampled_token_ids = random.categorical(key, logits_filtered, axis=-1)
     return sampled_token_ids
 
+
 class Sampler(abc.ABC):
     @abc.abstractmethod
     def sample(self, logits: jax.Array, key: random.PRNGKey) -> jax.Array:
         """Samples a token from the logits distribution."""
         pass
 
+
 class GreedySampler(Sampler):
     """Selects the token with the highest probability (argmax)."""
+
     def sample(self, logits: jax.Array, key: random.PRNGKey) -> jax.Array:
         # key is not used for greedy, but kept for interface consistency
         return jnp.argmax(logits, axis=-1)
 
+
 class CategoricalSampler(Sampler):
     """Samples from the distribution after applying temperature."""
+
     def __init__(self, temperature: float):
         if temperature <= 0:
             # Allow temperature of 0 to mean greedy, but it's better to use GreedySampler for that.
@@ -124,8 +135,10 @@ class CategoricalSampler(Sampler):
         scaled_logits = temperature_scale(logits, self.temperature)
         return random.categorical(key, scaled_logits, axis=-1)
 
+
 class TopKSampler(Sampler):
     """Samples from the top-k tokens after applying temperature."""
+
     def __init__(self, k: int, temperature: float):
         if k <= 0:
             raise ValueError("k must be positive for TopKSampler.")
@@ -146,18 +159,22 @@ class TopKSampler(Sampler):
             idx_in_top_k = jnp.argmax(top_k_logits_values)
             # Return the original token index
             return top_k_indices[idx_in_top_k]
-        
+
         scaled_logits = temperature_scale(logits, self.temperature)
         # The existing sample_top_k function expects (potentially scaled) logits, k, and a key.
         return sample_top_k(scaled_logits, self.k, key)
 
+
 class TopPSampler(Sampler):
     """Samples using nucleus (top-p) sampling. Temperature is applied internally by sample_top_p."""
+
     def __init__(self, p: float, temperature: float):
         if not (0 < p <= 1.0):
             raise ValueError("p must be in (0, 1] for TopPSampler.")
-        if temperature <= 0: # sample_top_p internally handles temperature > 0
-            raise ValueError("Temperature must be positive for TopPSampler if using the helper.")
+        if temperature <= 0:  # sample_top_p internally handles temperature > 0
+            raise ValueError(
+                "Temperature must be positive for TopPSampler if using the helper."
+            )
             # If a temp of 0 was desired with top-p, logic would need to adapt.
             # The current sample_top_p scales with temperature and expects it > 0.
         self.p = p
@@ -165,4 +182,4 @@ class TopPSampler(Sampler):
 
     def sample(self, logits: jax.Array, key: random.PRNGKey) -> jax.Array:
         # The existing sample_top_p function handles temperature scaling internally.
-        return sample_top_p(logits, self.p, key, temperature=self.temperature) 
+        return sample_top_p(logits, self.p, key, temperature=self.temperature)

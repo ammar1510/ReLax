@@ -1,17 +1,24 @@
-# Placeholder for shared, reusable Flax modules (RMSNorm, FFN, Attention, etc.) 
+# Placeholder for shared, reusable Flax modules (RMSNorm, FFN, Attention, etc.)
 import jax
 import jax.numpy as jnp
-import jax.nn as nn 
+import jax.nn as nn
 import jax.lax as lax
 from jax import jit
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
-from .kvcache import KVCache 
+from .kvcache import KVCache
 from typing import Optional
 from functools import partial
 
-@partial(jit, static_argnames=['head_dim', 'end', 'use_scaled', 'dtype'])
-def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: jnp.dtype = jnp.float32) -> jax.Array:
+
+@partial(jit, static_argnames=["head_dim", "end", "use_scaled", "dtype"])
+def precompute_freqs_cis(
+    head_dim: int,
+    end: int,
+    theta: float = 500000.0,
+    use_scaled: bool = False,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
     """
     Precompute the rotational frequency embeddings.
 
@@ -25,22 +32,34 @@ def precompute_freqs_cis(head_dim: int, end: int, theta: float = 500000.0, use_s
         A JAX array of shape for the rotary embeddings.
         The shape is `[end, head_dim // 2, 2]` containing the cosine and sine components.
     """
-    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)) # Shape: (head_dim // 2,)
+    freqs = 1.0 / (
+        theta
+        ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)].astype(dtype) / head_dim)
+    )  # Shape: (head_dim // 2,)
     if use_scaled:
         freqs = apply_scaling(freqs)
-    t = jnp.arange(end, dtype=dtype) # Shape: (end,)
-    freqs = jnp.outer(t, freqs) # Shape: (end, head_dim // 2)
+    t = jnp.arange(end, dtype=dtype)  # Shape: (end,)
+    freqs = jnp.outer(t, freqs)  # Shape: (end, head_dim // 2)
 
     # In JAX, torch.polar(torch.ones_like(freqs), freqs) is equivalent to jnp.cos(freqs) + 1j * jnp.sin(freqs)
-    freqs_cos = jnp.cos(freqs) # Shape: (end, head_dim // 2)
-    freqs_sin = jnp.sin(freqs) # Shape: (end, head_dim // 2)
+    freqs_cos = jnp.cos(freqs)  # Shape: (end, head_dim // 2)
+    freqs_sin = jnp.sin(freqs)  # Shape: (end, head_dim // 2)
 
     # Stack on the last dimension to create a shape of [end, head_dim // 2, 2]
-    freqs_cis = jnp.stack([freqs_cos, freqs_sin], axis=-1) # Shape: (end, head_dim // 2, 2)
+    freqs_cis = jnp.stack(
+        [freqs_cos, freqs_sin], axis=-1
+    )  # Shape: (end, head_dim // 2, 2)
     return freqs_cis
 
+
 @jit
-def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: float = 1.0,high_freq_factor: float = 4.0,old_context_len: float = 8192.0) -> jax.Array:
+def apply_scaling(
+    freqs: jax.Array,
+    scale_factor: float = 8.0,
+    low_freq_factor: float = 1.0,
+    high_freq_factor: float = 4.0,
+    old_context_len: float = 8192.0,
+) -> jax.Array:
     """
     Apply RoPE scaling to frequencies based on Llama 3 implementation.
     The scaling is done to extend the context length.
@@ -60,11 +79,13 @@ def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: fl
     high_freq_wavelen = old_context_len / high_freq_factor
 
     wavelen = 2 * jnp.pi / freqs
-    
+
     # This is the smooth transition part from the original implementation.
-    smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smooth = (old_context_len / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
     freqs_for_mid_range = (1 - smooth) * freqs / scale_factor + smooth * freqs
-    
+
     # Conditions to select which scaling to apply.
     # 1. if wavelen > low_freq_wavelen, new_freqs = freqs / scale_factor
     # 2. if wavelen < high_freq_wavelen, new_freqs = freqs
@@ -72,13 +93,10 @@ def apply_scaling(freqs: jax.Array,scale_factor: float = 8.0,low_freq_factor: fl
     new_freqs = jnp.where(
         wavelen > low_freq_wavelen,
         freqs / scale_factor,
-        jnp.where(
-            wavelen < high_freq_wavelen,
-            freqs,
-            freqs_for_mid_range
-        )
+        jnp.where(wavelen < high_freq_wavelen, freqs, freqs_for_mid_range),
     )
     return new_freqs
+
 
 @struct.dataclass
 class AttentionParams:
@@ -87,11 +105,12 @@ class AttentionParams:
     wv: jax.Array
     wo: jax.Array
 
+
 @struct.dataclass
 class FeedForwardParams:
-    w_gate: jax.Array # Corresponds to gate_proj
-    w_up: jax.Array   # Corresponds to up_proj
-    w_down: jax.Array # Corresponds to down_proj
+    w_gate: jax.Array  # Corresponds to gate_proj
+    w_up: jax.Array  # Corresponds to up_proj
+    w_down: jax.Array  # Corresponds to down_proj
 
 
 @jit
@@ -145,7 +164,8 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
     return x_out
 
-@partial(jit, static_argnames=['n_rep'])
+
+@partial(jit, static_argnames=["n_rep"])
 def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     """
     Repeat Key/Value heads for Grouped Query Attention.
@@ -161,18 +181,21 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     if n_rep == 1:
         return x
     # equivalent to torch.repeat_interleave(x, repeats=n_rep, dim=2)
-    return jnp.broadcast_to(x[:, :, :, None, :], (bs, slen, n_kv_heads, n_rep, head_dim)).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    return jnp.broadcast_to(
+        x[:, :, :, None, :], (bs, slen, n_kv_heads, n_rep, head_dim)
+    ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+
 
 @jit
 def grouped_query_attention(
     x: jax.Array,
-    freqs_cis: jax.Array, # Precomputed freqs for max_seqlen
+    freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
     start_pos: int,
-    prefill_mask: Optional[jax.Array] = None, # padding mask during prefill stage
-) -> tuple[jax.Array, KVCache]: # Return output and updated cache
+    prefill_mask: Optional[jax.Array] = None,  # padding mask during prefill stage
+) -> tuple[jax.Array, KVCache]:  # Return output and updated cache
     """
     Compute Grouped Query Attention with KV Caching.
 
@@ -191,14 +214,18 @@ def grouped_query_attention(
     bsz, seqlen, dim = x.shape
 
     # Project inputs to queries, keys, values for the current token(s)
-    xq = jnp.einsum('bsd,dhc->bshc', x, params.wq)
-    xk = jnp.einsum('bsd,dkc->bskc', x, params.wk)
-    xv = jnp.einsum('bsd,dvc->bsvc', x, params.wv)
+    xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)
+    xk = jnp.einsum("bsd,dkc->bskc", x, params.wk)
+    xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv)
 
     # Apply rotary positional embeddings
     current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0)
-    xq = apply_rotary_emb(xq, freqs_cis=current_freqs_cis) # Shape: (bsz, seqlen, n_heads, head_dim)
-    xk = apply_rotary_emb(xk, freqs_cis=current_freqs_cis) # Shape: (bsz, seqlen, n_kv_heads, head_dim)
+    xq = apply_rotary_emb(
+        xq, freqs_cis=current_freqs_cis
+    )  # Shape: (bsz, seqlen, n_heads, head_dim)
+    xk = apply_rotary_emb(
+        xk, freqs_cis=current_freqs_cis
+    )  # Shape: (bsz, seqlen, n_kv_heads, head_dim)
 
     # During prefill, mask out padding tokens before caching
     if prefill_mask is not None:
@@ -216,11 +243,13 @@ def grouped_query_attention(
     query_positions = jnp.arange(seqlen) + start_pos
     key_positions = jnp.arange(max_seqlen)
 
-    mask = (query_positions[:, None] >= key_positions[None, :])[None, :, :] # [1, seqlen, max_seqlen] 
+    mask = (query_positions[:, None] >= key_positions[None, :])[
+        None, :, :
+    ]  # [1, seqlen, max_seqlen]
 
     if prefill_mask is not None:
         # Mask out queries at padding positions
-        query_mask = prefill_mask[:, :, None] # [bsz, seqlen, 1]
+        query_mask = prefill_mask[:, :, None]  # [bsz, seqlen, 1]
         mask = mask & query_mask
 
     # Add head dimension for broadcasting
@@ -239,16 +268,16 @@ def grouped_query_attention(
         attn_output = jnp.where(prefill_mask[:, :, None, None], attn_output, 0)
 
     attn_output = attn_output.reshape(bsz, seqlen, -1)
-    output = jnp.einsum('bsd,do->bso', attn_output, params.wo)
+    output = jnp.einsum("bsd,do->bso", attn_output, params.wo)
 
     return output, updated_cache
 
 
-@partial(jit, static_argnames=['activation_fn'])
+@partial(jit, static_argnames=["activation_fn"])
 def feed_forward(
     x: jax.Array,
     params: FeedForwardParams,
-    activation_fn: str, # Added activation function name
+    activation_fn: str,  # Added activation function name
 ) -> jax.Array:
     """
     Compute FeedForward network (MLP) using a configurable activation function (like SwiGLU).
@@ -264,25 +293,25 @@ def feed_forward(
 
     # Project input: x -> gate, up
     # x: [bs, seqlen, dim], w_gate: [dim, hidden_dim], w_up: [dim, hidden_dim]
-    gate = jnp.einsum('bsd,dh->bsh', x, params.w_gate)
-    up = jnp.einsum('bsd,dh->bsh', x, params.w_up)
+    gate = jnp.einsum("bsd,dh->bsh", x, params.w_gate)
+    up = jnp.einsum("bsd,dh->bsh", x, params.w_up)
 
     # Apply the specified activation function (SwiGLU style)
-    if activation_fn == 'silu':
+    if activation_fn == "silu":
         activated_gate = nn.silu(gate)
-    elif activation_fn == 'relu':
+    elif activation_fn == "relu":
         activated_gate = nn.relu(gate)
-    elif activation_fn == 'gelu':
+    elif activation_fn == "gelu":
         # Use approximate=False for exact GELU, True for faster approximation
         activated_gate = nn.gelu(gate, approximate=False)
     else:
         raise ValueError(f"Unsupported activation function: {activation_fn}")
-        # replace error handling with chex 
-   
+        # replace error handling with chex
+
     fused_activation = activated_gate * up
 
     # Project down
     # fused_swiglu: [bs, seqlen, hidden_dim], w_down: [hidden_dim, dim]
-    output = jnp.einsum('bsh,hd->bsd', fused_activation, params.w_down)
+    output = jnp.einsum("bsh,hd->bsd", fused_activation, params.w_down)
 
-    return output 
+    return output

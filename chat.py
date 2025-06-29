@@ -24,6 +24,7 @@ from sampling import Sampler, GreedySampler
 
 Role = Literal["system", "user", "assistant"]
 
+
 class Message(TypedDict):
     role: Role
     content: str
@@ -33,27 +34,32 @@ Dialog = List[Message]
 
 # --- State Management ---
 
+
 @dataclass
 class ChatState:
     """Holds the state of a single, ongoing conversation."""
+
     dialog_history: Dialog
     kv_cache: KVCache
     sequence_length: int = 0
 
+
 # --- Core Chat Engine ---
+
 
 class ChatEngine:
     """
     A stateless engine for driving conversational chat with a Llama model.
     It operates on ChatState objects and is designed to be JIT-friendly.
     """
+
     def __init__(
         self,
         model: LLaMA,
         params: Dict,
         tokenizer: Tokenizer,
         max_seq_len: int = 2048,
-        cache_dtype: jnp.dtype = jnp.bfloat16
+        cache_dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.model = model
         self.params = params
@@ -63,20 +69,21 @@ class ChatEngine:
 
         # --- Pre-compile JAX functions ---
         self._jitted_model_step = partial(self._model_step, self)
-        
-        if jax.default_backend() != 'cpu':
-            self._jitted_model_step = jax.jit(self._jitted_model_step, static_argnames=('self',))
 
+        if jax.default_backend() != "cpu":
+            self._jitted_model_step = jax.jit(
+                self._jitted_model_step, static_argnames=("self",)
+            )
 
     def _create_kv_cache(self) -> KVCache:
         """Helper to initialize a new, empty KVCache."""
         return KVCache(
-            batch_size=1, # Chat is always batch size 1
+            batch_size=1,  # Chat is always batch size 1
             max_seq_len=self.max_seq_len,
             n_layers=self.model.args.n_layers,
             n_kv_heads=self.model.args.n_kv_heads,
             head_dim=self.model.args.head_dim,
-            dtype=self.cache_dtype
+            dtype=self.cache_dtype,
         )
 
     def start_new_conversation(self, system_prompt: Optional[str] = None) -> ChatState:
@@ -86,7 +93,7 @@ class ChatEngine:
         """
         kv_cache = self._create_kv_cache()
         initial_dialog: Dialog = []
-        
+
         if system_prompt:
             # A system prompt is provided, so pre-process it.
             initial_dialog.append({"role": "system", "content": system_prompt})
@@ -97,18 +104,16 @@ class ChatEngine:
             prompt_tokens = [self.tokenizer.bos_id]
 
         prompt_jnp = jnp.array([prompt_tokens], dtype=jnp.int32)
-        
+
         # Run the model to "warm up" the cache with the initial tokens.
         _, updated_kv_cache = self._jitted_model_step(
-            tokens=prompt_jnp,
-            kv_cache=kv_cache,
-            start_pos=0
+            tokens=prompt_jnp, kv_cache=kv_cache, start_pos=0
         )
-        
+
         return ChatState(
-            dialog_history=initial_dialog, # Will be empty if no system prompt
+            dialog_history=initial_dialog,  # Will be empty if no system prompt
             kv_cache=updated_kv_cache,
-            sequence_length=prompt_jnp.shape[1]
+            sequence_length=prompt_jnp.shape[1],
         )
 
     def _model_step(
@@ -122,10 +127,7 @@ class ChatEngine:
         along with the updated KVCache.
         """
         logits, updated_kv_cache = self.model.apply(
-            {'params': self.params},
-            tokens,
-            start_pos=start_pos,
-            kv_cache=kv_cache
+            {"params": self.params}, tokens, start_pos=start_pos, kv_cache=kv_cache
         )
         # The logits for the next token are always at the last position of the sequence.
         return logits[:, -1, :], updated_kv_cache
@@ -209,18 +211,21 @@ class ChatEngine:
 
         # 5. Decode response and finalize state
         response_text = self.tokenizer.decode(generated_tokens)
-        final_dialog = updated_dialog + [{"role": "assistant", "content": response_text}]
+        final_dialog = updated_dialog + [
+            {"role": "assistant", "content": response_text}
+        ]
 
         new_state = ChatState(
             dialog_history=final_dialog,
             kv_cache=kv_cache,
-            sequence_length=current_seq_len
+            sequence_length=current_seq_len,
         )
-        
+
         return response_text, new_state
 
+
 # --- Example Usage ---
-if __name__ == '__main__':
+if __name__ == "__main__":
     # This section is for conceptual demonstration and testing.
     # It requires a mock or real Llama model, Tokenizer, and params.
 
@@ -237,9 +242,11 @@ if __name__ == '__main__':
 
         def apply(self, params_dict, tokens, start_pos, kv_cache):
             mock_vocab_size = self.args.vocab_size
-            logits = jnp.ones((tokens.shape[0], tokens.shape[1], mock_vocab_size)) * -10.0
-            logits = logits.at[:, :, 5].set(10.0) # Make token '5' likely
-            return logits, kv_cache 
+            logits = (
+                jnp.ones((tokens.shape[0], tokens.shape[1], mock_vocab_size)) * -10.0
+            )
+            logits = logits.at[:, :, 5].set(10.0)  # Make token '5' likely
+            return logits, kv_cache
 
     class MockTokenizer:
         def __init__(self):
@@ -271,13 +278,13 @@ if __name__ == '__main__':
         model=mock_model_instance,
         tokenizer=mock_tokenizer_instance,
         params=mock_params,
-        max_seq_len=128
+        max_seq_len=128,
     )
 
     print("--- Starting Conversation 1 (Pirate Bot) ---")
     # Start a new conversation for a pirate bot
     pirate_state = engine.start_new_conversation(system_prompt="You are a pirate.")
-    
+
     # User sends a message
     print("User: Ahoy there!")
     rng_key = jax.random.PRNGKey(0)
@@ -285,7 +292,7 @@ if __name__ == '__main__':
         user_message="Ahoy there!",
         state=pirate_state,
         sampler=GreedySampler(),
-        rng_key=rng_key
+        rng_key=rng_key,
     )
     print(f"Pirate Bot: {pirate_response}")
     print(f"Dialog History: {pirate_state.dialog_history}")
@@ -294,7 +301,7 @@ if __name__ == '__main__':
     # --- Starting Conversation 2 (Poet Bot) ---
     print("--- Starting Conversation 2 (Poet Bot) ---")
     poet_state = engine.start_new_conversation(system_prompt="You are a poet.")
-    
+
     # User sends a message
     print("User: Tell me a short poem.")
     rng_key, poet_key = jax.random.split(rng_key)
@@ -302,7 +309,7 @@ if __name__ == '__main__':
         user_message="Tell me a short poem.",
         state=poet_state,
         sampler=GreedySampler(),
-        rng_key=poet_key
+        rng_key=poet_key,
     )
     print(f"Poet Bot: {poet_response}")
     print(f"Dialog History: {poet_state.dialog_history}")
@@ -314,9 +321,9 @@ if __name__ == '__main__':
     rng_key, pirate_key_2 = jax.random.split(rng_key)
     pirate_response_2, pirate_state = engine.generate_response(
         user_message="Where's the treasure?",
-        state=pirate_state, # Pass the *updated* pirate_state
+        state=pirate_state,  # Pass the *updated* pirate_state
         sampler=GreedySampler(),
-        rng_key=pirate_key_2
+        rng_key=pirate_key_2,
     )
     print(f"Pirate Bot: {pirate_response_2}")
     print(f"Final Pirate Dialog: {pirate_state.dialog_history}")

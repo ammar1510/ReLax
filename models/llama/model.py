@@ -4,11 +4,19 @@ import jax.numpy as jnp
 import flax.linen as nn
 from jax import jit
 
-from utils.ops import rms_norm, grouped_query_attention, feed_forward, precompute_freqs_cis, AttentionParams, FeedForwardParams
-from utils.kvcache import KVCache 
+from utils.ops import (
+    rms_norm,
+    grouped_query_attention,
+    feed_forward,
+    precompute_freqs_cis,
+    AttentionParams,
+    FeedForwardParams,
+)
+from utils.kvcache import KVCache
 from .config import ModelConfig
 
 jax.config.update("jax_enable_x64", True)
+
 
 class TransformerBlock(nn.Module):
     args: ModelConfig
@@ -16,22 +24,74 @@ class TransformerBlock(nn.Module):
     def setup(self):
         # Attention parameters
         self.attention = AttentionParams(
-            wq=self.param('wq', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_heads, self.args.head_dim), dtype=self.args.dtype),
-            wk=self.param('wk', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim), dtype=self.args.dtype),
-            wv=self.param('wv', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.n_kv_heads, self.args.head_dim), dtype=self.args.dtype),
-            wo=self.param('wo', nn.initializers.normal(stddev=0.02), (self.args.n_heads * self.args.head_dim, self.args.dim), dtype=self.args.dtype),
+            wq=self.param(
+                "wq",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.dim, self.args.n_heads, self.args.head_dim),
+                dtype=self.args.dtype,
+            ),
+            wk=self.param(
+                "wk",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.dim, self.args.n_kv_heads, self.args.head_dim),
+                dtype=self.args.dtype,
+            ),
+            wv=self.param(
+                "wv",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.dim, self.args.n_kv_heads, self.args.head_dim),
+                dtype=self.args.dtype,
+            ),
+            wo=self.param(
+                "wo",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.n_heads * self.args.head_dim, self.args.dim),
+                dtype=self.args.dtype,
+            ),
         )
         # Feed-forward parameters
         self.feed_forward = FeedForwardParams(
-            w_gate=self.param('w_gate', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
-            w_up=self.param('w_up', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.ffn_hidden_dim), dtype=self.args.dtype),
-            w_down=self.param('w_down', nn.initializers.normal(stddev=0.02), (self.args.ffn_hidden_dim, self.args.dim), dtype=self.args.dtype),
+            w_gate=self.param(
+                "w_gate",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.dim, self.args.ffn_hidden_dim),
+                dtype=self.args.dtype,
+            ),
+            w_up=self.param(
+                "w_up",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.dim, self.args.ffn_hidden_dim),
+                dtype=self.args.dtype,
+            ),
+            w_down=self.param(
+                "w_down",
+                nn.initializers.normal(stddev=0.02),
+                (self.args.ffn_hidden_dim, self.args.dim),
+                dtype=self.args.dtype,
+            ),
         )
         # Normalization layer parameters
-        self.attention_norm_weight = self.param('attention_norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
-        self.ffn_norm_weight = self.param('ffn_norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
+        self.attention_norm_weight = self.param(
+            "attention_norm_weight",
+            nn.initializers.ones,
+            (self.args.dim,),
+            dtype=self.args.dtype,
+        )
+        self.ffn_norm_weight = self.param(
+            "ffn_norm_weight",
+            nn.initializers.ones,
+            (self.args.dim,),
+            dtype=self.args.dtype,
+        )
 
-    def __call__(self, x: jax.Array, freqs_cis: jax.Array, kv_cache: KVCache, layer_idx: int, start_pos: int) -> tuple[jax.Array, KVCache]:
+    def __call__(
+        self,
+        x: jax.Array,
+        freqs_cis: jax.Array,
+        kv_cache: KVCache,
+        layer_idx: int,
+        start_pos: int,
+    ) -> tuple[jax.Array, KVCache]:
         # Attention block
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
         attn_output, kv_cache = grouped_query_attention(
@@ -65,24 +125,34 @@ class LLaMa(nn.Module):
             num_embeddings=self.args.vocab_size,
             features=self.args.dim,
             embedding_init=nn.initializers.normal(stddev=0.02),
-            dtype=self.args.dtype
+            dtype=self.args.dtype,
         )
 
-        self.layers = [TransformerBlock(self.args, name=f'layer_{i}') for i in range(self.args.n_layers)]
+        self.layers = [
+            TransformerBlock(self.args, name=f"layer_{i}")
+            for i in range(self.args.n_layers)
+        ]
 
         # Final normalization weight
-        self.norm_weight = self.param('norm_weight', nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype)
+        self.norm_weight = self.param(
+            "norm_weight", nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype
+        )
 
         # Final output layer
-        self.output = self.param('output', nn.initializers.normal(stddev=0.02), (self.args.dim, self.args.vocab_size), self.args.dtype)
+        self.output = self.param(
+            "output",
+            nn.initializers.normal(stddev=0.02),
+            (self.args.dim, self.args.vocab_size),
+            self.args.dtype,
+        )
 
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
-            self.args.head_dim, 
-            self.args.max_seqlen*2,
+            self.args.head_dim,
+            self.args.max_seqlen * 2,
             self.args.rope_theta,
-            dtype= jnp.float64,
-            use_scaled=self.args.use_scaled_rope
+            dtype=jnp.float64,
+            use_scaled=self.args.use_scaled_rope,
         ).astype(self.args.dtype)
 
     def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
@@ -96,6 +166,6 @@ class LLaMa(nn.Module):
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
         # Tie weights: use the token embedding matrix for the final linear layer
-        logits = jnp.einsum('bsd,dv->bsv', h, self.output)
+        logits = jnp.einsum("bsd,dv->bsv", h, self.output)
 
-        return logits, kv_cache # Return logits and the updated KVCache 
+        return logits, kv_cache  # Return logits and the updated KVCache
