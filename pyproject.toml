@@ -18,6 +18,7 @@ dev = [
   "huggingface_hub",
   "fire",
   "blobfile",
+  "black"
 ]
 
 [tool.setuptools.packages.find]
