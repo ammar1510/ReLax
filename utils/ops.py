@@ -186,7 +186,7 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 
 
-@jit
+@partial(jit, donate_argnums=[0,3,4,5])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
@@ -273,7 +273,7 @@ def grouped_query_attention(
     return output, updated_cache
 
 
-@partial(jit, static_argnames=["activation_fn"])
+@partial(jit, static_argnames=['activation_fn'],donate_argnums=[0])
 def feed_forward(
     x: jax.Array,
     params: FeedForwardParams,

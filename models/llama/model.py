@@ -15,7 +15,6 @@ from utils.ops import (
 from utils.kvcache import KVCache
 from .config import ModelConfig
 
-jax.config.update("jax_enable_x64", True)
 
 
 class TransformerBlock(nn.Module):

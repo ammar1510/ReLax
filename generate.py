@@ -15,7 +15,7 @@ from utils.kvcache import KVCache
 from sampling import TopPSampler
 from utils.memory import estimate_pytree_memory_footprint, format_bytes
 
-jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 
 def generate(
@@ -69,6 +69,8 @@ def generate(
         next_token = sampler.sample(logits, sample_key)
         generated_tokens.append(next_token.item())
         tokens = next_token[:,None]
+        if next_token == tokenizer.eot_id:
+            break
 
     return tokenizer.decode(generated_tokens)
 
@@ -83,7 +85,7 @@ def main(
     Entry point for running the Llama JAX model for text generation.
     """
     system_prompt = "You are a knowledgeable, efficient, and direct AI assistant. Provide concise answers, focusing on the key information needed. Offer suggestions tactfully when appropriate to improve outcomes. Engage in productive collaboration with the user."
-    user_prompt = "Explain relativity to me in a concise illustraive manner."
+    user_prompt ="Write a python code to print all prime numbers between 1 and 100"
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
     print("Loading model and tokenizer...")
     start_time = time.time()
