@@ -15,6 +15,7 @@ def create_dummy_model_file(model_path: Path, content: str):
         f.write(content)
     return model_path
 
+
 # Fixture for the Tokenizer
 @pytest.fixture(scope="module")
 def tokenizer_model_path(tmp_path_factory):
@@ -28,7 +29,7 @@ def tokenizer_model_path(tmp_path_factory):
     # " "       -> IA==
     # "b"       -> Yg==
     # "c"       -> Yw==
-    # "a"       -> YQ== 
+    # "a"       -> YQ==
     # "e"       -> ZQ==
     # "o"       -> bw==
     # "t"       -> dA==
@@ -63,11 +64,14 @@ Pg== 17
     create_dummy_model_file(model_file, content)
     return str(model_file)
 
+
 @pytest.fixture(scope="module")
 def tokenizer(tokenizer_model_path):
     return Tokenizer(model_path=tokenizer_model_path)
 
+
 # --- Test Cases ---
+
 
 def test_tokenizer_initialization(tokenizer: Tokenizer, tokenizer_model_path: str):
     """Tests basic tokenizer initialization and properties."""
@@ -77,7 +81,7 @@ def test_tokenizer_initialization(tokenizer: Tokenizer, tokenizer_model_path: st
     assert tokenizer.bos_id is not None
     assert tokenizer.eos_id is not None
     assert tokenizer.eot_id is not None
-    assert tokenizer.pad_id == -1 # As defined in Tokenizer
+    assert tokenizer.pad_id == -1  # As defined in Tokenizer
 
     # Check if special tokens are loaded
     assert "<|begin_of_text|>" in tokenizer.special_tokens
@@ -102,6 +106,7 @@ def test_tokenizer_missing_model_file():
     """Tests that Tokenizer raises FileNotFoundError for a missing model file."""
     with pytest.raises(FileNotFoundError):
         Tokenizer(model_path="non_existent_model.tiktoken")
+
 
 def test_encode_simple_string(tokenizer: Tokenizer):
     """Tests encoding a simple string."""
@@ -128,7 +133,7 @@ def test_encode_simple_string(tokenizer: Tokenizer):
 
 def test_encode_with_bos_eos(tokenizer: Tokenizer):
     """Tests encoding with BOS and EOS tokens."""
-    text = "b" # token "b" is rank 4
+    text = "b"  # token "b" is rank 4
     encoded_tokens_bos = tokenizer.encode(text, bos=True, eos=False)
     assert encoded_tokens_bos == [tokenizer.bos_id, 4]
 
@@ -137,6 +142,7 @@ def test_encode_with_bos_eos(tokenizer: Tokenizer):
 
     encoded_tokens_bos_eos = tokenizer.encode(text, bos=True, eos=True)
     assert encoded_tokens_bos_eos == [tokenizer.bos_id, 4, tokenizer.eos_id]
+
 
 def test_decode_simple(tokenizer: Tokenizer):
     """Tests decoding a simple list of token IDs."""
@@ -154,9 +160,10 @@ def test_decode_simple(tokenizer: Tokenizer):
 
 def test_get_vocab_size(tokenizer: Tokenizer):
     """Tests the get_vocab_size method."""
-    num_base_tokens = 18 # Updated to 18 base tokens
+    num_base_tokens = 18  # Updated to 18 base tokens
     expected_num_special_tokens = 10 + (tokenizer.num_reserved_special_tokens - 5 - 5)
     assert tokenizer.get_vocab_size() == num_base_tokens + expected_num_special_tokens
+
 
 def test_split_whitespaces_or_nonwhitespaces_helper():
     """Tests the _split_whitespaces_or_nonwhitespaces static method."""
@@ -180,7 +187,19 @@ def test_split_whitespaces_or_nonwhitespaces_helper():
     assert list(split_fn(s3, 3)) == ["   ", "  ", "###", "##"]
 
     s4 = "a b c d e f"
-    assert list(split_fn(s4, 1)) == ["a", " ", "b", " ", "c", " ", "d", " ", "e", " ", "f"]
+    assert list(split_fn(s4, 1)) == [
+        "a",
+        " ",
+        "b",
+        " ",
+        "c",
+        " ",
+        "d",
+        " ",
+        "e",
+        " ",
+        "f",
+    ]
 
 
 def test_encode_long_string_splitting(tokenizer: Tokenizer):
@@ -208,7 +227,7 @@ def test_encode_long_string_splitting(tokenizer: Tokenizer):
         assert tokenizer.decode(encoded_ws) == text_long_ws
 
         Tokenizer.TIKTOKEN_MAX_ENCODE_CHARS = 3
-        Tokenizer.MAX_NO_WHITESPACES_CHARS = 5 # Larger than TIKTOKEN_MAX_ENCODE_CHARS
+        Tokenizer.MAX_NO_WHITESPACES_CHARS = 5  # Larger than TIKTOKEN_MAX_ENCODE_CHARS
 
         # "b b b" -> b=4, space=3. Encodes to [4,3,4,3,4]
         text_tik_split = "b b b"
@@ -216,7 +235,9 @@ def test_encode_long_string_splitting(tokenizer: Tokenizer):
         assert encoded_tik_split == [4, 3, 4, 3, 4]
         assert tokenizer.decode(encoded_tik_split) == text_tik_split
 
-        Tokenizer.MAX_NO_WHITESPACES_CHARS = 2 # Smaller than TIKTOKEN_MAX_ENCODE_CHARS=3
+        Tokenizer.MAX_NO_WHITESPACES_CHARS = (
+            2  # Smaller than TIKTOKEN_MAX_ENCODE_CHARS=3
+        )
         # "bbb" -> b=4. Encodes to [4,4,4]
         text_complex_split = "bbb"
         encoded_complex = tokenizer.encode(text_complex_split, bos=False, eos=False)
@@ -230,7 +251,7 @@ def test_encode_long_string_splitting(tokenizer: Tokenizer):
 
 def test_special_tokens_values(tokenizer: Tokenizer):
     """Test that special token IDs are assigned correctly and are unique."""
-    num_base_tokens = 18 # Updated to 18 base tokens
+    num_base_tokens = 18  # Updated to 18 base tokens
     # Ensure the tokens exist (values are checked for uniqueness below)
     assert "<|begin_of_text|>" in tokenizer.special_tokens
     assert "<|end_of_text|>" in tokenizer.special_tokens
@@ -253,7 +274,10 @@ def test_encode_empty_string(tokenizer: Tokenizer):
     assert tokenizer.encode("", bos=False, eos=False) == []
     assert tokenizer.encode("", bos=True, eos=False) == [tokenizer.bos_id]
     assert tokenizer.encode("", bos=False, eos=True) == [tokenizer.eos_id]
-    assert tokenizer.encode("", bos=True, eos=True) == [tokenizer.bos_id, tokenizer.eos_id]
+    assert tokenizer.encode("", bos=True, eos=True) == [
+        tokenizer.bos_id,
+        tokenizer.eos_id,
+    ]
 
 
 def test_encode_special_token_handling(tokenizer: Tokenizer):
@@ -262,8 +286,12 @@ def test_encode_special_token_handling(tokenizer: Tokenizer):
     special_token_id = tokenizer.eot_id
 
     # Test 1: Allowed special token
-    assert tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special="all") == [special_token_id]
-    assert tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special={special_token_str}) == [special_token_id]
+    assert tokenizer.encode(
+        special_token_str, bos=False, eos=False, allowed_special="all"
+    ) == [special_token_id]
+    assert tokenizer.encode(
+        special_token_str, bos=False, eos=False, allowed_special={special_token_str}
+    ) == [special_token_id]
 
     # Test 2: Unallowed special token (default behavior)
     # With the dummy model, tiktoken will likely try to break down "<|eot_id|>" into characters.
@@ -279,22 +307,32 @@ def test_encode_special_token_handling(tokenizer: Tokenizer):
     # encoding "<|eot_id|>" with allowed_special=set() should succeed and produce their tokens.
     # String "<|eot_id|>" tokenizes as: '<' (13), '|' (14), 'eot' (12), '_' (15), 'id' (16),'|' (14), '>' (17).
     expected_tokens_for_disallowed_special = [13, 14, 12, 15, 16, 14, 17]
-    actual_tokens = tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special=set())
+    actual_tokens = tokenizer.encode(
+        special_token_str, bos=False, eos=False, allowed_special=set()
+    )
     assert actual_tokens == expected_tokens_for_disallowed_special
 
     # Test 3: Disallowed special token
     # If a special token is explicitly disallowed, tiktoken should raise an error.
-    with pytest.raises(ValueError): # tiktoken.encode raises ValueError if disallowed_special is violated
-        tokenizer.encode(special_token_str, bos=False, eos=False, allowed_special="all", disallowed_special={special_token_str})
-    
+    with pytest.raises(
+        ValueError
+    ):  # tiktoken.encode raises ValueError if disallowed_special is violated
+        tokenizer.encode(
+            special_token_str,
+            bos=False,
+            eos=False,
+            allowed_special="all",
+            disallowed_special={special_token_str},
+        )
+
     # For the case: allowed_special="all", disallowed_special="all"
     # USER OBSERVED BEHAVIOR: tiktoken encodes as the special token ID, not as natural text, and does not raise ValueError.
     encoded_val = tokenizer.encode(
-        special_token_str, # This is "<|eot_id|>"
+        special_token_str,  # This is "<|eot_id|>"
         bos=False,
         eos=False,
         allowed_special="all",
-        disallowed_special="all"
+        disallowed_special="all",
     )
     # special_token_id is tokenizer.eot_id, defined earlier in the test function
     assert encoded_val == [special_token_id]
@@ -305,22 +343,33 @@ def test_encode_special_token_handling(tokenizer: Tokenizer):
     text_like_special = "<eot>"
     # Expected: '<' (13), 'eot' (12), '>' (17)
     expected_text_like_special_tokens = [13, 12, 17]
-    print(tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set()))
-    assert tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set()) == expected_text_like_special_tokens
+    print(
+        tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set())
+    )
+    assert (
+        tokenizer.encode(text_like_special, bos=False, eos=False, allowed_special=set())
+        == expected_text_like_special_tokens
+    )
 
     # Test 5: Behavior with a mix of normal text and special tokens
     text_mixed = "token1 <|eot_id|> b"
     # Ranks: token=0, 1=1, space=3, b=4. <|eot_id|> = special_token_id
     # "token1 <|eot_id|> b" -> "token", "1", " ", "<|eot_id|>", " ", "b"
     expected_mixed_tokens = [0, 1, 3, special_token_id, 3, 4]
-    encoded_mixed = tokenizer.encode(text_mixed, bos=False, eos=False, allowed_special="all")
+    encoded_mixed = tokenizer.encode(
+        text_mixed, bos=False, eos=False, allowed_special="all"
+    )
     assert encoded_mixed == expected_mixed_tokens
-    assert tokenizer.decode(encoded_mixed) == "token1 <|eot_id|> b" # tiktoken should reconstruct this if special token is known
+    assert (
+        tokenizer.decode(encoded_mixed) == "token1 <|eot_id|> b"
+    )  # tiktoken should reconstruct this if special token is known
 
     # What if the special token is not surrounded by spaces?
     text_mixed_no_space = "token1<|eot_id|>b"
     # "token1<|eot_id|>b" -> "token", "1", "<|eot_id|>", "b"
     expected_mixed_no_space = [0, 1, special_token_id, 4]
-    encoded_mixed_no_space = tokenizer.encode(text_mixed_no_space, bos=False, eos=False, allowed_special="all")
+    encoded_mixed_no_space = tokenizer.encode(
+        text_mixed_no_space, bos=False, eos=False, allowed_special="all"
+    )
     assert encoded_mixed_no_space == expected_mixed_no_space
-    assert tokenizer.decode(encoded_mixed_no_space) == "token1<|eot_id|>b" 
+    assert tokenizer.decode(encoded_mixed_no_space) == "token1<|eot_id|>b"

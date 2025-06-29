@@ -67,4 +67,7 @@ cython_debug/
 
 
 
+#tensor/array files
 artifacts
+*.npy
+

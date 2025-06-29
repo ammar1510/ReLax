@@ -19,6 +19,7 @@ from typing import (
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 
+
 class Tokenizer:
     """
     Tokenizing and encoding/decoding text using the Tiktoken tokenizer based on Llama 3 reference.
@@ -39,7 +40,7 @@ class Tokenizer:
         """
         model_path_obj = Path(model_path)
         if not model_path_obj.is_file():
-             raise FileNotFoundError(f"Tokenizer model not found at {model_path}")
+            raise FileNotFoundError(f"Tokenizer model not found at {model_path}")
 
         mergeable_ranks = load_tiktoken_bpe(str(model_path_obj))
         num_base_tokens = len(mergeable_ranks)
@@ -49,16 +50,20 @@ class Tokenizer:
             "<|end_of_text|>",
             "<|reserved_special_token_0|>",
             "<|reserved_special_token_1|>",
-            "<|reserved_special_token_2|>",
-            "<|reserved_special_token_3|>",
+            "<|finetune_right_pad_id|>",
+            "<|step_id|>",
             "<|start_header_id|>",
             "<|end_header_id|>",
-            "<|reserved_special_token_4|>",
+            "<|eom_id|>",
             "<|eot_id|>",  # end of turn
-        ] + [
-            f"<|reserved_special_token_{i}|>"
-            for i in range(5, self.num_reserved_special_tokens - 5)
+            "<|python_tag|>",
         ]
+        reserved_tokens = [
+            f"<|reserved_special_token_{2+i}|>"
+            for i in range(self.num_reserved_special_tokens - len(special_tokens))
+        ]
+        special_tokens = special_tokens + reserved_tokens
+
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
@@ -70,12 +75,14 @@ class Tokenizer:
             special_tokens=self.special_tokens,
         )
 
-        self.vocab_size: int = self.model.n_vocab
+        self.vocab_size: int = num_base_tokens + len(special_tokens)
         # BOS / EOS token IDs
         self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
         self.eos_id: int = self.special_tokens["<|end_of_text|>"]
         self.eot_id: int = self.special_tokens["<|eot_id|>"]
-        self.pad_id: int = -1 # Tiktoken doesn't usually have a pad token
+        self.eom_id: int = self.special_tokens["<|eom_id|>"]
+        self.python_tag_id: int = self.special_tokens["<|python_tag|>"]
+        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
 
         # Tokens that signify the end of a model's turn
         self.stop_tokens = {
@@ -159,7 +166,7 @@ class Tokenizer:
             str: The next segment of the string.
         """
 
-        if not s: # Handle empty string case
+        if not s:  # Handle empty string case
             yield ""
             return
 
@@ -173,8 +180,8 @@ class Tokenizer:
 
             if current_slice_is_space ^ is_now_space:  # Type of char changed
                 yield s[slice_start:i]  # Yield the segment that just finished
-                slice_start = i         # New segment starts at i
-                current_slice_len = 1   # Length of new segment is 1 (s[i])
+                slice_start = i  # New segment starts at i
+                current_slice_len = 1  # Length of new segment is 1 (s[i])
                 current_slice_is_space = is_now_space  # Update type for the new segment
             else:  # Same type as before
                 # The length of the current segment including s[i] is (i - slice_start + 1)
@@ -186,9 +193,9 @@ class Tokenizer:
                     # the end of the slice to yield is i.
                     yield s[slice_start:i]
                     slice_start = i
-                    current_slice_len = 1 # Reset for the new segment starting at i
+                    current_slice_len = 1  # Reset for the new segment starting at i
                     # current_slice_is_space remains the same for the new segment starting at i
-        
+
         # Yield any remaining part of the string
         if slice_start < len(s):
-            yield s[slice_start:] 
+            yield s[slice_start:]

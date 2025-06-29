@@ -10,11 +10,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
-  "pytest"
-]
 dev = [
-  "ipykernel"
+  "pytest",
+  "ipykernel",
+  "torch",
+  "chex",
+  "huggingface_hub",
+  "fire",
+  "blobfile",
+  "black"
 ]
 
 [tool.setuptools.packages.find]
