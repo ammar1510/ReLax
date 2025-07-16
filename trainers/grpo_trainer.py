@@ -1,4 +1,6 @@
 from typing import Any, Callable, Dict
+from functools import partial
+import dataclasses
 
 import flax.struct
 import jax
@@ -42,23 +44,6 @@ class GRPOTrainer(Trainer):
         self.reward_fn = reward_fn
         self.grpo_config = grpo_config
 
-    def create_train_state(
-        self, key: jax.random.PRNGKey, dummy_input: jax.Array
-    ) -> TrainState:
-        """Creates the initial TrainState for the policy model.
-
-        Args:
-            key: A JAX random key for parameter initialization.
-            dummy_input: A batch of dummy data to initialize the model structure.
-
-        Returns:
-            An initial TrainState for the policy model.
-        """
-        # Note: We use self.model here because the base Trainer stores the policy model as self.model
-        params = self.model.init(key, dummy_input)["params"]
-        opt_state = self.optimizer.init(params)
-        return TrainState(params=params, opt_state=opt_state, step=0)
-
     def _generate_samples(self, params, batch):
         # Placeholder for sample generation logic
         # This will involve an autoregressive loop with sampling.
@@ -97,10 +82,8 @@ class GRPOTrainer(Trainer):
         advantages = rewards - mean_rewards
 
         # 4. Log-Probability Calculation
-        policy_log_probs = self._get_log_probs(self.model, {"params": params}, samples)
-        ref_log_probs = self._get_log_probs(
-            self.ref_model, {"params": self.ref_model.params}, samples
-        )  # Assuming ref_model has params
+        policy_log_probs = self._get_log_probs(params, samples)
+        ref_log_probs = self._get_log_probs(self.ref_model.params, samples)
 
         # 5. Policy Loss
         policy_loss = (-advantages * policy_log_probs).mean()
@@ -112,3 +95,39 @@ class GRPOTrainer(Trainer):
         total_loss = policy_loss + self.grpo_config.kl_coeff * kl_div
 
         return total_loss
+
+    @partial(jax.jit, static_argnames=["self"])
+    def train_step(self, state: TrainState, batch) -> tuple[TrainState, jax.Array]:
+        """Performs a single, JIT-compiled training step."""
+
+        def loss_fn(params):
+            return self.compute_loss(params, batch)
+
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+
+        updates, new_opt_state = self.optimizer.update(
+            grads, state.opt_state, state.params
+        )
+        new_params = optax.apply_updates(state.params, updates)
+
+        new_state = dataclasses.replace(
+            state, params=new_params, opt_state=new_opt_state, step=state.step + 1
+        )
+        return new_state, loss
+
+    def train(self, train_loader: Any, num_epochs: int, state: TrainState):
+        """The main training loop.
+
+        Args:
+            train_loader: The data loader for the training set.
+            num_epochs: The total number of epochs to train for.
+            state: The initial training state.
+        """
+        for epoch in range(num_epochs):
+            for batch in train_loader:
+                state, loss = self.train_step(state, batch)
+
+                if state.step % 100 == 0:
+                    print(f"Epoch {epoch}, Step {state.step}, Loss: {loss:.4f}")
+
+        return state
