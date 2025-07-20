@@ -15,8 +15,6 @@ from utils.ops import (
 from utils.kvcache import KVCache
 from .config import ModelConfig
 
-jax.config.update("jax_enable_x64", True)
-
 
 class TransformerBlock(nn.Module):
     args: ModelConfig
@@ -147,6 +145,9 @@ class LLaMa(nn.Module):
         )
 
         # Precompute RoPE frequencies
+        # Used float64 to match the precision of the torch/numpy implementation
+        jax.config.update("jax_enable_x64", True)
+        jax.config.update("jax_default_matmul_precision", "highest")
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim,
             self.args.max_seqlen * 2,
@@ -154,6 +155,8 @@ class LLaMa(nn.Module):
             dtype=jnp.float64,
             use_scaled=self.args.use_scaled_rope,
         ).astype(self.args.dtype)
+        jax.config.update("jax_enable_x64", False)
+        jax.config.update("jax_default_matmul_precision", "default")
 
     def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape

@@ -52,7 +52,7 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-@jit
+@partial(jit,static_argnames=["scale_factor","low_freq_factor","high_freq_factor","old_context_len"],donate_argnums=[0])
 def apply_scaling(
     freqs: jax.Array,
     scale_factor: float = 8.0,
@@ -130,7 +130,7 @@ def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
     return output * weight
 
 
-@jit
+@partial(jit,donate_argnums=[0])
 def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     """
     Apply Rotary Positional Embeddings (RoPE) to a tensor.
@@ -186,7 +186,7 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 
 
-@jit
+@partial(jit,static_argnames=["layer_idx","start_pos"],donate_argnums=[0,1,3,6])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
@@ -194,7 +194,7 @@ def grouped_query_attention(
     kv_cache: KVCache,
     layer_idx: int,
     start_pos: int,
-    prefill_mask: Optional[jax.Array] = None,  # padding mask during prefill stage
+    padding_mask: Optional[jax.Array] = None,  # padding mask for the current token(s)
 ) -> tuple[jax.Array, KVCache]:  # Return output and updated cache
     """
     Compute Grouped Query Attention with KV Caching.
@@ -206,7 +206,7 @@ def grouped_query_attention(
         kv_cache: The current KV Cache.
         layer_idx: The index of the current layer.
         start_pos: The starting position index for the current computation.
-        prefill_mask: Optional padding mask for the prefill stage.
+        padding_mask: Optional padding mask for the current token(s)
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
@@ -214,24 +214,24 @@ def grouped_query_attention(
     bsz, seqlen, dim = x.shape
 
     # Project inputs to queries, keys, values for the current token(s)
-    xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)
-    xk = jnp.einsum("bsd,dkc->bskc", x, params.wk)
-    xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv)
+    xq = jnp.einsum("bsd,dhc->bshc", x, params.wq) # [bsz, seqlen, n_heads, head_dim]
+    xk = jnp.einsum("bsd,dkc->bskc", x, params.wk) # [bsz, seqlen, n_kv_heads, head_dim]
+    xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv) # [bsz, seqlen, n_kv_heads, head_dim]
 
     # Apply rotary positional embeddings
-    current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0)
+    current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0) # [seqlen, head_dim//2, 2]
     xq = apply_rotary_emb(
-        xq, freqs_cis=current_freqs_cis
+        xq, current_freqs_cis
     )  # Shape: (bsz, seqlen, n_heads, head_dim)
     xk = apply_rotary_emb(
-        xk, freqs_cis=current_freqs_cis
+        xk, current_freqs_cis
     )  # Shape: (bsz, seqlen, n_kv_heads, head_dim)
 
     # During prefill, mask out padding tokens before caching
-    if prefill_mask is not None:
-        prefill_mask_expanded = prefill_mask[:, :, None, None]
-        xk = xk * prefill_mask_expanded
-        xv = xv * prefill_mask_expanded
+    if padding_mask is not None:
+        mask_expanded = padding_mask[:, :, None, None]
+        xk = xk * mask_expanded
+        xv = xv * mask_expanded
 
     # Update the KV cache
     updated_cache = kv_cache.update(xk, xv, layer_idx, start_pos)
@@ -247,9 +247,9 @@ def grouped_query_attention(
         None, :, :
     ]  # [1, seqlen, max_seqlen]
 
-    if prefill_mask is not None:
+    if padding_mask is not None:
         # Mask out queries at padding positions
-        query_mask = prefill_mask[:, :, None]  # [bsz, seqlen, 1]
+        query_mask = padding_mask[:, :, None]  # [bsz, seqlen, 1]
         mask = mask & query_mask
 
     # Add head dimension for broadcasting
@@ -264,8 +264,8 @@ def grouped_query_attention(
     )
 
     # Zero out outputs for padded tokens to prevent NaNs
-    if prefill_mask is not None:
-        attn_output = jnp.where(prefill_mask[:, :, None, None], attn_output, 0)
+    if padding_mask is not None:
+        attn_output = jnp.where(padding_mask[:, :, None, None], attn_output, 0)
 
     attn_output = attn_output.reshape(bsz, seqlen, -1)
     output = jnp.einsum("bsd,do->bso", attn_output, params.wo)
@@ -273,7 +273,7 @@ def grouped_query_attention(
     return output, updated_cache
 
 
-@partial(jit, static_argnames=["activation_fn"])
+@partial(jit, static_argnames=["activation_fn"],donate_argnums=[0])
 def feed_forward(
     x: jax.Array,
     params: FeedForwardParams,
