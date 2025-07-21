@@ -29,6 +29,8 @@ import math
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+jax_dtype = jnp.bfloat16
+torch_dtype = torch.bfloat16
 
 
 def test_precompute_freqs_cis():
@@ -38,13 +40,13 @@ def test_precompute_freqs_cis():
     theta = 500000.0
     dtype = np.float32
     # JAX implementation
-    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=dtype).astype(jnp.bfloat16)
+    freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=jax_dtype)
 
     # PyTorch implementation
-    freqs_cis_torch = precompute_freqs_cis_torch(128, 1024, 500000.0).to(dtype=torch.bfloat16)
+    freqs_cis_torch = precompute_freqs_cis_torch(128, 1024, 500000.0).to(dtype=torch_dtype)
 
     #limits on precision are much softer for precompute_freqs_cis
-    np.testing.assert_allclose(freqs_cis_jax.astype(dtype=np.float32), freqs_cis_torch.float().numpy(), rtol=1e-4, atol=4e-3)
+    np.testing.assert_allclose(freqs_cis_jax.astype(dtype=dtype), freqs_cis_torch.float().numpy(), rtol=1e-4, atol=1e-4)
 
 
 def test_apply_rotary_emb():
@@ -61,14 +63,16 @@ def test_apply_rotary_emb():
     x_np = np.random.randn(bsz, seqlen, n_heads, head_dim).astype(dtype)
 
     # JAX input
-    x_jax = jnp.array(x_np)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
 
     # PyTorch input
-    x_torch = torch.tensor(x_np, device=device)
+    x_torch = torch.tensor(x_np, device=device, dtype=torch_dtype)
+    print("x_torch device: ", x_torch.device)
 
     # Precompute freqs_cis
-    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, seqlen, theta,jnp.float32)
-    freqs_cis_torch = torch.from_numpy(np.array(freqs_cis_jax))
+    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, seqlen, theta,jax_dtype)
+    freqs_cis_torch = torch.from_numpy(np.array(freqs_cis_jax)).to(device=device, dtype=torch_dtype)
+    print("freqs_cis_torch device: ", freqs_cis_torch.device)
 
     # Apply rotary embeddings
     output_jax = apply_rotary_emb_jax(x_jax, freqs_cis_jax)
@@ -94,10 +98,10 @@ def test_repeat_kv():
     x_np = np.random.randn(bs, slen, n_kv_heads, head_dim).astype(dtype)
 
     # JAX input
-    x_jax = jnp.array(x_np)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
 
     # PyTorch input
-    x_torch = torch.tensor(x_np)
+    x_torch = torch.tensor(x_np, device=device, dtype=torch_dtype)
 
     # JAX implementation
     output_jax = repeat_kv_jax(x_jax, n_rep)
@@ -123,13 +127,13 @@ def test_rms_norm():
     weight_np = np.random.randn(dim).astype(dtype)
 
     # JAX implementation
-    x_jax = jnp.array(x_np)
-    weight_jax = jnp.array(weight_np)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
+    weight_jax = jnp.array(weight_np, dtype=jax_dtype)
     output_jax = rms_norm_jax(x_jax, weight_jax, eps)
 
     # PyTorch implementation
-    x_torch = torch.tensor(x_np, device=device)
-    weight_torch = torch.tensor(weight_np, device=device)
+    x_torch = torch.tensor(x_np, device=device, dtype=torch_dtype)
+    weight_torch = torch.tensor(weight_np, device=device, dtype=torch_dtype)
 
     rms_norm_torch_module = RMSNorm_torch(dim, eps=eps)
     rms_norm_torch_module.weight = torch.nn.Parameter(weight_torch)
@@ -152,8 +156,6 @@ def test_attention():
     head_dim = dim // n_heads
     start_pos = 0  # Start from beginning for simplicity
     dtype = np.float32
-    jax_dtype = jnp.bfloat16
-    torch_dtype = torch.bfloat16
     max_seq_len = 1024
     n_layers = 1
 
@@ -171,15 +173,15 @@ def test_attention():
 
     # Precompute frequencies
     freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len).to(dtype=torch_dtype)
-    freqs_cis_jax = jnp.array(freqs_cis_torch.float().detach().cpu().numpy()).astype(jax_dtype)
+    freqs_cis_jax = jnp.array(freqs_cis_torch.float().detach().cpu().numpy(), dtype=jax_dtype)
 
     # 3. JAX setup
-    x_jax = jnp.array(x_np).astype(jax_dtype)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
     jax_params = AttentionParams(
-        wq=jnp.array(wq_np).reshape(dim, n_heads, head_dim).astype(jax_dtype),
-        wk=jnp.array(wk_np).reshape(dim, n_kv_heads, head_dim).astype(jax_dtype),
-        wv=jnp.array(wv_np).reshape(dim, n_kv_heads, head_dim).astype(jax_dtype),
-        wo=jnp.array(wo_np).astype(jax_dtype),
+        wq=jnp.array(wq_np, dtype=jax_dtype).reshape(dim, n_heads, head_dim),
+        wk=jnp.array(wk_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wv=jnp.array(wv_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wo=jnp.array(wo_np, dtype=jax_dtype),
     )
     
     # Initialize empty KV cache
@@ -287,7 +289,7 @@ def test_attention_causal_property():
 
     np.random.seed(123)
     x_np = np.random.randn(bsz, seqlen, dim).astype(np.float32)
-    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, max_seq_len, dtype=jnp.float32)
+    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, max_seq_len, dtype=jax_dtype)
 
     # Create parameters
     wq_np = np.random.randn(dim, n_heads * head_dim).astype(np.float32)
@@ -295,22 +297,22 @@ def test_attention_causal_property():
     wv_np = np.random.randn(dim, n_kv_heads * head_dim).astype(np.float32)
     wo_np = np.random.randn(n_heads * head_dim, dim).astype(np.float32)
 
-    x_jax = jnp.array(x_np)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
     jax_params = AttentionParams(
-        wq=jnp.array(wq_np).reshape(dim, n_heads, head_dim),
-        wk=jnp.array(wk_np).reshape(dim, n_kv_heads, head_dim),
-        wv=jnp.array(wv_np).reshape(dim, n_kv_heads, head_dim),
-        wo=jnp.array(wo_np),
+        wq=jnp.array(wq_np, dtype=jax_dtype).reshape(dim, n_heads, head_dim),
+        wk=jnp.array(wk_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wv=jnp.array(wv_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wo=jnp.array(wo_np, dtype=jax_dtype),
     )
 
     # Test 1: Process first 5 tokens only
-    kv_cache_1 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jnp.float32)
+    kv_cache_1 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
     output_1, cache_1 = grouped_query_attention(
         x_jax[:, :5, :], freqs_cis_jax, jax_params, kv_cache_1, 0, 0,None
     )
 
     # Test 2: Process first 10 tokens
-    kv_cache_2 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jnp.float32)
+    kv_cache_2 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
     output_2, cache_2 = grouped_query_attention(
         x_jax[:, :10, :], freqs_cis_jax, jax_params, kv_cache_2, 0, 0, None
     )
@@ -349,8 +351,8 @@ def test_attention_with_padding():
     padding_start = seqlen // 2
     prefill_mask_np[0, padding_start:] = 0
 
-    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len).to(dtype=torch.bfloat16)
-    freqs_cis_jax = jnp.array(freqs_cis_torch.float().detach().cpu().numpy()).astype(jnp.bfloat16)
+    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len).to(dtype=torch_dtype)
+    freqs_cis_jax = jnp.array(freqs_cis_torch.float().detach().cpu().numpy(), dtype=jax_dtype)
 
     wq_np = np.random.normal(0, 0.02, (dim, n_heads * head_dim)).astype(dtype)
     wk_np = np.random.normal(0, 0.02, (dim, n_kv_heads * head_dim)).astype(dtype)
@@ -358,27 +360,27 @@ def test_attention_with_padding():
     wo_np = np.random.normal(0, 0.02, (n_heads * head_dim, dim)).astype(dtype)
 
     # 3. JAX setup
-    x_jax = jnp.array(x_np).astype(jnp.bfloat16)
+    x_jax = jnp.array(x_np, dtype=jax_dtype)
     prefill_mask_jax = jnp.array(prefill_mask_np)
     jax_params = AttentionParams(
-        wq=jnp.array(wq_np).reshape(dim, n_heads, head_dim).astype(jnp.bfloat16),
-        wk=jnp.array(wk_np).reshape(dim, n_kv_heads, head_dim).astype(jnp.bfloat16),
-        wv=jnp.array(wv_np).reshape(dim, n_kv_heads, head_dim).astype(jnp.bfloat16),
-        wo=jnp.array(wo_np).astype(jnp.bfloat16),
+        wq=jnp.array(wq_np, dtype=jax_dtype).reshape(dim, n_heads, head_dim),
+        wk=jnp.array(wk_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wv=jnp.array(wv_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
+        wo=jnp.array(wo_np, dtype=jax_dtype),
     )
     kv_cache_jax_initial = KVCache_jax.new(
-        1, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jnp.bfloat16
+        1, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype
     )
 
     # 4. PyTorch setup
-    x_torch = torch.tensor(x_np, dtype=torch.bfloat16, device=device)
+    x_torch = torch.tensor(x_np, dtype=torch_dtype, device=device)
     torch_attention = Attention_torch(model_args)
-    torch_attention.wq.weight = torch.nn.Parameter(torch.tensor(wq_np.T, device=device, dtype=torch.bfloat16))
-    torch_attention.wk.weight = torch.nn.Parameter(torch.tensor(wk_np.T, device=device, dtype=torch.bfloat16))
-    torch_attention.wv.weight = torch.nn.Parameter(torch.tensor(wv_np.T, device=device, dtype=torch.bfloat16))
-    torch_attention.wo.weight = torch.nn.Parameter(torch.tensor(wo_np.T, device=device, dtype=torch.bfloat16))
+    torch_attention.wq.weight = torch.nn.Parameter(torch.tensor(wq_np.T, device=device, dtype=torch_dtype))
+    torch_attention.wk.weight = torch.nn.Parameter(torch.tensor(wk_np.T, device=device, dtype=torch_dtype))
+    torch_attention.wv.weight = torch.nn.Parameter(torch.tensor(wv_np.T, device=device, dtype=torch_dtype))
+    torch_attention.wo.weight = torch.nn.Parameter(torch.tensor(wo_np.T, device=device, dtype=torch_dtype))
     kv_cache_torch = KVCache_torch(
-        bsz, max_seq_len, n_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        bsz, max_seq_len, n_kv_heads, head_dim, dtype=torch_dtype, device=device
     )
     torch_attention.cache = kv_cache_torch
 
@@ -398,7 +400,7 @@ def test_attention_with_padding():
     # Create the equivalent mask for PyTorch to match JAX's internal masking
     torch_prefill_mask = torch.tensor(prefill_mask_np, device=device)
     causal_mask = torch.triu(
-        torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=torch.bfloat16), diagonal=1
+        torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=torch_dtype), diagonal=1
     )
 
     # Combine causal mask with the padding mask for queries
@@ -467,8 +469,8 @@ def test_apply_scaling():
     freqs_np = 1.0 / (theta ** (np.arange(0, head_dim, 2).astype(dtype) / head_dim))
 
     # JAX and PyTorch inputs
-    freqs_jax = jnp.array(freqs_np)
-    freqs_torch = torch.tensor(freqs_np)
+    freqs_jax = jnp.array(freqs_np, dtype=jax_dtype)
+    freqs_torch = torch.tensor(freqs_np, dtype=torch_dtype)
 
     # Get the reference output from the torch implementation
     output_torch_reference = apply_scaling_torch(freqs_torch)
@@ -503,8 +505,6 @@ def test_feed_forward():
     dim = 3072
     multiple_of = 32
     dtype = np.float32
-    jax_dtype = jnp.bfloat16
-    torch_dtype = torch.bfloat16
 
     # Mimic hidden_dim calculation from PyTorch implementation
     hidden_dim = int(2 * (4 * dim) / 3)
