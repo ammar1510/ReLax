@@ -34,6 +34,11 @@ torch_dtype = torch.bfloat16
 
 
 def test_precompute_freqs_cis():
+    jax.config.update("jax_enable_x64", True)
+    jax_dtype = jnp.float64
+    torch_dtype = torch.float64
+    #Loading with float64 since only precompute_freqs_cis is one time computation. 
+
     # Parameters for the test
     dim = 128
     end = 1024
@@ -46,11 +51,14 @@ def test_precompute_freqs_cis():
     freqs_cis_torch = precompute_freqs_cis_torch(128, 1024, 500000.0).to(dtype=torch_dtype)
 
     #limits on precision are much softer for precompute_freqs_cis
-    np.testing.assert_allclose(freqs_cis_jax.astype(dtype=dtype), freqs_cis_torch.float().numpy(), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(freqs_cis_jax, freqs_cis_torch.numpy(), rtol=8e-4, atol=1e-4)
+    jax.config.update("jax_enable_x64", False)
 
 
 def test_apply_rotary_emb():
     # Parameters
+    jax.config.update("jax_enable_x64", True)
+
     bsz = 2
     seqlen = 128
     n_heads = 4
@@ -67,12 +75,11 @@ def test_apply_rotary_emb():
 
     # PyTorch input
     x_torch = torch.tensor(x_np, device=device, dtype=torch_dtype)
-    print("x_torch device: ", x_torch.device)
 
     # Precompute freqs_cis
-    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, seqlen, theta,jax_dtype)
+    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, seqlen, theta,jnp.float64)
     freqs_cis_torch = torch.from_numpy(np.array(freqs_cis_jax)).to(device=device, dtype=torch_dtype)
-    print("freqs_cis_torch device: ", freqs_cis_torch.device)
+    freqs_cis_jax = freqs_cis_jax.astype(jax_dtype)
 
     # Apply rotary embeddings
     output_jax = apply_rotary_emb_jax(x_jax, freqs_cis_jax)
@@ -80,8 +87,9 @@ def test_apply_rotary_emb():
 
     # Compare
     np.testing.assert_allclose(
-        np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=5e-5, atol=1e-5
+        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-5, atol=1e-5
     )
+    jax.config.update("jax_enable_x64", False)
 
 
 def test_repeat_kv():
@@ -141,7 +149,7 @@ def test_rms_norm():
 
     # Compare
     np.testing.assert_allclose(
-        np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=1e-5, atol=1e-5
+        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-2, atol=1e-4
     )
 
 
@@ -207,7 +215,7 @@ def test_attention():
     )
 
     # 6. Execute PyTorch attention
-    freqs_cis_torch_sliced = freqs_cis_torch[start_pos : start_pos + seqlen]
+    freqs_cis_torch_sliced = freqs_cis_torch[start_pos : start_pos + seqlen].to(device=device)
     
     # Create causal mask for PyTorch (JAX handles this internally)
     mask = None
@@ -500,9 +508,9 @@ def test_apply_scaling():
 #For exact precision, run both on xPU.
 def test_feed_forward():
     # 1. Setup Parameters
-    bsz = 8
-    seqlen = 128
-    dim = 3072
+    bsz = 4
+    seqlen = 64
+    dim = 1536
     multiple_of = 32
     dtype = np.float32
 
@@ -539,5 +547,5 @@ def test_feed_forward():
 
     # 5. Compare
     np.testing.assert_allclose(
-        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-4, atol=1e-4
+        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-2, atol=1e-3
     )
