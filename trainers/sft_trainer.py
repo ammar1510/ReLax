@@ -46,26 +46,7 @@ class SFTTrainer(Trainer):
 
         return mean_loss
 
-    @partial(jax.jit, static_argnames=["self"])
-    def train_step(self, state: TrainState, batch) -> tuple[TrainState, jax.Array]:
-        """Performs a single, JIT-compiled training step."""
-
-        def loss_fn(params):
-            return self.compute_loss(params, batch)
-
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-
-        updates, new_opt_state = self.optimizer.update(
-            grads, state.opt_state, state.params
-        )
-        new_params = optax.apply_updates(state.params, updates)
-
-        new_state = dataclasses.replace(
-            state, params=new_params, opt_state=new_opt_state, step=state.step + 1
-        )
-        return new_state, loss
-
-    def train(self, train_loader: Any, num_epochs: int, state: TrainState):
+    def train(self, train_loader: Any, num_epochs: int, state: TrainState) -> TrainState:
         """The main training loop.
 
         Args:
