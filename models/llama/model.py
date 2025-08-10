@@ -88,7 +88,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: jax.Array,
         kv_cache: KVCache,
         layer_idx: int,
-        start_pos: int,
+        seq_lengths: jax.Array,
     ) -> tuple[jax.Array, KVCache]:
         # Attention block
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
@@ -98,7 +98,7 @@ class TransformerBlock(nn.Module):
             params=self.attention,
             kv_cache=kv_cache,
             layer_idx=layer_idx,
-            start_pos=start_pos,
+            seq_lengths=seq_lengths,
         )
         x = x + attn_output  # Residual connection
 
@@ -158,13 +158,13 @@ class LLaMa(nn.Module):
         jax.config.update("jax_enable_x64", False)
         jax.config.update("jax_default_matmul_precision", "default")
 
-    def __call__(self, tokens: jax.Array, start_pos: int, kv_cache: KVCache):
+    def __call__(self, tokens: jax.Array, seq_lengths: jax.Array, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
         # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
-            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, start_pos)
+            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, seq_lengths)
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)

@@ -1,0 +1,14 @@
+for jax
+- https://docs.jax.dev/en/latest/
+
+for pallas
+- https://docs.jax.dev/en/latest/pallas/
+
+
+for scaling model, inference on jax, sharding, TPU optimizations 
+- https://jax-ml.github.io/scaling-book/
+
+
+for jax codebases(only refer if explicitly told to)
+- https://github.com/xjdr-alt/entropix
+

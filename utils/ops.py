@@ -52,7 +52,16 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-@partial(jit,static_argnames=["scale_factor","low_freq_factor","high_freq_factor","old_context_len"],donate_argnums=[0])
+@partial(
+    jit,
+    static_argnames=[
+        "scale_factor",
+        "low_freq_factor",
+        "high_freq_factor",
+        "old_context_len",
+    ],
+    donate_argnums=[0],
+)
 def apply_scaling(
     freqs: jax.Array,
     scale_factor: float = 8.0,
@@ -130,7 +139,7 @@ def rms_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
     return output * weight
 
 
-@partial(jit,donate_argnums=[0])
+@partial(jit, donate_argnums=[0])
 def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     """
     Apply Rotary Positional Embeddings (RoPE) to a tensor.
@@ -151,6 +160,41 @@ def apply_rotary_emb(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     # freqs_cis: [seqlen, head_dim//2, 2] -> [1, seqlen, 1, head_dim//2, 2]
     # This reshapes freqs_cis to be broadcastable with the x tensor.
     freqs_cis = freqs_cis[None, :, None, :, :]
+    freqs_cos, freqs_sin = freqs_cis[..., 0], freqs_cis[..., 1]
+
+    # Apply the rotation using complex number multiplication logic.
+    # (v_r + i*v_i) * (cos + i*sin) = (v_r*cos - v_i*sin) + i*(v_r*sin + v_i*cos)
+    x_out_r = x_r * freqs_cos - x_i * freqs_sin
+    x_out_i = x_r * freqs_sin + x_i * freqs_cos
+
+    # Combine the real and imaginary parts back into a single tensor.
+    # [..., head_dim//2, 2] -> [..., head_dim]
+    x_out = jnp.stack([x_out_r, x_out_i], axis=-1).reshape(x.shape)
+
+    return x_out
+
+
+@partial(jit, donate_argnums=[0])
+def apply_rotary_emb_batch(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
+    """
+    Apply Rotary Positional Embeddings (RoPE) to a tensor with per-batch-item frequencies.
+
+    Args:
+        x: Input tensor, shape [bsz, seqlen, n_heads, head_dim] or [bsz, seqlen, n_kv_heads, head_dim].
+        freqs_cis: Precomputed rotary frequency embeddings per batch item. A JAX array of shape
+                   `[bsz, seqlen, head_dim // 2, 2]`, where the last dimension contains
+                   the cosine and sine components.
+
+    Returns:
+        The transformed tensor with RoPE applied.
+    """
+    # x: [..., head_dim] -> [..., head_dim//2, 2]
+    x_shaped = x.reshape(*x.shape[:-1], -1, 2)
+    x_r, x_i = x_shaped[..., 0], x_shaped[..., 1]
+
+    # freqs_cis: [bsz, seqlen, head_dim//2, 2] -> [bsz, seqlen, 1, head_dim//2, 2]
+    # This reshapes freqs_cis to be broadcastable with the x tensor.
+    freqs_cis = freqs_cis[:, :, None, :, :]
     freqs_cos, freqs_sin = freqs_cis[..., 0], freqs_cis[..., 1]
 
     # Apply the rotation using complex number multiplication logic.
@@ -186,27 +230,25 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 
 
-@partial(jit,static_argnames=["layer_idx","start_pos"],donate_argnums=[0,1,3,6])
+@partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3, 5])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
-    start_pos: int,
-    padding_mask: Optional[jax.Array] = None,  # padding mask for the current token(s)
+    seq_lengths: jax.Array,  # Actual sequence lengths for each batch item [batch_size]
 ) -> tuple[jax.Array, KVCache]:  # Return output and updated cache
     """
-    Compute Grouped Query Attention with KV Caching.
+    Compute Grouped Query Attention with KV Caching for variable-length sequences.
 
     Args:
-        x: Input tensor of shape [batch_size, seqlen, dim] (seqlen=1 for decoding).
+        x: Input tensor of shape [batch_size, seqlen, dim] (padded to max length in batch).
         freqs_cis: Precomputed rotary frequency embeddings (complex format, shape like [max_seqlen, head_dim//2, 2]).
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
         kv_cache: The current KV Cache.
         layer_idx: The index of the current layer.
-        start_pos: The starting position index for the current computation.
-        padding_mask: Optional padding mask for the current token(s)
+        seq_lengths: Actual sequence lengths for each batch item, shape [batch_size].
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
@@ -214,48 +256,80 @@ def grouped_query_attention(
     bsz, seqlen, dim = x.shape
 
     # Project inputs to queries, keys, values for the current token(s)
-    xq = jnp.einsum("bsd,dhc->bshc", x, params.wq) # [bsz, seqlen, n_heads, head_dim]
-    xk = jnp.einsum("bsd,dkc->bskc", x, params.wk) # [bsz, seqlen, n_kv_heads, head_dim]
-    xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv) # [bsz, seqlen, n_kv_heads, head_dim]
+    xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)  # [bsz, seqlen, n_heads, head_dim]
+    xk = jnp.einsum(
+        "bsd,dkc->bskc", x, params.wk
+    )  # [bsz, seqlen, n_kv_heads, head_dim]
+    xv = jnp.einsum(
+        "bsd,dvc->bsvc", x, params.wv
+    )  # [bsz, seqlen, n_kv_heads, head_dim]
 
-    # Apply rotary positional embeddings
-    current_freqs_cis = lax.dynamic_slice_in_dim(freqs_cis, start_pos, seqlen, axis=0) # [seqlen, head_dim//2, 2]
-    xq = apply_rotary_emb(
-        xq, current_freqs_cis
-    )  # Shape: (bsz, seqlen, n_heads, head_dim)
-    xk = apply_rotary_emb(
-        xk, current_freqs_cis
-    )  # Shape: (bsz, seqlen, n_kv_heads, head_dim)
+    # Apply rotary positional embeddings per sequence
+    # Create position arrays for each sequence in the batch
+    position_ids = jnp.arange(seqlen)[None, :]  # [1, seqlen]
+    position_ids = jnp.broadcast_to(position_ids, (bsz, seqlen))  # [bsz, seqlen]
 
-    # During prefill, mask out padding tokens before caching
-    if padding_mask is not None:
-        mask_expanded = padding_mask[:, :, None, None]
-        xk = xk * mask_expanded
-        xv = xv * mask_expanded
+    # Mask positions beyond sequence length for each batch item
+    seq_mask = position_ids < seq_lengths[:, None]  # [bsz, seqlen]
+    valid_positions = jnp.where(seq_mask, position_ids, 0)  # [bsz, seqlen]
 
-    # Update the KV cache
-    updated_cache = kv_cache.update(xk, xv, layer_idx, start_pos)
+    # Get frequencies for all positions needed
+    # We'll apply RoPE per sequence by gathering the right frequencies
+    batch_freqs_cis = freqs_cis[valid_positions]  # [bsz, seqlen, head_dim//2, 2]
+
+    # Apply rotary embeddings with per-sequence frequencies
+    xq = apply_rotary_emb_batch(xq, batch_freqs_cis)  # [bsz, seqlen, n_heads, head_dim]
+    xk = apply_rotary_emb_batch(
+        xk, batch_freqs_cis
+    )  # [bsz, seqlen, n_kv_heads, head_dim]
+
+    # Update the KV cache with per-sequence lengths
+    updated_cache = kv_cache.update_batch(xk, xv, layer_idx, seq_lengths)
     keys, values = updated_cache.get_layer(layer_idx)
 
     max_seqlen = keys.shape[1]
 
-    # Build attention mask
-    query_positions = jnp.arange(seqlen) + start_pos
-    key_positions = jnp.arange(max_seqlen)
+    # Build variable-length attention mask using cache positions
+    # Each sequence has its own valid positions based on how much is cached
+    query_positions = jnp.arange(seqlen)[
+        None, :
+    ]  # [1, seqlen] - positions in current input
+    key_positions = jnp.arange(max_seqlen)[
+        None, :
+    ]  # [1, max_seqlen] - positions in cache
 
-    mask = (query_positions[:, None] >= key_positions[None, :])[
-        None, :, :
-    ]  # [1, seqlen, max_seqlen]
+    # Current query positions are relative to the current cache positions
+    # Queries are at positions [cache_pos : cache_pos + seqlen] for each sequence
+    current_positions = (
+        updated_cache.positions
+    )  # [bsz] - where each sequence is now positioned
 
-    if padding_mask is not None:
-        # Mask out queries at padding positions
-        query_mask = padding_mask[:, :, None]  # [bsz, seqlen, 1]
-        mask = mask & query_mask
+    # Adjust query positions to absolute positions in the cache
+    abs_query_positions = (
+        query_positions + (current_positions - seqlen)[:, None]
+    )  # [bsz, seqlen]
+
+    # Causal mask: queries can only attend to keys at positions <= their own position
+    causal_mask = (
+        abs_query_positions[:, :, None] >= key_positions[:, None, :]
+    )  # [bsz, seqlen, max_seqlen]
+
+    # Valid key mask: keys beyond current cache position are invalid for each sequence
+    valid_key_mask = (
+        key_positions < current_positions[:, None, None]
+    )  # [bsz, 1, max_seqlen]
+
+    # Valid query mask: queries beyond sequence length in current input are invalid
+    valid_query_mask = query_positions < seq_lengths[:, None, None]  # [bsz, seqlen, 1]
+
+    # Combine all masks
+    mask = causal_mask & valid_key_mask & valid_query_mask  # [bsz, seqlen, max_seqlen]
 
     # Add head dimension for broadcasting
     mask = mask[:, None, :, :]
 
     # Perform attention using JAX's optimized dot-product attention
+    # JAX handles all the masking internally - no need for additional output masking
     attn_output = nn.dot_product_attention(
         query=xq,
         key=keys,
@@ -263,17 +337,13 @@ def grouped_query_attention(
         mask=mask,
     )
 
-    # Zero out outputs for padded tokens to prevent NaNs
-    if padding_mask is not None:
-        attn_output = jnp.where(padding_mask[:, :, None, None], attn_output, 0)
-
     attn_output = attn_output.reshape(bsz, seqlen, -1)
     output = jnp.einsum("bsd,do->bso", attn_output, params.wo)
 
     return output, updated_cache
 
 
-@partial(jit, static_argnames=["activation_fn"],donate_argnums=[0])
+@partial(jit, static_argnames=["activation_fn"], donate_argnums=[0])
 def feed_forward(
     x: jax.Array,
     params: FeedForwardParams,
