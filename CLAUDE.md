@@ -8,46 +8,40 @@ ReLax is a JAX-based implementation of the LLaMA transformer architecture optimi
 
 ## Development Commands
 
-**Testing:**
-```bash
-# Run all tests
-pytest
+### Dependencies and Setup
+- Install dependencies: `pip install -e .[dev]`
+- Project uses Python with JAX/Flax for model implementation
+- Dependencies include: tiktoken, jax, flax, numpy, safetensors
+- Dev dependencies: pytest, torch, chex, huggingface_hub, fire, black
 
-# Run specific test files
-pytest tests/test_ops.py
-pytest tests/test_kvcache.py
-pytest tests/test_gqa_benchmark.py
+### Testing
+- Run tests: `pytest`
+- Run specific test files: `pytest tests/test_ops.py tests/test_kvcache.py tests/test_gqa_benchmark.py`
+- Test files are in `tests/` directory
+- Key test files:
+  - `test_model.py` - Model architecture tests
+  - `test_ops.py` - JAX operations tests  
+  - `test_llama_tokenizer.py` - Tokenizer tests
+  - `test_kvcache.py` - KV cache tests
 
-# Run with specific Python path (already configured in pyproject.toml)
-python -m pytest tests/
-```
+### Code Formatting
+- Format code: `black .`
 
-**Code Formatting:**
-```bash
-# Format code (black is in dev dependencies)
-python -m black .
-```
+### Running the Model
+- Generate text: `python generate.py --model_path <path_to_model> --prompt "Your prompt here"`
+- Chat interface: `python chat.py`
 
-**Model Generation:**
-```bash
-# Generate text using the model
-python generate.py --model_path <path_to_model> --prompt "Your prompt here"
-
-# Interactive chat interface
-python chat.py
-```
-
-## Architecture Overview
+## Project Architecture
 
 ### Core Components
 
-**Models (`models/`):**
+**Models (`models/`)**
 - `models/llama/model.py`: Core LLaMA transformer implementation using Flax
 - `models/llama/config.py`: Model configuration with support for loading HuggingFace configs
 - `models/llama/load.py`: Model weight loading utilities
 - `models/llama/tokenizer.py`: Tokenizer implementation
 
-**Optimized Operations (`utils/`):**
+**Optimized Operations (`utils/`)**
 - `utils/ops.py`: High-performance JAX operations including:
   - `grouped_query_attention()`: Variable-length GQA with KV caching
   - `apply_rotary_emb()` and `apply_rotary_emb_batch()`: RoPE implementations
@@ -57,10 +51,12 @@ python chat.py
 - `utils/sharding.py`: Multi-device computation utilities
 - `utils/memory.py`: Memory footprint estimation tools
 
-**Trainers (`trainers/`):**
+**Training Framework (`trainers/`)**
+- Modular training architecture following abstract base class pattern
 - `trainers/trainer.py`: Abstract base trainer with custom TrainState
 - `trainers/sft_trainer.py`: Supervised fine-tuning implementation
 - `trainers/grpo_trainer.py`: Group Relative Policy Optimization trainer
+- Training follows functional programming with JAX transformations
 
 ### Key Design Patterns
 
@@ -71,11 +67,12 @@ The codebase implements sophisticated variable-length sequence handling:
 - Attention masks combine causal, validity, and sequence-length constraints
 - JAX's `nn.dot_product_attention` handles GQA automatically
 
-**JAX Optimization:**
+**JAX/Flax Design**
+- Uses Flax modules with explicit parameter management
 - Extensive use of `@jit` decorators with static arguments
 - `donate_argnums` for memory efficiency
-- Structured arrays using `flax.struct.dataclass`
-- Functional programming patterns for JAX transformations
+- Functional programming style with immutable state
+- Custom TrainState dataclass for training state management
 
 **Configuration Management:**
 - `ModelConfig` dataclass with HuggingFace compatibility
