@@ -328,3 +328,7 @@ if __name__ == "__main__":
     print(f"Pirate Bot: {pirate_response_2}")
     print(f"Final Pirate Dialog: {pirate_state.dialog_history}")
     print(f"Final Pirate Sequence Length: {pirate_state.sequence_length}")
+
+    x = 0
+    for i in range(4):
+        print(i)
