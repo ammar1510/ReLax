@@ -56,9 +56,10 @@ class InferenceRequest:
     top_p: float = 1.0
     
     # Internal state
-    tokens: Optional[jax.Array] = None
-    seq_length: Optional[int] = None
-    result: Optional[str] = None
+    tokens: Optional[jax.Array] = None  # Tokenized prompt (for prefill)
+    seq_length: Optional[int] = None    # Length of tokenized prompt
+    generated_tokens: List[int] = field(default_factory=list)  # All generated tokens for detokenization
+    result: Optional[str] = None        # Final detokenized text
     
     # Completion signaling
     complete_event: threading.Event = field(default_factory=threading.Event)
@@ -90,8 +91,7 @@ class GenerationSlot:
     
     slot_id: int
     request: Optional[InferenceRequest] = None
-    prefill_cache: Optional[Any] = None  # KV cache from prefill
-    current_length: int = 0
+    last_token: Optional[int] = None  # Single token for next model input
     tokens_generated: int = 0
     is_complete: bool = False
     
@@ -102,8 +102,7 @@ class GenerationSlot:
     def reset(self):
         """Reset slot for reuse."""
         self.request = None
-        self.prefill_cache = None
-        self.current_length = 0
+        self.last_token = None
         self.tokens_generated = 0
         self.is_complete = False
 
@@ -220,17 +219,12 @@ class InferenceEngine:
         batch_tokens = []
         
         for slot in active_slots:
-            if hasattr(slot, 'last_token') and slot.last_token is not None:
-                # Use the last generated token
+            if slot.last_token is not None:
+                # Use the last generated/prefill token
                 batch_tokens.append([slot.last_token])
-            elif hasattr(slot.request, 'first_token') and slot.request.first_token is not None:
-                # Use first token from prefill
-                batch_tokens.append([slot.request.first_token])
-            elif slot.request.tokens is not None and len(slot.request.tokens) > 0:
-                # Fallback to last token from prefill tokens
-                batch_tokens.append([int(slot.request.tokens[-1])])
             else:
-                # Last resort: BOS token
+                # This shouldn't happen if transfer worker is working correctly
+                logging.warning(f"Slot {slot.slot_id} has no last_token, using BOS")
                 batch_tokens.append([self.tokenizer.bos_id])
         
         # Convert to JAX array [batch_size, 1] - all sequences have length 1 for generation
@@ -454,9 +448,15 @@ class InferenceEngine:
                 
                 # Assign request to slot
                 slot.request = request
-                slot.current_length = request.seq_length
                 slot.tokens_generated = 0
                 slot.is_complete = False
+                
+                # Initialize last_token for generation
+                # For now, use last token from prompt (will be replaced with first generated token from prefill)
+                if request.tokens is not None and len(request.tokens) > 0:
+                    slot.last_token = int(request.tokens[-1])  # Last prompt token
+                else:
+                    slot.last_token = self.tokenizer.bos_id
                 
                 request.generation_start_time = time.perf_counter()
                 
