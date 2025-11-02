@@ -210,8 +210,9 @@ def test_attention():
     torch_attention.cache = kv_cache_torch
 
     # 5. Execute JAX attention
+    seq_lengths = jnp.full((bsz,), seqlen, dtype=jnp.int32)  # All sequences have same length (no padding)
     output_jax, updated_kv_cache_jax = grouped_query_attention(
-        x_jax, freqs_cis_jax, jax_params, kv_cache_jax, 0, start_pos, None
+        x_jax, freqs_cis_jax, jax_params, kv_cache_jax, 0, seq_lengths
     )
 
     # 6. Execute PyTorch attention
@@ -315,14 +316,16 @@ def test_attention_causal_property():
 
     # Test 1: Process first 5 tokens only
     kv_cache_1 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
+    seq_lengths_1 = jnp.full((bsz,), 5, dtype=jnp.int32)  # All sequences have 5 tokens
     output_1, cache_1 = grouped_query_attention(
-        x_jax[:, :5, :], freqs_cis_jax, jax_params, kv_cache_1, 0, 0,None
+        x_jax[:, :5, :], freqs_cis_jax, jax_params, kv_cache_1, 0, seq_lengths_1
     )
 
     # Test 2: Process first 10 tokens
     kv_cache_2 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
+    seq_lengths_2 = jnp.full((bsz,), 10, dtype=jnp.int32)  # All sequences have 10 tokens
     output_2, cache_2 = grouped_query_attention(
-        x_jax[:, :10, :], freqs_cis_jax, jax_params, kv_cache_2, 0, 0, None
+        x_jax[:, :10, :], freqs_cis_jax, jax_params, kv_cache_2, 0, seq_lengths_2
     )
 
     # The first token's output should be the same in both cases (causal property)
@@ -393,15 +396,15 @@ def test_attention_with_padding():
     torch_attention.cache = kv_cache_torch
 
     # 5. Execute
-    # JAX
+    # JAX - compute actual sequence lengths from the prefill mask
+    seq_lengths_jax = jnp.sum(prefill_mask_jax, axis=1, dtype=jnp.int32)  # Count non-padded tokens per sequence
     output_jax, updated_kv_cache_jax = grouped_query_attention(
         x_jax,
         freqs_cis_jax,
         jax_params,
         kv_cache_jax_initial,
         0,
-        start_pos,
-        prefill_mask_jax,
+        seq_lengths_jax,
     )
 
     # PyTorch
