@@ -119,7 +119,7 @@ def test_repeat_kv():
 
     # Compare
     np.testing.assert_allclose(
-        np.array(output_jax), output_torch.detach().cpu().numpy(), rtol=1e-5
+        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-5
     )
 
 
@@ -485,7 +485,7 @@ def test_apply_scaling():
 
     # Get the reference output from the torch implementation
     output_torch_reference = apply_scaling_torch(freqs_torch)
-    torch_result_np = output_torch_reference.detach().cpu().numpy()
+    torch_result_np = output_torch_reference.float().detach().cpu().numpy()  # Convert to float32 first
 
     # Test JAX implementation with explicit parameters that match the torch hardcoded values
     scale_factor = 8.0
