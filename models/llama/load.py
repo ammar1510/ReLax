@@ -11,6 +11,7 @@ from safetensors import safe_open
 from pathlib import Path
 from typing import Dict, Any
 import numpy as np
+from flax.core import FrozenDict
 
 from .config import ModelConfig
 
@@ -90,7 +91,10 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
     print(f"Loaded {len(all_weights)} tensors total")
 
     # Convert to ReLax format
-    return _convert_hf_to_relax(all_weights, config)
+    params = _convert_hf_to_relax(all_weights, config)
+
+    # Wrap in FrozenDict for Flax
+    return FrozenDict(params)
 
 
 def _convert_hf_to_relax(
@@ -115,19 +119,27 @@ def _convert_hf_to_relax(
     # HF: model.embed_tokens.weight [vocab_size, dim]
     # ReLax: tok_embeddings.embedding [vocab_size, dim]
     embed_weight = hf_weights.get("model.embed_tokens.weight")
-    if embed_weight is not None:
-        params["tok_embeddings"] = {
-            "embedding": jnp.asarray(embed_weight, dtype=config.dtype)
-        }
-        print(f"  ✓ Embeddings: {embed_weight.shape}")
+    if embed_weight is None:
+        raise ValueError("model.embed_tokens.weight not found in checkpoint")
+
+    params["tok_embeddings"] = {
+        "embedding": jnp.asarray(embed_weight, dtype=config.dtype)
+    }
+    print(f"  ✓ Embeddings: {embed_weight.shape}")
 
     # Output layer (language model head)
-    # HF: lm_head.weight [vocab_size, dim]
+    # HF: lm_head.weight [vocab_size, dim] (if exists)
+    # Otherwise: use tied embeddings (reuse embed_tokens.weight)
     # ReLax: output [dim, vocab_size] (transposed)
     lm_head = hf_weights.get("lm_head.weight")
     if lm_head is not None:
+        # Separate LM head exists
         params["output"] = jnp.asarray(lm_head.T, dtype=config.dtype)
-        print(f"  ✓ LM head: {lm_head.shape} -> {params['output'].shape}")
+        print(f"  ✓ LM head (separate): {lm_head.shape} -> {params['output'].shape}")
+    else:
+        # Tied embeddings: reuse embedding weights
+        params["output"] = jnp.asarray(embed_weight.T, dtype=config.dtype)
+        print(f"  ✓ LM head (tied embeddings): {embed_weight.shape} -> {params['output'].shape}")
 
     # Final norm
     # HF: model.norm.weight [dim]
