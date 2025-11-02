@@ -42,6 +42,7 @@ class InferenceRequest:
         eos_token_id: Token ID that signals end of sequence
         response_queue: Queue where responses will be sent (set by orchestrator)
     """
+
     request_id: str
     prompt_tokens: jax.Array  # [seqlen]
     max_new_tokens: int = 100
@@ -60,20 +61,18 @@ class DecodeState:
     efficient batching of multiple concurrent requests.
 
     Attributes:
-        kv_cache: Key-value cache for all slots
+        kv_cache: Key-value cache for all slots (also tracks positions per sequence)
                   Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
         tokens: Current token for each slot
                 Shape: [max_slots, 1]
-        seq_lengths: Current position in generation for each slot
-                     Shape: [max_slots]
         active_mask: Boolean mask indicating which slots are actively generating
                      Shape: [max_slots]
         request_ids: Which request occupies each slot (None if slot is empty)
                      Length: max_slots
     """
+
     kv_cache: KVCache
     tokens: jax.Array  # [max_slots, 1]
-    seq_lengths: jax.Array  # [max_slots]
     active_mask: jax.Array  # [max_slots] bool
     request_ids: List[Optional[str]]  # [max_slots]
 
@@ -193,11 +192,14 @@ class InferenceEngine:
         """
         # Forward pass with all slot tokens
         # tokens shape: [max_slots, 1]
-        # seq_lengths: [max_slots] - current position for each slot
+        # seq_lengths represents the actual (non-padded) input length for THIS step
+        # For generation, we're processing 1 token at a time
+        seq_lengths = jnp.ones(self.max_slots, dtype=jnp.int32)
+
         logits, updated_cache = self.model.apply(
             {"params": self.params},
             decode_state.tokens,
-            seq_lengths=decode_state.seq_lengths + 1,  # Next position
+            seq_lengths=seq_lengths,
             kv_cache=decode_state.kv_cache,
         )
 
@@ -216,18 +218,10 @@ class InferenceEngine:
             decode_state.tokens,
         )
 
-        # Increment seq_lengths only for active slots
-        updated_seq_lengths = jnp.where(
-            decode_state.active_mask,
-            decode_state.seq_lengths + 1,
-            decode_state.seq_lengths,
-        )
-
         # Create updated decode state
         updated_state = DecodeState(
             kv_cache=updated_cache,
             tokens=updated_tokens,
-            seq_lengths=updated_seq_lengths,
             active_mask=decode_state.active_mask,
             request_ids=decode_state.request_ids,
         )
@@ -265,17 +259,20 @@ class InferenceEngine:
 
         # For KV cache: insert at batch position slot_idx
         # Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
-        layers, max_slots, max_seq_len, kv_heads, head_dim = decode_state.kv_cache.k.shape
+        layers, max_slots, max_seq_len, kv_heads, head_dim = (
+            decode_state.kv_cache.k.shape
+        )
 
         # Extract the single-sequence cache
         # prefill_cache.k shape: [layers, 1, max_seq_len, kv_heads, head_dim]
-        new_k = decode_state.kv_cache.k.at[:, slot_idx:slot_idx+1, :, :, :].set(
+        new_k = decode_state.kv_cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(
             prefill_cache.k
         )
-        new_v = decode_state.kv_cache.v.at[:, slot_idx:slot_idx+1, :, :, :].set(
+        new_v = decode_state.kv_cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(
             prefill_cache.v
         )
 
+        # Update cache with new K/V and set position for this slot
         updated_cache = KVCache(
             k=new_k,
             v=new_v,
@@ -284,9 +281,6 @@ class InferenceEngine:
 
         # Update token for this slot
         updated_tokens = decode_state.tokens.at[slot_idx, 0].set(next_token)
-
-        # Update seq_length for this slot
-        updated_seq_lengths = decode_state.seq_lengths.at[slot_idx].set(seq_length)
 
         # Mark slot as active
         updated_active_mask = decode_state.active_mask.at[slot_idx].set(True)
@@ -298,7 +292,6 @@ class InferenceEngine:
         return DecodeState(
             kv_cache=updated_cache,
             tokens=updated_tokens,
-            seq_lengths=updated_seq_lengths,
             active_mask=updated_active_mask,
             request_ids=updated_request_ids,
         )
@@ -327,7 +320,6 @@ class InferenceEngine:
         return DecodeState(
             kv_cache=decode_state.kv_cache,  # Cache can stay (will be overwritten)
             tokens=decode_state.tokens,
-            seq_lengths=decode_state.seq_lengths,
             active_mask=updated_active_mask,
             request_ids=updated_request_ids,
         )
@@ -351,9 +343,6 @@ class InferenceEngine:
         # Initialize tokens (doesn't matter what they are since slots are inactive)
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
 
-        # Initialize seq_lengths
-        seq_lengths = jnp.zeros(self.max_slots, dtype=jnp.int32)
-
         # All slots start inactive
         active_mask = jnp.zeros(self.max_slots, dtype=bool)
 
@@ -363,7 +352,6 @@ class InferenceEngine:
         return DecodeState(
             kv_cache=kv_cache,
             tokens=tokens,
-            seq_lengths=seq_lengths,
             active_mask=active_mask,
             request_ids=request_ids,
         )
@@ -515,9 +503,7 @@ class InferenceOrchestrator:
                 # Add batch dimension and pad
                 tokens_with_batch = prompt_tokens[None, :]  # [1, seqlen]
                 padded_tokens = pad_to_bucket(
-                    tokens_with_batch,
-                    bucket_size,
-                    self.engine.pad_id
+                    tokens_with_batch, bucket_size, self.engine.pad_id
                 )
 
                 # Run prefill
@@ -532,11 +518,13 @@ class InferenceOrchestrator:
             except Exception as e:
                 # Send error to response queue
                 if request.response_queue:
-                    request.response_queue.put({
-                        "status": "error",
-                        "error": str(e),
-                        "request_id": request.request_id,
-                    })
+                    request.response_queue.put(
+                        {
+                            "status": "error",
+                            "error": str(e),
+                            "request_id": request.request_id,
+                        }
+                    )
 
         print("[Prefill Thread] Stopped")
 
@@ -576,10 +564,12 @@ class InferenceOrchestrator:
 
                         # Send first token to response queue
                         if request.response_queue:
-                            request.response_queue.put({
-                                "status": "generating",
-                                "token": first_token,
-                            })
+                            request.response_queue.put(
+                                {
+                                    "status": "generating",
+                                    "token": first_token,
+                                }
+                            )
 
                     except queue.Empty:
                         # No prefilled requests available, put slot back
@@ -603,30 +593,38 @@ class InferenceOrchestrator:
                             tokens.append(token)
 
                             # Check for completion
-                            is_eos = (token == request.eos_token_id)
-                            is_max_length = (len(tokens) >= request.max_new_tokens)
+                            is_eos = token == request.eos_token_id
+                            is_max_length = len(tokens) >= request.max_new_tokens
 
                             if is_eos or is_max_length:
                                 # Send final response
                                 if request.response_queue:
-                                    request.response_queue.put({
-                                        "status": "complete",
-                                        "tokens": tokens,
-                                        "request_id": request.request_id,
-                                        "finish_reason": "eos" if is_eos else "length",
-                                    })
+                                    request.response_queue.put(
+                                        {
+                                            "status": "complete",
+                                            "tokens": tokens,
+                                            "request_id": request.request_id,
+                                            "finish_reason": (
+                                                "eos" if is_eos else "length"
+                                            ),
+                                        }
+                                    )
                                 finished_slots.append(slot_idx)
                             else:
                                 # Send streaming update
                                 if request.response_queue:
-                                    request.response_queue.put({
-                                        "status": "generating",
-                                        "token": token,
-                                    })
+                                    request.response_queue.put(
+                                        {
+                                            "status": "generating",
+                                            "token": token,
+                                        }
+                                    )
 
                     # Remove finished sequences and free slots
                     for slot_idx in finished_slots:
-                        decode_state = self.engine.remove_from_slot(decode_state, slot_idx)
+                        decode_state = self.engine.remove_from_slot(
+                            decode_state, slot_idx
+                        )
                         del active_requests[slot_idx]
                         self._free_slots.put(slot_idx)
 
