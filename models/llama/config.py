@@ -53,7 +53,9 @@ class ModelConfig:
     @classmethod
     def from_json_file(cls, model_path: str):
         """
-        Loads model configuration from a config.json file.
+        Loads model configuration from a config.json file (HuggingFace format).
+
+        Supports both standard and extended LLaMA configs with rope_scaling.
 
         Args:
             model_path: Path to the directory containing config.json.
@@ -68,6 +70,21 @@ class ModelConfig:
         with open(config_path, "r") as f:
             hf_config = json.load(f)
 
+        # Handle rope_scaling (optional)
+        # Some models have rope_scaling with original_max_position_embeddings
+        # Others just use max_position_embeddings directly
+        if "rope_scaling" in hf_config and hf_config["rope_scaling"] is not None:
+            rope_scaling = hf_config["rope_scaling"]
+            max_seqlen = rope_scaling.get(
+                "original_max_position_embeddings",
+                hf_config.get("max_position_embeddings", 8192)
+            )
+            # Check if we should use scaled rope
+            use_scaled_rope = rope_scaling.get("rope_type") == "llama3"
+        else:
+            max_seqlen = hf_config.get("max_position_embeddings", 8192)
+            use_scaled_rope = False
+
         # Mapping from Hugging Face config keys to our ModelConfig keys
         return cls(
             dim=hf_config["hidden_size"],
@@ -76,9 +93,10 @@ class ModelConfig:
             n_kv_heads=hf_config["num_key_value_heads"],
             ffn_hidden_dim=hf_config["intermediate_size"],
             vocab_size=hf_config["vocab_size"],
-            rms_norm_eps=hf_config["rms_norm_eps"],
+            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-5),
             rope_theta=hf_config.get("rope_theta", 500000.0),
-            max_seqlen=hf_config["rope_scaling"]["original_max_position_embeddings"],
+            max_seqlen=max_seqlen,
             activation_fn=hf_config.get("hidden_act", "silu"),
             dtype=hf_config.get("torch_dtype", "bfloat16"),
+            use_scaled_rope=use_scaled_rope,
         )
