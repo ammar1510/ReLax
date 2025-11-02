@@ -534,8 +534,7 @@ def test_feed_forward():
     dtype = np.float32
 
     # Mimic hidden_dim calculation from PyTorch implementation
-    hidden_dim = int(2 * (4 * dim) / 3)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+    hidden_dim =  (dim//3)*8
 
     # 2. Create shared weights and inputs
     np.random.seed(0)
