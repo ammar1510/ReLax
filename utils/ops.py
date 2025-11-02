@@ -237,7 +237,7 @@ def grouped_query_attention(
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
-    true_lengths: jax.Array,  # [bsz] - actual (non-padded) lengths
+    seq_lengths: jax.Array,  # [bsz] - actual (non-padded) lengths
 ) -> tuple[jax.Array, KVCache]:
     """
     Compute Grouped Query Attention with variable-length sequences and per-sequence positions.
@@ -248,7 +248,7 @@ def grouped_query_attention(
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
         kv_cache: The current KV Cache (tracks positions per sequence internally).
         layer_idx: The index of the current layer.
-        true_lengths: Actual (non-padded) input lengths for each sequence [bsz].
+        seq_lengths: Actual (non-padded) input lengths for each sequence [bsz].
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
@@ -308,7 +308,7 @@ def grouped_query_attention(
         return mask  # [seqlen, max_seqlen]
 
     # Apply to all sequences
-    mask = jax.vmap(build_mask_for_sequence)(true_lengths, updated_cache.positions)
+    mask = jax.vmap(build_mask_for_sequence)(seq_lengths, updated_cache.positions)
     # Shape: [bsz, seqlen, max_seqlen]
 
     # Add head dimension for broadcasting
