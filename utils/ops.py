@@ -230,106 +230,86 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
 
 
-@partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3, 5])
+@partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
-    seq_lengths: jax.Array,  # Actual sequence lengths for each batch item [batch_size]
-) -> tuple[jax.Array, KVCache]:  # Return output and updated cache
+    true_lengths: jax.Array,  # [bsz] - actual (non-padded) lengths
+) -> tuple[jax.Array, KVCache]:
     """
-    Compute Grouped Query Attention with KV Caching for variable-length sequences.
+    Compute Grouped Query Attention with variable-length sequences and per-sequence positions.
 
     Args:
-        x: Input tensor of shape [batch_size, seqlen, dim] (padded to max length in batch).
-        freqs_cis: Precomputed rotary frequency embeddings (complex format, shape like [max_seqlen, head_dim//2, 2]).
+        x: Input tensor of shape [bsz, seqlen, dim] (padded to max length in batch).
+        freqs_cis: Precomputed rotary frequency embeddings [max_seqlen, head_dim//2, 2].
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
-        kv_cache: The current KV Cache.
+        kv_cache: The current KV Cache (tracks positions per sequence internally).
         layer_idx: The index of the current layer.
-        seq_lengths: Actual sequence lengths for each batch item, shape [batch_size].
+        true_lengths: Actual (non-padded) input lengths for each sequence [bsz].
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
     """
     bsz, seqlen, dim = x.shape
 
-    # Project inputs to queries, keys, values for the current token(s)
+    # Get per-sequence cache positions (where each sequence will write)
+    start_positions = kv_cache.positions  # [bsz] - can be different per sequence
+
+    # Project inputs to queries, keys, values
     xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)  # [bsz, seqlen, n_heads, head_dim]
-    xk = jnp.einsum(
-        "bsd,dkc->bskc", x, params.wk
-    )  # [bsz, seqlen, n_kv_heads, head_dim]
-    xv = jnp.einsum(
-        "bsd,dvc->bsvc", x, params.wv
-    )  # [bsz, seqlen, n_kv_heads, head_dim]
+    xk = jnp.einsum("bsd,dkc->bskc", x, params.wk)  # [bsz, seqlen, n_kv_heads, head_dim]
+    xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv)  # [bsz, seqlen, n_kv_heads, head_dim]
 
-    # Apply rotary positional embeddings per sequence
-    # Create position arrays for each sequence in the batch
-    position_ids = jnp.arange(seqlen)[None, :]  # [1, seqlen]
-    position_ids = jnp.broadcast_to(position_ids, (bsz, seqlen))  # [bsz, seqlen]
+    # Apply RoPE at absolute positions
+    # Each sequence's tokens are at positions [start_pos, start_pos+1, ..., start_pos+seqlen-1]
+    position_offsets = jnp.arange(seqlen)[None, :]  # [1, seqlen]
+    absolute_positions = start_positions[:, None] + position_offsets  # [bsz, seqlen]
 
-    # Mask positions beyond sequence length for each batch item
-    seq_mask = position_ids < seq_lengths[:, None]  # [bsz, seqlen]
-    valid_positions = jnp.where(seq_mask, position_ids, 0)  # [bsz, seqlen]
+    # Get frequencies for these absolute positions
+    batch_freqs_cis = freqs_cis[absolute_positions]  # [bsz, seqlen, head_dim//2, 2]
 
-    # Get frequencies for all positions needed
-    # We'll apply RoPE per sequence by gathering the right frequencies
-    batch_freqs_cis = freqs_cis[valid_positions]  # [bsz, seqlen, head_dim//2, 2]
+    # Apply rotary embeddings
+    xq = apply_rotary_emb_batch(xq, batch_freqs_cis)
+    xk = apply_rotary_emb_batch(xk, batch_freqs_cis)
 
-    # Apply rotary embeddings with per-sequence frequencies
-    xq = apply_rotary_emb_batch(xq, batch_freqs_cis)  # [bsz, seqlen, n_heads, head_dim]
-    xk = apply_rotary_emb_batch(
-        xk, batch_freqs_cis
-    )  # [bsz, seqlen, n_kv_heads, head_dim]
-
-    # Update the KV cache with per-sequence lengths
-    updated_cache = kv_cache.update_batch(xk, xv, layer_idx, seq_lengths)
+    # Update cache (each sequence writes at its own position)
+    updated_cache = kv_cache.update(xk, xv, layer_idx)
     keys, values = updated_cache.get_layer(layer_idx)
 
-    max_seqlen = keys.shape[1]
+    max_seqlen = keys.shape[1]  # Max cache size (e.g., 2048)
 
-    # Build variable-length attention mask using cache positions
-    # Each sequence has its own valid positions based on how much is cached
-    query_positions = jnp.arange(seqlen)[
-        None, :
-    ]  # [1, seqlen] - positions in current input
-    key_positions = jnp.arange(max_seqlen)[
-        None, :
-    ]  # [1, max_seqlen] - positions in cache
+    # Build per-sequence attention masks using vmap
+    def build_mask_for_sequence(true_len, cache_pos):
+        """Build attention mask for one sequence.
 
-    # Current query positions are relative to the current cache positions
-    # Queries are at positions [cache_pos : cache_pos + seqlen] for each sequence
-    current_positions = (
-        updated_cache.positions
-    )  # [bsz] - where each sequence is now positioned
+        Args:
+            true_len: Actual input length (non-padded)
+            cache_pos: Cache position after update
+        """
+        # Query absolute positions: [cache_pos-seqlen, ..., cache_pos-1]
+        query_positions = jnp.arange(cache_pos - seqlen, cache_pos)  # [seqlen]
+        key_positions = jnp.arange(max_seqlen)  # [max_seqlen]
 
-    # Adjust query positions to absolute positions in the cache
-    abs_query_positions = (
-        query_positions + (current_positions - seqlen)[:, None]
-    )  # [bsz, seqlen]
+        # Causal mask: query at pos i can only attend to keys at pos <= i
+        causal_mask = query_positions[:, None] >= key_positions[None, :]  # [seqlen, max_seqlen]
 
-    # Causal mask: queries can only attend to keys at positions <= their own position
-    causal_mask = (
-        abs_query_positions[:, :, None] >= key_positions[:, None, :]
-    )  # [bsz, seqlen, max_seqlen]
+        # Valid query mask: only first true_len queries are real (rest are padding)
+        valid_query_mask = jnp.arange(seqlen) < true_len  # [seqlen]
 
-    # Valid key mask: keys beyond current cache position are invalid for each sequence
-    valid_key_mask = (
-        key_positions < current_positions[:, None, None]
-    )  # [bsz, 1, max_seqlen]
+        mask = causal_mask & valid_query_mask[:, None]
+        return mask  # [seqlen, max_seqlen]
 
-    # Valid query mask: queries beyond sequence length in current input are invalid
-    valid_query_mask = query_positions < seq_lengths[:, None, None]  # [bsz, seqlen, 1]
-
-    # Combine all masks
-    mask = causal_mask & valid_key_mask & valid_query_mask  # [bsz, seqlen, max_seqlen]
+    # Apply to all sequences
+    mask = jax.vmap(build_mask_for_sequence)(true_lengths, updated_cache.positions)
+    # Shape: [bsz, seqlen, max_seqlen]
 
     # Add head dimension for broadcasting
-    mask = mask[:, None, :, :]
+    mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen]
 
-    # Perform attention using JAX's optimized dot-product attention
-    # JAX handles all the masking internally - no need for additional output masking
+    # Perform attention
     attn_output = nn.dot_product_attention(
         query=xq,
         key=keys,
@@ -337,6 +317,7 @@ def grouped_query_attention(
         mask=mask,
     )
 
+    # Output projection
     attn_output = attn_output.reshape(bsz, seqlen, -1)
     output = jnp.einsum("bsd,do->bso", attn_output, params.wo)
 
