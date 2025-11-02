@@ -27,8 +27,24 @@ from utils.ops import apply_scaling as apply_scaling_jax
 from experiments.torch_llama import apply_scaling as apply_scaling_torch
 import math
 
+# Try to import torch_xla for TPU support
+try:
+    import torch_xla.core.xla_model as xm
+    TORCH_XLA_AVAILABLE = True
+except ImportError:
+    TORCH_XLA_AVAILABLE = False
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Device selection: TPU > CUDA > CPU
+if TORCH_XLA_AVAILABLE:
+    device = xm.xla_device()  # TPU device
+    print(f"Using PyTorch XLA device: {device}")
+elif torch.cuda.is_available():
+    device = "cuda"
+    print("Using CUDA device")
+else:
+    device = "cpu"
+    print("Using CPU device")
+
 jax_dtype = jnp.bfloat16
 torch_dtype = torch.bfloat16
 
