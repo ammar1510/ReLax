@@ -289,16 +289,21 @@ def grouped_query_attention(
             true_len: Actual input length (non-padded)
             cache_pos: Cache position after update
         """
-        # Query absolute positions: [cache_pos-seqlen, ..., cache_pos-1]
-        query_positions = jnp.arange(cache_pos - seqlen, cache_pos)  # [seqlen]
-        key_positions = jnp.arange(max_seqlen)  # [max_seqlen]
+        # Create static position arrays
+        query_offsets = jnp.arange(seqlen)  # [seqlen] - Static: [0, 1, 2, ..., seqlen-1]
+        key_positions = jnp.arange(max_seqlen)  # [max_seqlen] - Static
+
+        # Compute absolute query positions: [cache_pos-seqlen, ..., cache_pos-1]
+        # Use broadcasting to add the dynamic cache_pos offset
+        query_positions = (cache_pos - seqlen) + query_offsets  # [seqlen]
 
         # Causal mask: query at pos i can only attend to keys at pos <= i
         causal_mask = query_positions[:, None] >= key_positions[None, :]  # [seqlen, max_seqlen]
 
         # Valid query mask: only first true_len queries are real (rest are padding)
-        valid_query_mask = jnp.arange(seqlen) < true_len  # [seqlen]
+        valid_query_mask = query_offsets < true_len  # [seqlen]
 
+        # Combine masks
         mask = causal_mask & valid_query_mask[:, None]
         return mask  # [seqlen, max_seqlen]
 
