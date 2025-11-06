@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from pathlib import Path
 import argparse
+import dataclasses
 
 # JAX/Flax model components
 from models.llama.model import LLaMa as Llama_jax
@@ -57,7 +58,7 @@ def test_model_forward_pass(model_path: str):
 
     # Load JAX configuration and weights
     jax_config = ModelConfig.from_json_file(str(model_path / "config.json"))
-    jax_config.dtype = jax_dtype
+    jax_config = dataclasses.replace(jax_config, dtype=jax_dtype)
     print(f"JAX Config: dim={jax_config.dim}, n_layers={jax_config.n_layers}, "
           f"n_heads={jax_config.n_heads}, n_kv_heads={jax_config.n_kv_heads}")
 
