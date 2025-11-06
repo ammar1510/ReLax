@@ -29,6 +29,7 @@ import math
 
 # Try to import torch_xla for TPU support
 try:
+    import torch_xla
     import torch_xla.core.xla_model as xm
     TORCH_XLA_AVAILABLE = True
 except ImportError:
@@ -36,7 +37,7 @@ except ImportError:
 
 # Device selection: TPU > CUDA > CPU
 if TORCH_XLA_AVAILABLE:
-    device = xm.xla_device()  # TPU device
+    device = torch_xla.device()  # TPU device
     print(f"Using PyTorch XLA device: {device}")
 elif torch.cuda.is_available():
     device = "cuda"
