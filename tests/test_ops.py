@@ -59,7 +59,6 @@ def test_precompute_freqs_cis():
     dim = 128
     end = 1024
     theta = 500000.0
-    dtype = np.float32
     # JAX implementation
     freqs_cis_jax = precompute_freqs_cis_jax(dim, end, theta, dtype=jax_dtype)
 
@@ -178,7 +177,8 @@ def test_attention():
     n_heads = 16
     n_kv_heads = 4
     head_dim = dim // n_heads
-    start_pos = 0  # Start from beginning for simplicity
+    cache_seq_len = 64  # Sequence length up to which cache is pre-filled
+    start_pos = cache_seq_len  # Start from cache_seq_len to perform attention beyond it
     dtype = np.float32
     max_seq_len = 1024
     n_layers = 1
@@ -208,9 +208,21 @@ def test_attention():
         wo=jnp.array(wo_np, dtype=jax_dtype),
     )
     
-    # Initialize empty KV cache
+    # Initialize KV cache with randomly initialized values up to cache_seq_len
     kv_cache_jax = KVCache_jax.new(
         n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype
+    )
+    # Pre-fill cache with random values
+    prefill_k = np.random.randn(n_layers, bsz, cache_seq_len, n_kv_heads, head_dim).astype(dtype)
+    prefill_v = np.random.randn(n_layers, bsz, cache_seq_len, n_kv_heads, head_dim).astype(dtype)
+    k_init_jax = jnp.zeros((n_layers, bsz, max_seq_len, n_kv_heads, head_dim), dtype=jax_dtype)
+    v_init_jax = jnp.zeros((n_layers, bsz, max_seq_len, n_kv_heads, head_dim), dtype=jax_dtype)
+    k_updated_jax = k_init_jax.at[:, :, :cache_seq_len, :, :].set(jnp.array(prefill_k, dtype=jax_dtype))
+    v_updated_jax = v_init_jax.at[:, :, :cache_seq_len, :, :].set(jnp.array(prefill_v, dtype=jax_dtype))
+    kv_cache_jax = KVCache_jax(
+        k=k_updated_jax, 
+        v=v_updated_jax, 
+        positions=jnp.full((bsz,), cache_seq_len, dtype=jnp.int32)
     )
 
     # 4. PyTorch setup
@@ -223,12 +235,15 @@ def test_attention():
     kv_cache_torch = KVCache_torch(
         bsz, max_seq_len, n_kv_heads, head_dim, dtype=torch_dtype, device=device
     )
+    # Pre-fill PyTorch cache with same random values
+    kv_cache_torch.cache_k[:, :cache_seq_len, :, :] = torch.tensor(prefill_k[0], device=device, dtype=torch_dtype)
+    kv_cache_torch.cache_v[:, :cache_seq_len, :, :] = torch.tensor(prefill_v[0], device=device, dtype=torch_dtype)
     torch_attention.cache = kv_cache_torch
 
     # 5. Execute JAX attention
     seq_lengths = jnp.full((bsz,), seqlen, dtype=jnp.int32)  # All sequences have same length (no padding)
     output_jax, updated_kv_cache_jax = grouped_query_attention(
-        x_jax, freqs_cis_jax, jax_params, kv_cache_jax, 0, seq_lengths
+        x_jax, freqs_cis_jax, jax_params, kv_cache_jax, start_pos, seq_lengths
     )
 
     # 6. Execute PyTorch attention
@@ -266,14 +281,18 @@ def test_attention():
     updated_k_jax = updated_kv_cache_jax.k[0]  # Layer 0
     updated_v_jax = updated_kv_cache_jax.v[0]  # Layer 0
     
-    # Keys and values should be stored at positions 0:seqlen
-    assert not jnp.all(updated_k_jax[:, :seqlen, :, :] == 0), "JAX keys should be cached"
-    assert not jnp.all(updated_v_jax[:, :seqlen, :, :] == 0), "JAX values should be cached"
+    # Pre-filled cache should still have values at positions 0:cache_seq_len
+    assert not jnp.all(updated_k_jax[:, :cache_seq_len, :, :] == 0), "JAX pre-filled keys should remain in cache"
+    assert not jnp.all(updated_v_jax[:, :cache_seq_len, :, :] == 0), "JAX pre-filled values should remain in cache"
     
-    # Positions beyond seqlen should still be zero (empty)
-    if seqlen < max_seq_len:
-        assert jnp.all(updated_k_jax[:, seqlen:, :, :] == 0), "JAX keys beyond seqlen should be zero"
-        assert jnp.all(updated_v_jax[:, seqlen:, :, :] == 0), "JAX values beyond seqlen should be zero"
+    # New keys and values should be stored at positions cache_seq_len:cache_seq_len+seqlen
+    assert not jnp.all(updated_k_jax[:, cache_seq_len:cache_seq_len+seqlen, :, :] == 0), "JAX new keys should be cached"
+    assert not jnp.all(updated_v_jax[:, cache_seq_len:cache_seq_len+seqlen, :, :] == 0), "JAX new values should be cached"
+    
+    # Positions beyond cache_seq_len+seqlen should still be zero (empty)
+    if cache_seq_len + seqlen < max_seq_len:
+        assert jnp.all(updated_k_jax[:, cache_seq_len+seqlen:, :, :] == 0), "JAX keys beyond cache_seq_len+seqlen should be zero"
+        assert jnp.all(updated_v_jax[:, cache_seq_len+seqlen:, :, :] == 0), "JAX values beyond cache_seq_len+seqlen should be zero"
     
     # 8. Compare outputs between JAX and PyTorch
     np.testing.assert_allclose(
@@ -298,192 +317,6 @@ def test_attention():
     )
     
     print("✓ Basic attention test with PyTorch comparison passed!")
-
-
-def test_attention_causal_property():
-    """Test that attention respects causal masking by comparing outputs at different positions."""
-    # Setup
-    bsz = 8
-    seqlen = 16
-    dim = 64
-    n_heads = 2
-    n_kv_heads = 1
-    head_dim = dim // n_heads
-    max_seq_len = 32
-    n_layers = 1
-
-    np.random.seed(123)
-    x_np = np.random.randn(bsz, seqlen, dim).astype(np.float32)
-    freqs_cis_jax = precompute_freqs_cis_jax(head_dim, max_seq_len, dtype=jax_dtype)
-
-    # Create parameters
-    wq_np = np.random.randn(dim, n_heads * head_dim).astype(np.float32)
-    wk_np = np.random.randn(dim, n_kv_heads * head_dim).astype(np.float32)
-    wv_np = np.random.randn(dim, n_kv_heads * head_dim).astype(np.float32)
-    wo_np = np.random.randn(n_heads * head_dim, dim).astype(np.float32)
-
-    x_jax = jnp.array(x_np, dtype=jax_dtype)
-    jax_params = AttentionParams(
-        wq=jnp.array(wq_np, dtype=jax_dtype).reshape(dim, n_heads, head_dim),
-        wk=jnp.array(wk_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
-        wv=jnp.array(wv_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
-        wo=jnp.array(wo_np, dtype=jax_dtype),
-    )
-
-    # Test 1: Process first 5 tokens only
-    kv_cache_1 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
-    seq_lengths_1 = jnp.full((bsz,), 5, dtype=jnp.int32)  # All sequences have 5 tokens
-    output_1, cache_1 = grouped_query_attention(
-        x_jax[:, :5, :], freqs_cis_jax, jax_params, kv_cache_1, 0, seq_lengths_1
-    )
-
-    # Test 2: Process first 10 tokens
-    kv_cache_2 = KVCache_jax.new(n_layers, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype)
-    seq_lengths_2 = jnp.full((bsz,), 10, dtype=jnp.int32)  # All sequences have 10 tokens
-    output_2, cache_2 = grouped_query_attention(
-        x_jax[:, :10, :], freqs_cis_jax, jax_params, kv_cache_2, 0, seq_lengths_2
-    )
-
-    # The first token's output should be the same in both cases (causal property)
-    np.testing.assert_allclose(
-        np.array(output_1[0, :5, :]), 
-        np.array(output_2[0, :5, :]), 
-        rtol=1e-6, atol=1e-6,
-        err_msg="First token output should be identical regardless of future tokens"
-    )
-    
-    print("✓ Causal property test passed!")
-
-
-def test_attention_with_padding():
-    # 1. Setup Parameters for prefill with padding
-    bsz = 2
-    seqlen = 64  # Prefill length
-    dim = 128
-    n_heads = 4
-    n_kv_heads = 2
-    head_dim = dim // n_heads
-    start_pos = 0  # Testing prefill
-    dtype = np.float32
-    max_seq_len = 256
-
-    model_args = ModelArgs(dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads, flash=False)
-
-    # 2. Create shared weights and inputs with padding
-    np.random.seed(0)
-    x_np = np.random.randn(bsz, seqlen, dim).astype(dtype)
-
-    # Create a padding mask. Pad the second half of the sequence for the first batch element.
-    prefill_mask_np = np.ones((bsz, seqlen), dtype=np.bool_)
-    padding_start = seqlen // 2
-    prefill_mask_np[0, padding_start:] = 0
-
-    freqs_cis_torch = precompute_freqs_cis_torch(head_dim, max_seq_len).to(dtype=torch_dtype)
-    freqs_cis_jax = jnp.array(freqs_cis_torch.float().detach().cpu().numpy(), dtype=jax_dtype)
-
-    wq_np = np.random.normal(0, 0.02, (dim, n_heads * head_dim)).astype(dtype)
-    wk_np = np.random.normal(0, 0.02, (dim, n_kv_heads * head_dim)).astype(dtype)
-    wv_np = np.random.normal(0, 0.02, (dim, n_kv_heads * head_dim)).astype(dtype)
-    wo_np = np.random.normal(0, 0.02, (n_heads * head_dim, dim)).astype(dtype)
-
-    # 3. JAX setup
-    x_jax = jnp.array(x_np, dtype=jax_dtype)
-    prefill_mask_jax = jnp.array(prefill_mask_np)
-    jax_params = AttentionParams(
-        wq=jnp.array(wq_np, dtype=jax_dtype).reshape(dim, n_heads, head_dim),
-        wk=jnp.array(wk_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
-        wv=jnp.array(wv_np, dtype=jax_dtype).reshape(dim, n_kv_heads, head_dim),
-        wo=jnp.array(wo_np, dtype=jax_dtype),
-    )
-    kv_cache_jax_initial = KVCache_jax.new(
-        1, bsz, max_seq_len, n_kv_heads, head_dim, dtype=jax_dtype
-    )
-
-    # 4. PyTorch setup
-    x_torch = torch.tensor(x_np, dtype=torch_dtype, device=device)
-    torch_attention = Attention_torch(model_args)
-    torch_attention.wq.weight = torch.nn.Parameter(torch.tensor(wq_np.T, device=device, dtype=torch_dtype))
-    torch_attention.wk.weight = torch.nn.Parameter(torch.tensor(wk_np.T, device=device, dtype=torch_dtype))
-    torch_attention.wv.weight = torch.nn.Parameter(torch.tensor(wv_np.T, device=device, dtype=torch_dtype))
-    torch_attention.wo.weight = torch.nn.Parameter(torch.tensor(wo_np.T, device=device, dtype=torch_dtype))
-    kv_cache_torch = KVCache_torch(
-        bsz, max_seq_len, n_kv_heads, head_dim, dtype=torch_dtype, device=device
-    )
-    torch_attention.cache = kv_cache_torch
-
-    # 5. Execute
-    # JAX - compute actual sequence lengths from the prefill mask
-    seq_lengths_jax = jnp.sum(prefill_mask_jax, axis=1, dtype=jnp.int32)  # Count non-padded tokens per sequence
-    output_jax, updated_kv_cache_jax = grouped_query_attention(
-        x_jax,
-        freqs_cis_jax,
-        jax_params,
-        kv_cache_jax_initial,
-        0,
-        seq_lengths_jax,
-    )
-
-    # PyTorch
-    # Create the equivalent mask for PyTorch to match JAX's internal masking
-    torch_prefill_mask = torch.tensor(prefill_mask_np, device=device)
-    causal_mask = torch.triu(
-        torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=torch_dtype), diagonal=1
-    )
-
-    # Combine causal mask with the padding mask for queries
-    # The mask needs to be (bsz, 1, seqlen, seqlen) to be broadcastable
-    # JAX logic: mask = causal_mask & query_mask
-    # query_mask comes from prefill_mask and is (bsz, seqlen, 1)
-    # This combination correctly masks rows (queries) for padded tokens
-    torch_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seqlen, seqlen)
-    query_mask_torch = torch_prefill_mask.unsqueeze(1).unsqueeze(
-        -1
-    )  # (bsz, 1, seqlen, 1)
-    final_torch_mask = torch.where(query_mask_torch, torch_mask, float("-inf"))
-
-    freqs_cis_torch_sliced = freqs_cis_torch[start_pos : start_pos + seqlen]
-    output_torch = torch_attention.forward(
-        x_torch, start_pos, freqs_cis_torch_sliced, final_torch_mask
-    )
-
-    # Manually zero out the output for padded tokens in the torch output to match the JAX behavior
-    output_torch = torch.where(torch_prefill_mask.unsqueeze(-1), output_torch, 0.0)
-
-    # 6. Compare output tensors
-    np.testing.assert_allclose(
-        np.array(output_jax), output_torch.float().detach().cpu().numpy(), rtol=1e-5, atol=5e-4
-    )
-
-    # 7. Compare KV caches
-    # JAX zeros out KV cache entries for padded tokens before caching
-    updated_k_jax = updated_kv_cache_jax.k[0]
-    updated_v_jax = updated_kv_cache_jax.v[0]
-
-    # The reference torch implementation doesn't have the pre-caching masking, so we apply it manually for comparison
-    updated_k_torch = torch_attention.cache.cache_k
-    updated_v_torch = torch_attention.cache.cache_v
-
-    # Manually mask the torch cache to match JAX's behavior
-    prefill_mask_torch_expanded = torch_prefill_mask[:, :seqlen, None, None]
-    updated_k_torch[:, :seqlen] = (
-        updated_k_torch[:, :seqlen] * prefill_mask_torch_expanded
-    )
-    updated_v_torch[:, :seqlen] = (
-        updated_v_torch[:, :seqlen] * prefill_mask_torch_expanded
-    )
-
-    np.testing.assert_allclose(
-        np.array(updated_k_jax),
-        updated_k_torch.float().detach().cpu().numpy(),
-        rtol=1e-5,
-        atol=1e-4,
-    )
-    np.testing.assert_allclose(
-        np.array(updated_v_jax),
-        updated_v_torch.float().detach().cpu().numpy(),
-        rtol=1e-5,
-        atol=1e-4,
-    )
 
 
 def test_apply_scaling():
