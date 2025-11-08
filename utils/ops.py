@@ -10,7 +10,6 @@ from .kvcache import KVCache
 from typing import Optional
 from functools import partial
 
-
 @partial(jit, static_argnames=["head_dim", "end", "use_scaled", "dtype"])
 def precompute_freqs_cis(
     head_dim: int,

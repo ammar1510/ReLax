@@ -432,8 +432,25 @@ class Llama:
             tokenizer_path
         ), f"Tokenizer file '{tokenizer_path}' does not exist."
 
-        local_rank = 0
-        torch.cuda.set_device(local_rank)
+        # Detect available device: XLA, CUDA, or CPU
+        try:
+            import torch_xla
+            import torch_xla.core.xla_model as xm
+            device = torch_xla.device()
+            device_type = "xla"
+            print(f"Using XLA device: {device}")
+        except ImportError:
+            if torch.cuda.is_available():
+                local_rank = 0
+                torch.cuda.set_device(local_rank)
+                device = torch.device("cuda")
+                device_type = "cuda"
+                print(f"Using CUDA device")
+            else:
+                device = torch.device("cpu")
+                device_type = "cpu"
+                print(f"Using CPU device")
+
         torch.manual_seed(seed)  # seed must be the same in all processes
 
         start_time = time.time()
@@ -453,18 +470,33 @@ class Llama:
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         assert model_args.vocab_size == tokenizer.vocab_size
-        if torch.cuda.is_bf16_supported():
+        
+        # Set default tensor type based on device
+        if device_type == "cuda" and torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        else:
+        elif device_type == "cuda":
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        else:
+            # For XLA and CPU, use standard float32 initially
+            # Model will be converted to bfloat16 after loading
+            torch.set_default_tensor_type(torch.FloatTensor)
+        
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        
+        # Move model to device and convert to bfloat16 if not CUDA
+        if device_type != "cuda":
+            model = model.to(device)
+            # Convert to bfloat16 for XLA/CPU
+            model = model.to(torch.bfloat16)
+        
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
-        return Llama(model, tokenizer)
+        return Llama(model, tokenizer, device)
 
-    def __init__(self, model: Transformer, tokenizer: Tokenizer):
+    def __init__(self, model: Transformer, tokenizer: Tokenizer, device=None):
         self.model = model
         self.tokenizer = tokenizer
+        self.device = device if device is not None else torch.device("cpu")
 
     @torch.inference_mode()
     def generate(
@@ -507,12 +539,12 @@ class Llama:
             )
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device=self.device)
         input_text_mask = tokens != pad_id
 
         if min_prompt_len == total_len:
@@ -734,12 +766,13 @@ def main(
 
     # super simple training loop to start
     model = llama.model
+    device = llama.device
     model.train()
     optimizer = model.configure_optimizers(learning_rate=1e-5, weight_decay=0.0)
     for step in range(20):
         optimizer.zero_grad()
         x, y = data_loader.next_batch()
-        x, y = x.cuda(), y.cuda()
+        x, y = x.to(device), y.to(device)
         loss = model.forward_loss(x, y)
         loss.backward()
         optimizer.step()
@@ -754,7 +787,7 @@ def main(
         "On a dark and stormy night",
     ]
 
-    sample_rng = torch.Generator(device="cuda")
+    sample_rng = torch.Generator(device=device)
     sample_rng.manual_seed(1337)
     t0 = time.time()
     results = llama.text_completion(

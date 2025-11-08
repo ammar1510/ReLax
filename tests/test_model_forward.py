@@ -57,7 +57,7 @@ def test_model_forward_pass(model_path: str):
     print("="*80)
 
     # Load JAX configuration and weights
-    jax_config = ModelConfig.from_json_file(str(model_path / "config.json"))
+    jax_config = ModelConfig.from_json_file(model_path)
     jax_config = dataclasses.replace(jax_config, dtype=jax_dtype)
     print(f"JAX Config: dim={jax_config.dim}, n_layers={jax_config.n_layers}, "
           f"n_heads={jax_config.n_heads}, n_kv_heads={jax_config.n_kv_heads}")

@@ -11,7 +11,6 @@ from safetensors import safe_open
 from pathlib import Path
 from typing import Dict, Any
 import numpy as np
-from flax.core import FrozenDict
 
 from .config import ModelConfig
 
@@ -21,9 +20,7 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
     Loads LLaMA model weights from HuggingFace sharded safetensors format.
 
     Args:
-        model_path: Path to directory containing:
-            - model.safetensors.index.json (weight mapping)
-            - model-0000X-of-0000Y.safetensors (sharded weight files)
+        model_path: Path to directory containing *.safetensors files
         config: ModelConfig instance for the LLaMa model.
 
     Returns:
@@ -53,48 +50,33 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
         - output
     """
     model_path = Path(model_path)
-    index_path = model_path / "model.safetensors.index.json"
-
-    if not index_path.exists():
+    
+    # Find all safetensor files
+    shard_files = sorted(model_path.glob("*.safetensors"))
+    
+    if len(shard_files) == 0:
         raise FileNotFoundError(
-            f"Model index file not found: {index_path}\n"
-            f"Expected model.safetensors.index.json in {model_path}"
+            f"No safetensor files found in {model_path}\n"
+            f"Expected *.safetensors files"
         )
-
-    print(f"Loading sharded model from {model_path}")
-
-    # Load the index file
-    with open(index_path, 'r') as f:
-        index = json.load(f)
-
-    weight_map = index['weight_map']
-
-    # Group weights by shard file
-    shard_to_weights = {}
-    for weight_name, shard_file in weight_map.items():
-        if shard_file not in shard_to_weights:
-            shard_to_weights[shard_file] = []
-        shard_to_weights[shard_file].append(weight_name)
-
-    print(f"Loading from {len(shard_to_weights)} shard files...")
-
+    
+    print(f"Loading model from {model_path}")
+    print(f"Found {len(shard_files)} safetensor file(s)")
+    
     # Load all weights from all shards
     all_weights = {}
-    for shard_file, weight_names in shard_to_weights.items():
-        shard_path = model_path / shard_file
-        print(f"  Loading {shard_file}... ({len(weight_names)} tensors)")
-
+    for shard_path in shard_files:
+        print(f"  Loading {shard_path.name}...")
         with safe_open(shard_path, framework="numpy") as f:
-            for weight_name in weight_names:
-                all_weights[weight_name] = f.get_tensor(weight_name)
-
+            for key in f.keys():
+                all_weights[key] = f.get_tensor(key)
+    
     print(f"Loaded {len(all_weights)} tensors total")
 
     # Convert to ReLax format
     params = _convert_hf_to_relax(all_weights, config)
 
-    # Wrap in FrozenDict for Flax
-    return FrozenDict(params)
+    return params
 
 
 def _convert_hf_to_relax(
