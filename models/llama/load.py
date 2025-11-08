@@ -1,13 +1,12 @@
 """
-Functions to load model weights from HuggingFace format.
+Functions to load model weights from PyTorch checkpoint format.
 
-This module handles loading LLaMA weights from sharded safetensors files
-in the HuggingFace format, converting them to the ReLax model structure.
+This module handles loading LLaMA weights from sharded .pth files
+in the PyTorch format, converting them to the ReLax model structure.
 """
 
-import json
 import jax.numpy as jnp
-from safetensors import safe_open
+import torch
 from pathlib import Path
 from typing import Dict, Any
 import numpy as np
@@ -17,16 +16,16 @@ from .config import ModelConfig
 
 def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
     """
-    Loads LLaMA model weights from HuggingFace sharded safetensors format.
+    Loads LLaMA model weights from PyTorch sharded .pth format.
 
     Args:
-        model_path: Path to directory containing *.safetensors files
+        model_path: Path to directory containing *.pth files
         config: ModelConfig instance for the LLaMa model.
 
     Returns:
         Flax parameter dictionary matching the LLaMa model structure.
 
-    HuggingFace weight naming (input):
+    PyTorch weight naming (input):
         - model.embed_tokens.weight
         - model.layers.{i}.self_attn.q_proj.weight
         - model.layers.{i}.self_attn.k_proj.weight
@@ -49,27 +48,35 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
         - norm_weight
         - output
     """
-    model_path = Path(model_path)
+    model_path = Path(model_path)/"original"
     
-    # Find all safetensor files
-    shard_files = sorted(model_path.glob("*.safetensors"))
+    # Find all .pth checkpoint files
+    shard_files = sorted(model_path.glob("*.pth"))
+    print(model_path)
     
     if len(shard_files) == 0:
         raise FileNotFoundError(
-            f"No safetensor files found in {model_path}\n"
-            f"Expected *.safetensors files"
+            f"No .pth checkpoint files found in {model_path}\n"
+            f"Expected *.pth files"
         )
     
     print(f"Loading model from {model_path}")
-    print(f"Found {len(shard_files)} safetensor file(s)")
+    print(f"Found {len(shard_files)} checkpoint file(s)")
     
     # Load all weights from all shards
     all_weights = {}
     for shard_path in shard_files:
         print(f"  Loading {shard_path.name}...")
-        with safe_open(shard_path, framework="numpy") as f:
-            for key in f.keys():
-                all_weights[key] = f.get_tensor(key)
+        checkpoint = torch.load(shard_path, map_location="cpu", weights_only=True)
+        # Convert PyTorch tensors to numpy arrays
+        for key, value in checkpoint.items():
+            if isinstance(value, torch.Tensor):
+                # Convert BFloat16 to float32 (numpy doesn't support bfloat16)
+                if value.dtype == torch.bfloat16:
+                    value = value.float()
+                all_weights[key] = value.detach().cpu().numpy()
+            else:
+                all_weights[key] = value
     
     print(f"Loaded {len(all_weights)} tensors total")
 
@@ -84,16 +91,16 @@ def _convert_hf_to_relax(
     config: ModelConfig,
 ) -> Dict[str, Any]:
     """
-    Convert HuggingFace weight format to ReLax model structure.
+    Convert PyTorch/HuggingFace weight format to ReLax model structure.
 
     Args:
-        hf_weights: Dictionary of HuggingFace weights (numpy arrays)
+        hf_weights: Dictionary of PyTorch weights (numpy arrays)
         config: Model configuration
 
     Returns:
         Flax parameter dictionary for ReLax LLaMa model
     """
-    print("Converting HuggingFace weights to ReLax format...")
+    print("Converting PyTorch weights to ReLax format...")
 
     params = {}
 
@@ -110,14 +117,20 @@ def _convert_hf_to_relax(
     print(f"  ✓ Embeddings: {embed_weight.shape}")
 
     # Output layer (language model head)
-    # HF: lm_head.weight [vocab_size, dim] (if exists)
+    # PyTorch: lm_head.weight [vocab_size, dim] or output.weight [dim, vocab_size] (if exists)
     # Otherwise: use tied embeddings (reuse embed_tokens.weight)
-    # ReLax: output [dim, vocab_size] (transposed)
+    # ReLax: output [dim, vocab_size]
     lm_head = hf_weights.get("lm_head.weight")
+    output_weight = hf_weights.get("output.weight")
+    
     if lm_head is not None:
-        # Separate LM head exists
+        # Separate LM head exists (HuggingFace format: [vocab_size, dim])
         params["output"] = jnp.asarray(lm_head.T, dtype=config.dtype)
         print(f"  ✓ LM head (separate): {lm_head.shape} -> {params['output'].shape}")
+    elif output_weight is not None:
+        # PyTorch format: already [dim, vocab_size]
+        params["output"] = jnp.asarray(output_weight, dtype=config.dtype)
+        print(f"  ✓ Output layer (PyTorch format): {output_weight.shape}")
     else:
         # Tied embeddings: reuse embedding weights
         params["output"] = jnp.asarray(embed_weight.T, dtype=config.dtype)
