@@ -107,7 +107,7 @@ def _convert_hf_to_relax(
     # Token embeddings
     # HF: model.embed_tokens.weight [vocab_size, dim]
     # ReLax: tok_embeddings.embedding [vocab_size, dim]
-    embed_weight = hf_weights.get("model.embed_tokens.weight")
+    embed_weight = hf_weights.get("tok_embeddings.weight")
     if embed_weight is None:
         raise ValueError("model.embed_tokens.weight not found in checkpoint")
 
@@ -120,29 +120,15 @@ def _convert_hf_to_relax(
     # PyTorch: lm_head.weight [vocab_size, dim] or output.weight [dim, vocab_size] (if exists)
     # Otherwise: use tied embeddings (reuse embed_tokens.weight)
     # ReLax: output [dim, vocab_size]
-    lm_head = hf_weights.get("lm_head.weight")
     output_weight = hf_weights.get("output.weight")
     
-    if lm_head is not None:
-        # Separate LM head exists (HuggingFace format: [vocab_size, dim])
-        params["output"] = jnp.asarray(lm_head.T, dtype=config.dtype)
-        print(f"  ✓ LM head (separate): {lm_head.shape} -> {params['output'].shape}")
-    elif output_weight is not None:
-        # PyTorch format: already [dim, vocab_size]
-        params["output"] = jnp.asarray(output_weight, dtype=config.dtype)
-        print(f"  ✓ Output layer (PyTorch format): {output_weight.shape}")
-    else:
-        # Tied embeddings: reuse embedding weights
-        params["output"] = jnp.asarray(embed_weight.T, dtype=config.dtype)
-        print(f"  ✓ LM head (tied embeddings): {embed_weight.shape} -> {params['output'].shape}")
+    params["output"] = jnp.asarray(output_weight.T, dtype=config.dtype)
 
     # Final norm
     # HF: model.norm.weight [dim]
     # ReLax: norm_weight [dim]
-    norm = hf_weights.get("model.norm.weight")
-    if norm is not None:
-        params["norm_weight"] = jnp.asarray(norm, dtype=config.dtype)
-        print(f"  ✓ Final norm: {norm.shape}")
+    norm = hf_weights.get("norm.weight")
+    params["norm_weight"] = jnp.asarray(norm, dtype=config.dtype)
 
     # Transformer layers
     print(f"  Converting {config.n_layers} transformer layers...")
@@ -186,15 +172,15 @@ def _convert_layer(
         - attention_norm_weight: [dim]
         - ffn_norm_weight: [dim]
     """
-    prefix = f"model.layers.{layer_idx}"
+    prefix = f"layers.{layer_idx}"
 
     # Attention weights
     # HF: [n_heads * head_dim, dim] or [n_kv_heads * head_dim, dim]
     # ReLax: need to transpose and reshape
-    q_proj = hf_weights[f"{prefix}.self_attn.q_proj.weight"]  # [n_heads * head_dim, dim]
-    k_proj = hf_weights[f"{prefix}.self_attn.k_proj.weight"]  # [n_kv_heads * head_dim, dim]
-    v_proj = hf_weights[f"{prefix}.self_attn.v_proj.weight"]  # [n_kv_heads * head_dim, dim]
-    o_proj = hf_weights[f"{prefix}.self_attn.o_proj.weight"]  # [dim, n_heads * head_dim]
+    q_proj = hf_weights[f"{prefix}.attention.wq.weight"]  # [n_heads * head_dim, dim]
+    k_proj = hf_weights[f"{prefix}.attention.wk.weight"]  # [n_kv_heads * head_dim, dim]
+    v_proj = hf_weights[f"{prefix}.attention.wv.weight"]  # [n_kv_heads * head_dim, dim]
+    o_proj = hf_weights[f"{prefix}.attention.wo.weight"]  # [dim, n_heads * head_dim]
 
     # Transpose and reshape for ReLax format
     # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
@@ -213,17 +199,17 @@ def _convert_layer(
     # MLP/Feed-forward weights
     # HF: [ffn_hidden_dim, dim]
     # ReLax: transpose to [dim, ffn_hidden_dim] or [ffn_hidden_dim, dim]
-    gate_proj = hf_weights[f"{prefix}.mlp.gate_proj.weight"]  # [ffn_hidden_dim, dim]
-    up_proj = hf_weights[f"{prefix}.mlp.up_proj.weight"]      # [ffn_hidden_dim, dim]
-    down_proj = hf_weights[f"{prefix}.mlp.down_proj.weight"]  # [dim, ffn_hidden_dim]
+    gate_proj = hf_weights[f"{prefix}.feed_forward.w1.weight"]  # [ffn_hidden_dim, dim]
+    up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]      # [ffn_hidden_dim, dim]
+    down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
 
     w_gate = jnp.asarray(gate_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
     w_up = jnp.asarray(up_proj.T, dtype=config.dtype)      # [dim, ffn_hidden_dim]
     w_down = jnp.asarray(down_proj.T, dtype=config.dtype)  # [ffn_hidden_dim, dim]
 
     # Normalization weights
-    attention_norm = hf_weights[f"{prefix}.input_layernorm.weight"]
-    ffn_norm = hf_weights[f"{prefix}.post_attention_layernorm.weight"]
+    attention_norm = hf_weights[f"{prefix}.attention_norm.weight"]
+    ffn_norm = hf_weights[f"{prefix}.ffn_norm.weight"]
 
     return {
         "wq": wq,
