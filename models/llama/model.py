@@ -172,7 +172,7 @@ class LLaMa(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,
-        true_lengths : jax.Array,
+        true_lengths: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
         kv_cache: KVCache,
         mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
     ):
@@ -186,7 +186,7 @@ class LLaMa(nn.Module):
 
         # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
-            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask, seq_lengths)
+            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask, true_lengths)
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)

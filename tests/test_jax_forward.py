@@ -13,6 +13,7 @@ from models.llama.config import ModelConfig
 from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache
+from utils.ops import build_attn_mask
 
 
 def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", max_gen_len: int = 256):
@@ -93,22 +94,30 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     
     # Create JIT-compiled forward function
     @jax.jit
-    def forward_fn(variables, tokens, seq_lengths, kv_cache):
+    def forward_fn(variables, tokens, true_lengths, kv_cache, mask):
         return model.apply(
             variables,
             tokens=tokens,
-            seq_lengths=seq_lengths,
+            true_lengths=true_lengths,
             kv_cache=kv_cache,
+            mask=mask,
         )
     
     # Prefill: process the prompt
     print(f"Prefilling with {len(prompt_tokens)} tokens...")
-    seq_lengths = jnp.array([len(prompt_tokens)], dtype=jnp.int32)
+    true_lengths = jnp.array([len(prompt_tokens)], dtype=jnp.int32)
+    
+    # Build attention mask for prefill
+    # Create dummy input tensor for mask building (only shape is needed)
+    dummy_input = jnp.zeros((batch_size, len(prompt_tokens), config.dim), dtype=jax_dtype)
+    mask = build_attn_mask(dummy_input, kv_cache, true_lengths)
+    
     logits, kv_cache = forward_fn(
         {"params": params},
         tokens=tokens,
-        seq_lengths=seq_lengths,
+        true_lengths=true_lengths,
         kv_cache=kv_cache,
+        mask=mask,
     )
     print(f"✓ Prefill complete")
 
@@ -138,12 +147,18 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
         next_token_tensor = jnp.array([[next_token_val]], dtype=jnp.int32)  # [1, 1]
         
         # Forward pass with single new token (JIT-compiled)
-        seq_lengths = jnp.array([1], dtype=jnp.int32)
+        true_lengths = jnp.array([1], dtype=jnp.int32)
+        
+        # Build attention mask for single token generation
+        dummy_input = jnp.zeros((batch_size, 1, config.dim), dtype=jax_dtype)
+        mask = build_attn_mask(dummy_input, kv_cache, true_lengths)
+        
         logits, kv_cache = forward_fn(
             {"params": params},
             tokens=next_token_tensor,
-            seq_lengths=seq_lengths,
+            true_lengths=true_lengths,
             kv_cache=kv_cache,
+            mask=mask,
         )
         
         if (step + 1) % 10 == 0:
