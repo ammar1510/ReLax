@@ -102,6 +102,10 @@ class TransformerBlock(nn.Module):
             seq_lengths=seq_lengths,
         )
         x = x + attn_output  # Residual connection
+        # Debug: After attention
+        h_np = np.array(x, dtype=np.float32)
+        print(f"\n[JAX] Layer {layer_idx} - After attention:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         # Feed-forward block
         h_ffn_norm = rms_norm(x, self.ffn_norm_weight, eps=self.args.rms_norm_eps)
@@ -111,6 +115,10 @@ class TransformerBlock(nn.Module):
             activation_fn=self.args.activation_fn,
         )
         x = x + ffn_output  # Residual connection
+        # Debug: After feedforward
+        h_np = np.array(x, dtype=np.float32)
+        print(f"\n[JAX] Layer {layer_idx} - After feedforward:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         return x, kv_cache
 

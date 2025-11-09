@@ -279,9 +279,23 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        layer_idx: Optional[int] = None,
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        # Attention block
+        attn_output = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + attn_output  # Residual connection
+        # Debug: After attention
+        if layer_idx is not None:
+            print(f"\n[PyTorch] Layer {layer_idx} - After attention:\n")
+            print(f"  Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+        
+        # Feed-forward block
+        ffn_output = self.feed_forward(self.ffn_norm(h))
+        out = h + ffn_output  # Residual connection
+        # Debug: After feedforward
+        if layer_idx is not None:
+            print(f"\n[PyTorch] Layer {layer_idx} - After feedforward:\n")
+            print(f"  Sample values (first batch, first position, first 10 dims): {out[0, 0, :10].cpu().float().numpy()}")
         return out
 
 
@@ -331,7 +345,7 @@ class Transformer(nn.Module):
             ).type_as(h)
 
         for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, layer_idx=layer_idx)
             # Debug: After each layer
             print(f"\n[PyTorch] After layer {layer_idx}:\n")
             print(f"  Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
