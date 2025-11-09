@@ -1,6 +1,7 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+import numpy as np
 import flax.linen as nn
 from jax import jit
 
@@ -146,8 +147,8 @@ class LLaMa(nn.Module):
 
         # Precompute RoPE frequencies
         # Used float64 to match the precision of the torch/numpy implementation
-        jax.config.update("jax_enable_x64", True)
-        jax.config.update("jax_default_matmul_precision", "highest")
+        # jax.config.update("jax_enable_x64", True)
+        # jax.config.update("jax_default_matmul_precision", "highest")
         self.freqs_cis = precompute_freqs_cis(
             self.args.head_dim,
             self.args.max_seqlen * 2,
@@ -155,19 +156,32 @@ class LLaMa(nn.Module):
             dtype=jnp.float64,
             use_scaled=self.args.use_scaled_rope,
         ).astype(self.args.dtype)
-        jax.config.update("jax_enable_x64", False)
-        jax.config.update("jax_default_matmul_precision", "default")
+        # jax.config.update("jax_enable_x64", False)
+        # jax.config.update("jax_default_matmul_precision", "default")
 
     def __call__(self, tokens: jax.Array, seq_lengths: jax.Array, kv_cache: KVCache):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        
+        # Debug: After embeddings
+        h_np = np.array(h, dtype=np.float32)
+        print(f"\n[JAX] After embeddings:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
             h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, seq_lengths)
+            # Debug: After each layer
+            h_np = np.array(h, dtype=np.float32)
+            print(f"\n[JAX] After layer {layer_idx}:\n")
+            print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
+        # Debug: After final norm
+        h_np = np.array(h, dtype=np.float32)
+        print(f"\n[JAX] After final norm:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
         # Tie weights: use the token embedding matrix for the final linear layer
         logits = jnp.einsum("bsd,dv->bsv", h, self.output)
 
