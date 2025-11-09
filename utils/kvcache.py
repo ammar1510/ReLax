@@ -23,7 +23,7 @@ class KVCache:
         return cls(
             k=jnp.zeros((n_layers, bsz, max_seqlen, kv_heads, head_dim), dtype=dtype),
             v=jnp.zeros((n_layers, bsz, max_seqlen, kv_heads, head_dim), dtype=dtype),
-            positions=jnp.zeros(bsz, dtype=jnp.int32),
+            positions=jnp.zeros(bsz, dtype=jnp.int64),
         )
 
     def update(self, xk: jax.Array, xv: jax.Array, layer_idx: int):

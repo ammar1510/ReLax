@@ -1,5 +1,7 @@
 import numpy as np
 import jax
+jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pathlib import Path
 import argparse
@@ -23,7 +25,7 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     test_prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
 
     # Use bfloat16 for consistency with typical inference
-    jax_dtype = jnp.float32
+    jax_dtype = jnp.float64
     use_scaled_rope = False
 
     print("\n" + "="*80)
@@ -31,13 +33,15 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     print("="*80)
 
     # Load JAX configuration and weights
-    config = ModelConfig.from_json_file(model_path)
+    config = ModelConfig.from_json_file(str(model_path))
     config = dataclasses.replace(config, dtype=jax_dtype,use_scaled_rope=use_scaled_rope)
     print(f"JAX Config: dim={config.dim}, n_layers={config.n_layers}, "
           f"n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}")
 
-    # Load JAX weights from safetensors
+    # Load JAX weights from PyTorch .pth files
     params = load_llama_weights(str(model_path), config)
+    params = jax.tree.map(lambda x: x.astype(jax_dtype), params)
+    print("dtype of params: ", params["tok_embeddings"]["embedding"].dtype)
     print("✓ JAX weights loaded successfully")
 
     # Initialize JAX model
@@ -87,10 +91,20 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     tokens = jnp.array([prompt_tokens], dtype=jnp.int32)  # [1, prompt_len]
     current_seq_len = len(prompt_tokens)
     
+    # Create JIT-compiled forward function
+    @jax.jit
+    def forward_fn(variables, tokens, seq_lengths, kv_cache):
+        return model.apply(
+            variables,
+            tokens=tokens,
+            seq_lengths=seq_lengths,
+            kv_cache=kv_cache,
+        )
+    
     # Prefill: process the prompt
     print(f"Prefilling with {len(prompt_tokens)} tokens...")
     seq_lengths = jnp.array([len(prompt_tokens)], dtype=jnp.int32)
-    logits, kv_cache = model.apply(
+    logits, kv_cache = forward_fn(
         {"params": params},
         tokens=tokens,
         seq_lengths=seq_lengths,
@@ -101,6 +115,7 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     # Generate tokens autoregressively with greedy sampling
     generated_tokens = []
     stop_tokens = {tokenizer.eos_id, tokenizer.eot_id}
+
     
     print(f"Generating up to {max_gen_len} tokens...")
     for step in range(max_gen_len):
@@ -122,9 +137,9 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
         # Prepare next token for forward pass
         next_token_tensor = jnp.array([[next_token_val]], dtype=jnp.int32)  # [1, 1]
         
-        # Forward pass with single new token
+        # Forward pass with single new token (JIT-compiled)
         seq_lengths = jnp.array([1], dtype=jnp.int32)
-        logits, kv_cache = model.apply(
+        logits, kv_cache = forward_fn(
             {"params": params},
             tokens=next_token_tensor,
             seq_lengths=seq_lengths,

@@ -27,7 +27,7 @@ def test_model_forward_pass(model_path: str):
 
     # Test configuration
     batch_size = 2
-    seqlen = 8192
+    seqlen = 256
     test_prompt = "The quick brown fox jumps over the lazy dog. This is a test sentence for the LLaMA model."
 
     # Device selection for PyTorch

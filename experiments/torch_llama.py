@@ -310,6 +310,11 @@ class Transformer(nn.Module):
         # for use during inference
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        
+        # Debug: After embeddings
+        print(f"\n[PyTorch] After embeddings:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+        
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
@@ -325,10 +330,16 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             h = layer(h, start_pos, freqs_cis, mask)
+            # Debug: After each layer
+            print(f"\n[PyTorch] After layer {layer_idx}:\n")
+            print(f"  Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
 
         h = self.norm(h)
+        # Debug: After final norm
+        print(f"\n[PyTorch] After final norm:\n")
+        print(f"  Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
         output = self.output(h).float()
         return output
 
