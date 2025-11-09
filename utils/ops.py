@@ -208,25 +208,57 @@ def apply_rotary_emb_batch(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
     return x_out
 
 
-@partial(jit, static_argnames=["n_rep"])
-def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
+
+@partial(jit, static_argnames=["seqlen"])
+def build_attn_mask(
+    x: jax.Array,  # [bsz, seqlen, dim] - input tensor
+    kv_cache: KVCache,  # KV cache with k, v, and positions
+    true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
+) -> jax.Array:
     """
-    Repeat Key/Value heads for Grouped Query Attention.
+    Build attention mask for variable-length sequences with KV caching.
 
     Args:
-        x: Input tensor (keys or values) with shape [bs, seqlen, n_kv_heads, head_dim].
-        n_rep: Number of times to repeat the KV heads.
+        x: Input tensor of shape [bsz, seqlen, dim] (padded to max length in batch).
+        kv_cache: KV cache containing keys, values, and positions.
+        true_len: Actual (non-padded) input lengths for each sequence [bsz].
 
     Returns:
-        Tensor with repeated KV heads, shape [bs, seqlen, n_q_heads, head_dim].
+        Additive attention mask of shape [bsz, seqlen, max_seqlen] where 0.0 means attend
+        and -inf means don't attend.
     """
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    # equivalent to torch.repeat_interleave(x, repeats=n_rep, dim=2)
-    return jnp.broadcast_to(
-        x[:, :, :, None, :], (bs, slen, n_kv_heads, n_rep, head_dim)
-    ).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    bsz, seqlen, _ = x.shape
+    
+    max_seqlen = kv_cache.k.shape[3] 
+    
+    cache_positions = kv_cache.positions 
+    
+    def build_mask_for_sequence(true_length, cache_pos):
+        """Build attention mask for one sequence.
+
+        Args:
+            true_length: Actual input length (non-padded)
+            cache_pos: Cache position (start_pos) for this sequence
+        """
+        query_offsets = jnp.arange(seqlen)  # [seqlen] - Static: [0, 1, 2, ..., seqlen-1]
+        key_positions = jnp.arange(max_seqlen)  # [max_seqlen] - Static
+
+        query_positions = cache_pos  + query_offsets  # [seqlen]
+
+        # Causal mask: query at pos i can only attend to keys at pos <= i
+        causal_mask = query_positions[:, None] >= key_positions[None, :]  # [seqlen, max_seqlen]
+
+        # Valid query mask: only first true_length queries are real (rest are padding)
+        valid_query_mask = query_offsets < true_length  # [seqlen]
+
+        mask_bool = causal_mask & valid_query_mask[:, None]  # [seqlen, max_seqlen]
+        
+        mask = jnp.where(mask_bool, 0.0, -jnp.inf)
+        return mask  # [seqlen, max_seqlen]
+
+    mask = jax.vmap(build_mask_for_sequence)(true_len, cache_positions) # [bsz, seqlen, max_seqlen]
+
+    return mask
 
 
 @partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3])
@@ -236,7 +268,8 @@ def grouped_query_attention(
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
-    seq_lengths: jax.Array,  # [bsz] - actual (non-padded) lengths
+    mask: jax.Array,  # [bsz, seqlen, max_seqlen] - additive attention mask (0.0 = attend, -inf = don't attend)
+    true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
 ) -> tuple[jax.Array, KVCache]:
     """
     Compute Grouped Query Attention with variable-length sequences and per-sequence positions.
@@ -247,83 +280,58 @@ def grouped_query_attention(
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
         kv_cache: The current KV Cache (tracks positions per sequence internally).
         layer_idx: The index of the current layer.
-        seq_lengths: Actual (non-padded) input lengths for each sequence [bsz].
+        mask: Additive attention mask of shape [bsz, seqlen, max_seqlen] where 0.0 means attend
+            and -inf means don't attend.
+        true_len: Actual (non-padded) sequence lengths for each sequence [bsz].
 
     Returns:
         Tuple of (Output tensor after attention, Updated KVCache).
     """
     bsz, seqlen, dim = x.shape
 
-    # Get per-sequence cache positions (where each sequence will write)
     start_positions = kv_cache.positions  # [bsz] - can be different per sequence
 
-    # Project inputs to queries, keys, values
     xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)  # [bsz, seqlen, n_heads, head_dim]
     xk = jnp.einsum("bsd,dkc->bskc", x, params.wk)  # [bsz, seqlen, n_kv_heads, head_dim]
     xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv)  # [bsz, seqlen, n_kv_heads, head_dim]
 
-    # Apply RoPE at absolute positions
-    # Each sequence's tokens are at positions [start_pos, start_pos+1, ..., start_pos+seqlen-1]
     position_offsets = jnp.arange(seqlen)[None, :]  # [1, seqlen]
     absolute_positions = start_positions[:, None] + position_offsets  # [bsz, seqlen]
 
-    # Get frequencies for these absolute positions
     batch_freqs_cis = freqs_cis[absolute_positions]  # [bsz, seqlen, head_dim//2, 2]
 
-    # Apply rotary embeddings
     xq = apply_rotary_emb_batch(xq, batch_freqs_cis)
     xk = apply_rotary_emb_batch(xk, batch_freqs_cis)
 
-    # Update cache (each sequence writes at its own position)
-    updated_cache = kv_cache.update(xk, xv, layer_idx)
+    xk = xk.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
+    xv = xv.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
+
+    updated_cache = kv_cache.update(xk, xv, layer_idx, true_len)
     keys, values = updated_cache.get_layer(layer_idx)
 
-    max_seqlen = keys.shape[1]  # Max cache size (e.g., 2048)
+    _, _, n_heads, head_dim = xq.shape
+    n_kv_heads = keys.shape[1]
+    n_rep = n_heads // n_kv_heads
 
-    # Build per-sequence attention masks using vmap
-    def build_mask_for_sequence(true_len, cache_pos):
-        """Build attention mask for one sequence.
+    if n_rep != 1:
+        # Repeat along head dimension: [bsz, kv_heads, max_seqlen, head_dim] -> [bsz, n_heads, max_seqlen, head_dim]
+        keys = jnp.repeat(keys, n_rep, axis=1)
+        values = jnp.repeat(values, n_rep, axis=1)
 
-        Args:
-            true_len: Actual input length (non-padded)
-            cache_pos: Cache position after update
-        """
-        # Create static position arrays
-        query_offsets = jnp.arange(seqlen)  # [seqlen] - Static: [0, 1, 2, ..., seqlen-1]
-        key_positions = jnp.arange(max_seqlen)  # [max_seqlen] - Static
+    xq = xq.transpose(0, 2, 1, 3)
+    scores = jnp.einsum("bhqd,bhkd->bhqk", xq, keys) / jnp.sqrt(head_dim)
 
-        # Compute absolute query positions: [cache_pos-seqlen, ..., cache_pos-1]
-        # Use broadcasting to add the dynamic cache_pos offset
-        query_positions = (cache_pos - seqlen) + query_offsets  # [seqlen]
+    mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen] 
+    scores = scores + mask
 
-        # Causal mask: query at pos i can only attend to keys at pos <= i
-        causal_mask = query_positions[:, None] >= key_positions[None, :]  # [seqlen, max_seqlen]
+    scores = nn.softmax(scores.astype(jnp.float32), axis=-1).astype(scores.dtype)
 
-        # Valid query mask: only first true_len queries are real (rest are padding)
-        valid_query_mask = query_offsets < true_len  # [seqlen]
+    attn_output = jnp.einsum("bhqk,bhkd->bhqd", scores, values) # [bsz, n_heads, seqlen, head_dim]
 
-        # Combine masks
-        mask = causal_mask & valid_query_mask[:, None]
-        return mask  # [seqlen, max_seqlen]
+    attn_output = attn_output.transpose(0, 2, 1, 3) # [bsz, seqlen, n_heads, head_dim]
+    attn_output = attn_output.reshape(bsz, seqlen, -1) # [bsz, seqlen, n_heads * head_dim]
 
-    # Apply to all sequences
-    mask = jax.vmap(build_mask_for_sequence)(seq_lengths, updated_cache.positions)
-    # Shape: [bsz, seqlen, max_seqlen]
-
-    # Add head dimension for broadcasting
-    mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen]
-
-    # Perform attention
-    attn_output = nn.dot_product_attention(
-        query=xq,
-        key=keys,
-        value=values,
-        mask=mask,
-    )
-
-    # Output projection
-    attn_output = attn_output.reshape(bsz, seqlen, -1)
-    output = jnp.einsum("bsd,do->bso", attn_output, params.wo)
+    output = jnp.einsum("bsd,do->bso", attn_output, params.wo) # [bsz, seqlen, n_heads * head_dim]
 
     return output, updated_cache
 

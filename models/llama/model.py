@@ -89,7 +89,8 @@ class TransformerBlock(nn.Module):
         freqs_cis: jax.Array,
         kv_cache: KVCache,
         layer_idx: int,
-        seq_lengths: jax.Array,
+        mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
+        true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
     ) -> tuple[jax.Array, KVCache]:
         # Attention block
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
@@ -99,7 +100,8 @@ class TransformerBlock(nn.Module):
             params=self.attention,
             kv_cache=kv_cache,
             layer_idx=layer_idx,
-            seq_lengths=seq_lengths,
+            mask=mask,
+            true_len=true_len,
         )
         x = x + attn_output  # Residual connection
         # Debug: After attention
@@ -167,7 +169,13 @@ class LLaMa(nn.Module):
         # jax.config.update("jax_enable_x64", False)
         # jax.config.update("jax_default_matmul_precision", "default")
 
-    def __call__(self, tokens: jax.Array, seq_lengths: jax.Array, kv_cache: KVCache):
+    def __call__(
+        self,
+        tokens: jax.Array,
+        true_lengths : jax.Array,
+        kv_cache: KVCache,
+        mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
+    ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         
@@ -178,11 +186,7 @@ class LLaMa(nn.Module):
 
         # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
-            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, seq_lengths)
-            # Debug: After each layer
-            h_np = np.array(h, dtype=np.float32)
-            print(f"\n[JAX] After layer {layer_idx}:\n")
-            print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask, seq_lengths)
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
