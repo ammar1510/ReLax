@@ -1,4 +1,5 @@
 # Placeholder for shared, reusable Flax modules (RMSNorm, FFN, Attention, etc.)
+import logging
 import jax
 import jax.numpy as jnp
 import jax.nn as nn
@@ -9,6 +10,10 @@ from jax.experimental.pallas.ops.tpu import flash_attention
 from .kvcache import KVCache
 from typing import Optional
 from functools import partial
+import numpy as np
+import sys
+
+logger = logging.getLogger(__name__)
 
 @partial(jit, static_argnames=["head_dim", "end", "use_scaled", "dtype"])
 def precompute_freqs_cis(
@@ -209,7 +214,7 @@ def apply_rotary_emb_batch(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
 
 
-@partial(jit, static_argnames=["seqlen"])
+@jit
 def build_attn_mask(
     x: jax.Array,  # [bsz, seqlen, dim] - input tensor
     kv_cache: KVCache,  # KV cache with k, v, and positions
@@ -224,8 +229,8 @@ def build_attn_mask(
         true_len: Actual (non-padded) input lengths for each sequence [bsz].
 
     Returns:
-        Additive attention mask of shape [bsz, seqlen, max_seqlen] where 0.0 means attend
-        and -inf means don't attend.
+        Boolean attention mask of shape [bsz, seqlen, max_seqlen] where True means attend
+        and False means don't attend.
     """
     bsz, seqlen, _ = x.shape
     
@@ -251,26 +256,25 @@ def build_attn_mask(
         # Valid query mask: only first true_length queries are real (rest are padding)
         valid_query_mask = query_offsets < true_length  # [seqlen]
 
-        mask_bool = causal_mask & valid_query_mask[:, None]  # [seqlen, max_seqlen]
+        mask = causal_mask & valid_query_mask[:, None]  # [seqlen, max_seqlen]
         
-        mask = jnp.where(mask_bool, 0.0, -jnp.inf)
-        return mask  # [seqlen, max_seqlen]
+        return mask  # [seqlen, max_seqlen] 
 
     mask = jax.vmap(build_mask_for_sequence)(true_len, cache_positions) # [bsz, seqlen, max_seqlen]
 
     return mask
 
 
-@partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3])
+# @partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
     params: AttentionParams,
     kv_cache: KVCache,
     layer_idx: int,
-    mask: jax.Array,  # [bsz, seqlen, max_seqlen] - additive attention mask (0.0 = attend, -inf = don't attend)
+    mask: jax.Array,  # [bsz, seqlen, max_seqlen] - boolean attention mask (True = attend, False = don't attend)
     true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
-) -> tuple[jax.Array, KVCache]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Compute Grouped Query Attention with variable-length sequences and per-sequence positions.
 
@@ -280,20 +284,29 @@ def grouped_query_attention(
         params: Dataclass containing weight matrices (wq, wk, wv, wo).
         kv_cache: The current KV Cache (tracks positions per sequence internally).
         layer_idx: The index of the current layer.
-        mask: Additive attention mask of shape [bsz, seqlen, max_seqlen] where 0.0 means attend
-            and -inf means don't attend.
+        mask: Boolean attention mask of shape [bsz, seqlen, max_seqlen] where True means attend
+            and False means don't attend.
         true_len: Actual (non-padded) sequence lengths for each sequence [bsz].
 
     Returns:
-        Tuple of (Output tensor after attention, Updated KVCache).
+        Tuple of (Output tensor after attention, new K tensor, new V tensor).
+        K and V tensors have shape [bsz, n_kv_heads, seqlen, head_dim].
     """
     bsz, seqlen, dim = x.shape
 
     start_positions = kv_cache.positions  # [bsz] - can be different per sequence
 
+    logger.debug(f"Start positions: {start_positions}, Sequence length: {seqlen}")
+
     xq = jnp.einsum("bsd,dhc->bshc", x, params.wq)  # [bsz, seqlen, n_heads, head_dim]
     xk = jnp.einsum("bsd,dkc->bskc", x, params.wk)  # [bsz, seqlen, n_kv_heads, head_dim]
     xv = jnp.einsum("bsd,dvc->bsvc", x, params.wv)  # [bsz, seqlen, n_kv_heads, head_dim]
+
+    # Debug: After Q, K, V projection (commented out for performance)
+    xq_np = np.array(xq[0, 0, 0, :10], dtype=np.float32)
+    xk_np = np.array(xk[0, 0, 0, :10], dtype=np.float32)
+    xv_np = np.array(xv[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After Q/K/V projection: Q={xq_np}, K={xk_np}, V={xv_np}")
 
     position_offsets = jnp.arange(seqlen)[None, :]  # [1, seqlen]
     absolute_positions = start_positions[:, None] + position_offsets  # [bsz, seqlen]
@@ -303,11 +316,21 @@ def grouped_query_attention(
     xq = apply_rotary_emb_batch(xq, batch_freqs_cis)
     xk = apply_rotary_emb_batch(xk, batch_freqs_cis)
 
-    xk = xk.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
-    xv = xv.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
+    # Debug: After RoPE (commented out for performance)
+    xq_rope_np = np.array(xq[0, 0, 0, :10], dtype=np.float32)
+    xk_rope_np = np.array(xk[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After RoPE: Q={xq_rope_np}, K={xk_rope_np}")
 
-    updated_cache = kv_cache.update(xk, xv, layer_idx, true_len)
-    keys, values = updated_cache.get_layer(layer_idx)
+    xk_transposed = xk.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
+    xv_transposed = xv.transpose(0, 2, 1, 3)  # [bsz, n_kv_heads, seqlen, head_dim]
+
+    # Get cached keys/values for this layer (these will be updated later in the model)
+    keys, values = kv_cache.get_layer(layer_idx)
+
+    # Debug: After cache retrieval (commented out for performance)
+    keys_np = np.array(keys[0, 0, 0, :10], dtype=np.float32)
+    values_np = np.array(values[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - Cached Keys={keys_np}, Values={values_np}")
 
     _, _, n_heads, head_dim = xq.shape
     n_kv_heads = keys.shape[1]
@@ -321,19 +344,34 @@ def grouped_query_attention(
     xq = xq.transpose(0, 2, 1, 3)
     scores = jnp.einsum("bhqd,bhkd->bhqk", xq, keys) / jnp.sqrt(head_dim)
 
-    mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen] 
-    scores = scores + mask
+    # Debug: After attention scores (commented out for performance)
+    scores_np = np.array(scores[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After attention scores: {scores_np}")
 
-    scores = nn.softmax(scores.astype(jnp.float32), axis=-1).astype(scores.dtype)
+    mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen] - boolean mask
+
+    scores = nn.softmax(scores, where=mask, axis=-1).astype(x.dtype)
+
+    # Debug: After softmax (commented out for performance)
+    scores_softmax_np = np.array(scores[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After softmax: {scores_softmax_np}")
 
     attn_output = jnp.einsum("bhqk,bhkd->bhqd", scores, values) # [bsz, n_heads, seqlen, head_dim]
+
+    # Debug: After attention output (commented out for performance)
+    attn_output_np = np.array(attn_output[0, 0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After attention output: {attn_output_np}")
 
     attn_output = attn_output.transpose(0, 2, 1, 3) # [bsz, seqlen, n_heads, head_dim]
     attn_output = attn_output.reshape(bsz, seqlen, -1) # [bsz, seqlen, n_heads * head_dim]
 
     output = jnp.einsum("bsd,do->bso", attn_output, params.wo) # [bsz, seqlen, n_heads * head_dim]
 
-    return output, updated_cache
+    # Debug: After output projection (commented out for performance)
+    output_np = np.array(output[0, 0, :10], dtype=np.float32)
+    logger.debug(f"Layer {layer_idx} - After output projection: {output_np}")
+
+    return output, xk_transposed, xv_transposed
 
 
 @partial(jit, static_argnames=["activation_fn"], donate_argnums=[0])

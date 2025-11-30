@@ -1,7 +1,7 @@
 import numpy as np
 import jax
-jax.config.update("jax_default_matmul_precision", "highest")
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_default_matmul_precision", "highest")
+# jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pathlib import Path
 import argparse
@@ -26,7 +26,7 @@ def test_jax_forward_pass(model_path: str, output_file: str = "jax_output.txt", 
     test_prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
 
     # Use bfloat16 for consistency with typical inference
-    jax_dtype = jnp.float64
+    jax_dtype = jnp.float32
     use_scaled_rope = False
 
     print("\n" + "="*80)

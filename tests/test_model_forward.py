@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from pathlib import Path
 import argparse
 import dataclasses
+import logging
 
 # JAX/Flax model components
 from models.llama.model import LLaMa as Llama_jax
@@ -12,6 +13,7 @@ from models.llama.config import ModelConfig
 from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
 from utils.kvcache import KVCache as KVCache_jax
+from utils.ops import build_attn_mask
 
 # PyTorch model components
 from experiments.torch_llama import Llama as Llama_wrapper
@@ -19,8 +21,30 @@ from experiments.torch_llama import Llama as Llama_wrapper
 jax.config.update("jax_default_matmul_precision", "highest")
 
 
-def test_model_forward_pass(model_path: str):
-    """Test forward pass comparison between PyTorch and JAX models with real Llama 3.2 1B weights."""
+def test_model_forward_pass(model_path: str, log_prefill: bool = False):
+    """Test forward pass comparison between PyTorch and JAX models with real Llama 3.2 1B weights.
+
+    Args:
+        model_path: Path to model directory
+        log_prefill: If True, enable debug logging during prefill. If False, only enable for generation.
+    """
+
+    # Configure logging based on log_prefill flag
+    logging.basicConfig(
+        level=logging.WARNING,  # Default level for all loggers
+        format='[%(name)s] %(levelname)s - %(message)s'
+    )
+
+    # Suppress JAX/JIT internal logs
+    logging.getLogger('jax').setLevel(logging.ERROR)
+    logging.getLogger('jaxlib').setLevel(logging.ERROR)
+    logging.getLogger('absl').setLevel(logging.ERROR)
+
+    if log_prefill:
+        # Enable debug logging for prefill
+        logging.getLogger('models.llama.model').setLevel(logging.DEBUG)
+        logging.getLogger('utils.ops').setLevel(logging.DEBUG)
+        logging.getLogger('experiments.torch_llama').setLevel(logging.DEBUG)
 
     model_path = Path(model_path)
     print(f"Loading model from {model_path}")
@@ -49,8 +73,8 @@ def test_model_forward_pass(model_path: str):
         print("Using CPU device")
 
     # Use bfloat16 for consistency with typical inference
-    torch_dtype = torch.bfloat16
-    jax_dtype = jnp.bfloat16
+    torch_dtype = torch.float32
+    jax_dtype = jnp.float32
 
     print("\n" + "="*80)
     print("LOADING JAX MODEL")
@@ -109,16 +133,12 @@ def test_model_forward_pass(model_path: str):
     print(f"Test prompt: {test_prompt}")
     print(f"Tokenized length: {len(tokens_list)}")
 
-    # Truncate or pad to match seqlen if needed
+    # Truncate if needed to fit within max cache size (but don't pad)
     if len(tokens_list) > seqlen:
         tokens_list = tokens_list[:seqlen]
         print(f"Truncated to {seqlen} tokens")
-    elif len(tokens_list) < seqlen:
-        # Pad with zeros (or could use pad_id)
-        tokens_list = tokens_list + [0] * (seqlen - len(tokens_list))
-        print(f"Padded to {seqlen} tokens")
 
-    actual_seqlen = min(len(tokens_list), seqlen)
+    actual_seqlen = len(tokens_list)
 
     # Create batch by repeating the tokens
     tokens_np = np.array([tokens_list] * batch_size, dtype=np.int32)
@@ -165,17 +185,25 @@ def test_model_forward_pass(model_path: str):
     print(f"✓ PyTorch KV caches initialized in all layers")
 
     print("\n" + "="*80)
-    print("RUNNING FORWARD PASSES")
+    logging_status = "Enabled" if log_prefill else "Disabled"
+    print(f"RUNNING FORWARD PASSES (PREFILL - Logging {logging_status})")
     print("="*80)
 
     # JAX forward pass
     print("Running JAX forward pass...")
-    seq_lengths = jnp.full((batch_size,), actual_seqlen, dtype=jnp.int32)
+    true_lengths = jnp.full((batch_size,), actual_seqlen, dtype=jnp.int32)
+
+    # Build attention mask - need to create a dummy input tensor for mask building
+    # The mask shape depends on the input tensor shape
+    dummy_input = jnp.zeros((batch_size, actual_seqlen, jax_config.dim), dtype=jax_dtype)
+    mask = build_attn_mask(dummy_input, kv_cache_jax, true_lengths)
+
     logits_jax, updated_kv_cache_jax = jax_model.apply(
         {"params": jax_params},
         tokens=tokens_jax,
-        seq_lengths=seq_lengths,
+        true_lengths=true_lengths,
         kv_cache=kv_cache_jax,
+        mask=mask,
     )
     print(f"✓ JAX forward pass complete: {logits_jax.shape}")
 
@@ -201,7 +229,7 @@ def test_model_forward_pass(model_path: str):
     assert logits_jax_np.shape == logits_torch_np.shape, (
         f"Shape mismatch: JAX {logits_jax_np.shape} vs PyTorch {logits_torch_np.shape}"
     )
-    assert logits_jax_np.shape == (batch_size, seqlen, jax_config.vocab_size), (
+    assert logits_jax_np.shape == (batch_size, actual_seqlen, jax_config.vocab_size), (
         f"Unexpected output shape: {logits_jax_np.shape}"
     )
     print("✓ Shape check passed")
@@ -264,6 +292,95 @@ def test_model_forward_pass(model_path: str):
         print(f"  Error: {e}")
         print(f"  This may be acceptable given bfloat16 precision limitations")
 
+    print("\n" + "="*80)
+    print("RUNNING SINGLE GENERATION STEP (Logging Enabled)")
+    print("="*80)
+
+    # Enable debug logging for generation step (if not already enabled)
+    if not log_prefill:
+        logging.getLogger('models.llama.model').setLevel(logging.DEBUG)
+        logging.getLogger('utils.ops').setLevel(logging.DEBUG)
+        logging.getLogger('experiments.torch_llama').setLevel(logging.DEBUG)
+        print("✓ Debug logging enabled for JAX and PyTorch models\n")
+    else:
+        print("✓ Debug logging already enabled from prefill\n")
+
+    # Sample next token from last position (greedy)
+    print("Sampling next token from last position...")
+    next_token_jax = jnp.argmax(logits_jax[:, -1, :], axis=-1)  # [batch_size]
+    next_token_torch = torch.argmax(logits_torch[:, -1, :], dim=-1)  # [batch_size]
+    
+    # Convert to numpy for comparison
+    next_token_jax_np = np.array(next_token_jax, dtype=np.int32)
+    next_token_torch_np = next_token_torch.cpu().numpy()
+    
+    print(f"JAX next tokens: {next_token_jax_np}")
+    print(f"PyTorch next tokens: {next_token_torch_np}")
+    
+    # Check if tokens match
+    tokens_match = np.array_equal(next_token_jax_np, next_token_torch_np)
+    print(f"Tokens match: {tokens_match}")
+    
+    # Use first batch's token for generation (repeat for batch_size=2)
+    next_token_val = int(next_token_jax_np[0])
+    print(f"Using token {next_token_val} for generation step (repeated for batch_size=2)")
+
+    # JAX generation step
+    print("\nRunning JAX generation step...")
+    next_token_jax_tensor = jnp.array([[next_token_val], [next_token_val]], dtype=jnp.int32)  # [2, 1]
+    true_lengths_gen = jnp.array([1, 1], dtype=jnp.int32)
+    
+    # Build mask for single token generation (batch_size=2)
+    dummy_input_gen = jnp.zeros((batch_size, 1, jax_config.dim), dtype=jax_dtype)
+    mask_gen = build_attn_mask(dummy_input_gen, updated_kv_cache_jax, true_lengths_gen)
+    
+    logits_jax_gen, updated_kv_cache_jax = jax_model.apply(
+        {"params": jax_params},
+        tokens=next_token_jax_tensor,
+        true_lengths=true_lengths_gen,
+        kv_cache=updated_kv_cache_jax,
+        mask=mask_gen,
+    )
+    print(f"✓ JAX generation step complete: {logits_jax_gen.shape}")
+
+    # PyTorch generation step
+    print("Running PyTorch generation step...")
+    next_token_torch_tensor = torch.tensor([[next_token_val], [next_token_val]], device=torch_device, dtype=torch.long)  # [2, 1]
+    start_pos_gen = actual_seqlen
+    
+    with torch.no_grad():
+        logits_torch_gen = torch_model.forward_inference(next_token_torch_tensor, start_pos_gen)
+    print(f"✓ PyTorch generation step complete: {logits_torch_gen.shape}")
+
+    # Compare generation step outputs
+    print("\n" + "="*80)
+    print("COMPARING GENERATION STEP OUTPUTS")
+    print("="*80)
+
+    logits_jax_gen_np = np.array(logits_jax_gen, dtype=np.float32)
+    logits_torch_gen_np = logits_torch_gen.cpu().float().detach().numpy()
+
+    print(f"JAX gen output shape: {logits_jax_gen_np.shape}")
+    print(f"PyTorch gen output shape: {logits_torch_gen_np.shape}")
+
+    # Compare outputs
+    abs_diff_gen = np.abs(logits_jax_gen_np - logits_torch_gen_np)
+    max_abs_diff_gen = np.max(abs_diff_gen)
+    mean_abs_diff_gen = np.mean(abs_diff_gen)
+
+    rel_diff_gen = abs_diff_gen / (np.abs(logits_torch_gen_np) + 1e-8)
+    max_rel_diff_gen = np.max(rel_diff_gen)
+
+    print(f"Max absolute difference: {max_abs_diff_gen:.6f}")
+    print(f"Mean absolute difference: {mean_abs_diff_gen:.6f}")
+    print(f"Max relative difference: {max_rel_diff_gen:.6f}")
+
+    # Sample some predictions to show
+    print(f"\nSample logits comparison (first batch, first position, first 10 vocab):")
+    print(f"JAX:     {logits_jax_gen_np[0, 0, :10]}")
+    print(f"PyTorch: {logits_torch_gen_np[0, 0, :10]}")
+    print(f"Diff:    {abs_diff_gen[0, 0, :10]}")
+
     # Clean up PyTorch caches
     for block in torch_model.layers:
         block.attention.cache = None
@@ -274,6 +391,10 @@ def test_model_forward_pass(model_path: str):
         "max_rel_diff": max_rel_diff,
         "jax_shape": logits_jax_np.shape,
         "torch_shape": logits_torch_np.shape,
+        "max_abs_diff_gen": max_abs_diff_gen,
+        "mean_abs_diff_gen": mean_abs_diff_gen,
+        "max_rel_diff_gen": max_rel_diff_gen,
+        "tokens_match": tokens_match,
     }
 
 
@@ -290,6 +411,11 @@ if __name__ == "__main__":
         help="Path to model directory containing safetensors files and config.json. "
              "Should also have 'original' subdirectory with .pth file and tokenizer.model"
     )
+    parser.add_argument(
+        "--log-prefill",
+        action="store_true",
+        help="Enable debug logging during the prefill step (disabled by default)"
+    )
 
     args = parser.parse_args()
 
@@ -298,14 +424,20 @@ if __name__ == "__main__":
     print("JAX vs PyTorch Implementation")
     print("="*80)
 
-    results = test_model_forward_pass(args.model_path)
+    results = test_model_forward_pass(args.model_path, log_prefill=args.log_prefill)
 
     print("\n" + "="*80)
     print("TEST COMPLETE")
     print("="*80)
     print(f"Summary:")
-    print(f"  Max absolute difference: {results['max_abs_diff']:.6f}")
-    print(f"  Mean absolute difference: {results['mean_abs_diff']:.6f}")
-    print(f"  Max relative difference: {results['max_rel_diff']:.6f}")
+    print(f"  Initial forward pass:")
+    print(f"    Max absolute difference: {results['max_abs_diff']:.6f}")
+    print(f"    Mean absolute difference: {results['mean_abs_diff']:.6f}")
+    print(f"    Max relative difference: {results['max_rel_diff']:.6f}")
+    print(f"  Generation step:")
+    print(f"    Max absolute difference: {results['max_abs_diff_gen']:.6f}")
+    print(f"    Mean absolute difference: {results['mean_abs_diff_gen']:.6f}")
+    print(f"    Max relative difference: {results['max_rel_diff_gen']:.6f}")
+    print(f"    Sampled tokens match: {results['tokens_match']}")
     print("="*80)
 
