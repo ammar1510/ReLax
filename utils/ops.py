@@ -350,7 +350,7 @@ def grouped_query_attention(
 
     mask = mask[:, None, :, :]  # [bsz, 1, seqlen, max_seqlen] - boolean mask
 
-    scores = nn.softmax(scores, where=mask, axis=-1).astype(x.dtype)
+    scores = nn.softmax(scores.astype(jnp.float32), where=mask, axis=-1).astype(x.dtype)
 
     # Debug: After softmax (commented out for performance)
     scores_softmax_np = np.array(scores[0, 0, 0, :10], dtype=np.float32)

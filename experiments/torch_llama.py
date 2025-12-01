@@ -352,7 +352,7 @@ class Transformer(nn.Module):
         logger.debug(f"After embeddings: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
 
         self.freqs_cis = self.freqs_cis.to(h.device)
-        logger.debug(f"Start position: {start_pos}, Sequence length: {seqlen}")
+        # logger.debug(f"Start position: {start_pos}, Sequence length: {seqlen}")
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None

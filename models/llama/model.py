@@ -120,8 +120,8 @@ class TransformerBlock(nn.Module):
         )
         x = x + ffn_output  # Residual connection
         # Debug: After feedforward (commented out for performance)
-        # h_np = np.array(x, dtype=np.float32)
-        # logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        h_np = np.array(x, dtype=np.float32)
+        logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         return x, xk, xv
 
