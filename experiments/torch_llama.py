@@ -206,21 +206,21 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         # Debug: After Q, K, V projection
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After Q/K/V projection: Q={xq[0, 0, 0, :10].cpu().float().numpy()}, K={xk[0, 0, 0, :10].cpu().float().numpy()}, V={xv[0, 0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+        #     logger.debug(f"Layer {layer_idx} - After Q/K/V projection: Q={xq[0, 0, 0, :10].cpu().float().numpy()}, K={xk[0, 0, 0, :10].cpu().float().numpy()}, V={xv[0, 0, 0, :10].cpu().float().numpy()}")
         # rotate query, keys (RoPE)
         xq = apply_rotary_emb(xq, freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis)
         # Debug: After RoPE
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After RoPE: Q={xq[0, 0, 0, :10].cpu().float().numpy()}, K={xk[0, 0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+        #     logger.debug(f"Layer {layer_idx} - After RoPE: Q={xq[0, 0, 0, :10].cpu().float().numpy()}, K={xk[0, 0, 0, :10].cpu().float().numpy()}")
         # KV cache update
         if self.cache is not None:
             # update the KV cache with current KV and get all the previous KVs
             xk, xv = self.cache.update(start_pos, xk, xv)
             # Debug: After cache update
-            if layer_idx is not None:
-                logger.debug(f"Layer {layer_idx} - After cache update: Keys={xk[0, 0, 0, :10].cpu().float().numpy()}, Values={xv[0, 0, 0, :10].cpu().float().numpy()}")
+            # if layer_idx is not None:
+            #     logger.debug(f"Layer {layer_idx} - After cache update: Keys={xk[0, 0, 0, :10].cpu().float().numpy()}, Values={xv[0, 0, 0, :10].cpu().float().numpy()}")
         # repeat k/v heads if n_kv_heads < n_heads (GQA)
         xk = repeat_kv(
             xk, self.n_rep
@@ -236,27 +236,27 @@ class Attention(nn.Module):
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             # Debug: After attention scores
-            if layer_idx is not None:
-                logger.debug(f"Layer {layer_idx} - After attention scores: {scores[0, 0, 0, :10].cpu().float().numpy()}")
+            # if layer_idx is not None:
+                # logger.debug(f"Layer {layer_idx} - After attention scores: {scores[0, 0, 0, :10].cpu().float().numpy()}")
             if mask is not None:
                 scores = (
                     scores + mask
                 )  # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             # Debug: After softmax
-            if layer_idx is not None:
-                logger.debug(f"Layer {layer_idx} - After softmax: {scores[0, 0, 0, :10].cpu().float().numpy()}")
+            # if layer_idx is not None:
+            #     logger.debug(f"Layer {layer_idx} - After softmax: {scores[0, 0, 0, :10].cpu().float().numpy()}")
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
         # Debug: After attention output
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After attention output: {output[0, 0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+        #     logger.debug(f"Layer {layer_idx} - After attention output: {output[0, 0, 0, :10].cpu().float().numpy()}")
         # concatenate all the heads
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         # output projection
         proj = self.wo(output)
         # Debug: After output projection
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After output projection: {proj[0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+        #     logger.debug(f"Layer {layer_idx} - After output projection: {proj[0, 0, :10].cpu().float().numpy()}")
         return proj
 
 
@@ -310,15 +310,15 @@ class TransformerBlock(nn.Module):
         attn_output = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, layer_idx=layer_idx)
         h = x + attn_output  # Residual connection
         # Debug: After attention
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After attention: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+            # logger.debug(f"Layer {layer_idx} - After attention: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
 
         # Feed-forward block
         ffn_output = self.feed_forward(self.ffn_norm(h))
         out = h + ffn_output  # Residual connection
         # Debug: After feedforward (commented out for performance)
-        if layer_idx is not None:
-            logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {out[0, 0, :10].cpu().float().numpy()}")
+        # if layer_idx is not None:
+            # logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {out[0, 0, :10].cpu().float().numpy()}")
         return out
 
 
@@ -349,7 +349,7 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
 
         # Debug: After embeddings
-        logger.debug(f"After embeddings: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+        # logger.debug(f"After embeddings: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
 
         self.freqs_cis = self.freqs_cis.to(h.device)
         # logger.debug(f"Start position: {start_pos}, Sequence length: {seqlen}")
@@ -370,11 +370,11 @@ class Transformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             h = layer(h, start_pos, freqs_cis, mask, layer_idx=layer_idx)
             # Debug: After each layer
-            logger.debug(f"After layer {layer_idx}: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+            # logger.debug(f"After layer {layer_idx}: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
 
         h = self.norm(h)
         # Debug: After final norm
-        logger.debug(f"After final norm: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
+        # logger.debug(f"After final norm: Sample values (first batch, first position, first 10 dims): {h[0, 0, :10].cpu().float().numpy()}")
         output = self.output(h).float()
         return output
 

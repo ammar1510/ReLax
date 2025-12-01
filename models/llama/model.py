@@ -14,7 +14,7 @@ from utils.ops import (
     AttentionParams,
     FeedForwardParams,
 )
-from utils.kvcache import KVCache, TempKV
+from utils.kvcache import KVCache
 from .config import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -93,23 +93,21 @@ class TransformerBlock(nn.Module):
         kv_cache: KVCache,
         layer_idx: int,
         mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
-        true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # Attention block
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
-        attn_output, xk, xv = grouped_query_attention(
+        attn_output, updated_cache = grouped_query_attention(
             h_norm,
             freqs_cis=freqs_cis,
             params=self.attention,
             kv_cache=kv_cache,
             layer_idx=layer_idx,
             mask=mask,
-            true_len=true_len,
         )
         x = x + attn_output  # Residual connection
         # Debug: After attention
-        h_np = np.array(x, dtype=np.float32)
-        logger.debug(f"Layer {layer_idx} - After attention: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        # h_np = np.array(x, dtype=np.float32)
+        # logger.debug(f"Layer {layer_idx} - After attention: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
         # Feed-forward block
         h_ffn_norm = rms_norm(x, self.ffn_norm_weight, eps=self.args.rms_norm_eps)
@@ -120,10 +118,10 @@ class TransformerBlock(nn.Module):
         )
         x = x + ffn_output  # Residual connection
         # Debug: After feedforward (commented out for performance)
-        h_np = np.array(x, dtype=np.float32)
-        logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        # h_np = np.array(x, dtype=np.float32)
+        # logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
-        return x, xk, xv
+        return x, updated_cache
 
 
 class LLaMa(nn.Module):
@@ -173,39 +171,30 @@ class LLaMa(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,
-        true_lengths: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
+        true_lengths : jax.Array,
         kv_cache: KVCache,
         mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
     ):
-        bsz, seqlen = tokens.shape
+        _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-
+        
         # Debug: After embeddings
-        h_np = np.array(h, dtype=np.float32)
-        logger.debug(f"After embeddings: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        # h_np = np.array(h, dtype=np.float32)
+        # print(f"\n[JAX] After embeddings:\n")
+        # print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
-        temp_kv = TempKV.new(
-            n_layers=self.args.n_layers,
-            bsz=bsz,
-            seqlen=seqlen,
-            kv_heads=self.args.n_kv_heads,
-            head_dim=self.args.head_dim,
-            dtype=self.args.dtype,
-        )
-
+        # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
-            h, xk, xv = layer(h, self.freqs_cis, kv_cache, layer_idx, mask, true_lengths)
-            temp_kv = temp_kv.set_layer(layer_idx, xk, xv)
-
-        # Update the KV cache with all layers at once
-        updated_kv_cache = kv_cache.update(temp_kv, true_lengths)
+            h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask)
 
         # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
         # Debug: After final norm
-        h_np = np.array(h, dtype=np.float32)
-        logger.debug(f"After final norm: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        # h_np = np.array(h, dtype=np.float32)
+        # print(f"\n[JAX] After final norm:\n")
+        # print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
         # Tie weights: use the token embedding matrix for the final linear layer
         logits = jnp.einsum("bsd,dv->bsv", h, self.output)
+        kv_cache = kv_cache.update_positions(true_lengths)
 
-        return logits, updated_kv_cache  # Return logits and the updated KVCache
+        return logits, kv_cache  # Return logits and the updated KVCache
