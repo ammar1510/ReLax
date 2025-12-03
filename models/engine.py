@@ -27,6 +27,9 @@ from flax.core import FrozenDict
 from models.llama.model import LLaMa
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
+from utils.ops import build_attn_mask
+from functools import partial
+from jax import jit
 
 
 @dataclass
@@ -115,6 +118,30 @@ class InferenceEngine:
         # Cache model config for convenience
         self.config = model.args
 
+        # Create separate JIT-compiled functions for prefill and generate
+        @jit
+        def _jitted_prefill_apply(params, tokens, true_lengths, kv_cache, mask):
+            return self.model.apply(
+                {"params": params},
+                tokens,
+                true_lengths=true_lengths,
+                kv_cache=kv_cache,
+                mask=mask,
+            )
+
+        @jit
+        def _jitted_generate_apply(params, tokens, true_lengths, kv_cache, mask):
+            return self.model.apply(
+                {"params": params},
+                tokens,
+                true_lengths=true_lengths,
+                kv_cache=kv_cache,
+                mask=mask,
+            )
+
+        self._jitted_prefill_apply = _jitted_prefill_apply
+        self._jitted_generate_apply = _jitted_generate_apply
+
     def prefill(
         self,
         tokens: jax.Array,  # [1, bucket_size]
@@ -135,7 +162,7 @@ class InferenceEngine:
                 - 'next_token': First generated token (sampled from position true_length-1)
                 - 'seq_length': Current sequence length (= true_length)
 
-        Note: This method is JIT-compiled internally for efficiency.
+        Note: The model.apply step is JIT-compiled internally for efficiency.
         """
         # Initialize cache for single sequence
         kv_cache = KVCache.new(
@@ -147,15 +174,20 @@ class InferenceEngine:
             dtype=jnp.dtype(self.config.dtype),
         )
 
-        # Create seq_lengths array
-        seq_lengths = jnp.array([true_length], dtype=jnp.int32)
+        # Create true_lengths array
+        true_lengths = jnp.array([true_length], dtype=jnp.int32)
 
-        # Forward pass through entire prompt
-        logits, updated_cache = self.model.apply(
-            {"params": self.params},
+        # Build attention mask - pass seqlen directly instead of dummy tensor
+        bsz, seqlen = tokens.shape
+        mask = build_attn_mask(seqlen, kv_cache, true_lengths)
+
+        # Forward pass through entire prompt (JIT-compiled)
+        logits, updated_cache = self._jitted_prefill_apply(
+            self.params,
             tokens,
-            seq_lengths=seq_lengths,
-            kv_cache=kv_cache,
+            true_lengths,
+            kv_cache,
+            mask,
         )
 
         # Extract logits at the last real token position
@@ -188,25 +220,37 @@ class InferenceEngine:
                 - Updated decode state with new tokens and incremented positions
                 - New tokens for each slot [max_slots, 1]
 
-        Note: This method is JIT-compiled internally for efficiency.
+        Note: The model.apply step is JIT-compiled internally for efficiency.
         """
         # Forward pass with all slot tokens
         # tokens shape: [max_slots, 1]
-        # seq_lengths represents the actual (non-padded) input length for THIS step
+        # true_lengths represents the actual (non-padded) input length for THIS step
         # For generation, we're processing 1 token at a time
-        seq_lengths = jnp.ones(self.max_slots, dtype=jnp.int32)
+        true_lengths = jnp.ones(self.max_slots, dtype=jnp.int32)
 
-        logits, updated_cache = self.model.apply(
-            {"params": self.params},
+        # Build attention mask - pass seqlen directly instead of dummy tensor
+        bsz, seqlen = decode_state.tokens.shape
+        mask = build_attn_mask(seqlen, decode_state.kv_cache, true_lengths)
+
+        # Forward pass (JIT-compiled)
+        logits, updated_cache = self._jitted_generate_apply(
+            self.params,
             decode_state.tokens,
-            seq_lengths=seq_lengths,
-            kv_cache=decode_state.kv_cache,
+            true_lengths,
+            decode_state.kv_cache,
+            mask,
         )
 
         # Sample next token for each slot
         # logits shape: [max_slots, 1, vocab_size]
         # Take first (and only) position: [max_slots, vocab_size]
         batch_logits = logits[:, 0, :]
+
+        # Debug: Print cache positions to diagnose repetition
+        print(f"[DEBUG] Cache positions before: {decode_state.kv_cache.positions}")
+        print(f"[DEBUG] Cache positions after: {updated_cache.positions}")
+        print(f"[DEBUG] Tokens being fed: {decode_state.tokens.flatten()[:5]}")
+        print(f"[DEBUG] Top 5 logits: {batch_logits[0, :5]}")
 
         # Greedy sampling (TODO: support temperature, top-k, etc.)
         new_tokens = jnp.argmax(batch_logits, axis=-1, keepdims=True)  # [max_slots, 1]

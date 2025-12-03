@@ -214,9 +214,9 @@ def apply_rotary_emb_batch(x: jax.Array, freqs_cis: jax.Array) -> jax.Array:
 
 
 
-@jit
+@partial(jit, static_argnames=["seqlen"])
 def build_attn_mask(
-    x: jax.Array,  # [bsz, seqlen, dim] - input tensor
+    seqlen: int,  # Input sequence length (static for JIT)
     kv_cache: KVCache,  # KV cache with k, v, and positions
     true_len: jax.Array,  # [bsz] - actual (non-padded) sequence lengths
 ) -> jax.Array:
@@ -224,7 +224,7 @@ def build_attn_mask(
     Build attention mask for variable-length sequences with KV caching.
 
     Args:
-        x: Input tensor of shape [bsz, seqlen, dim] (padded to max length in batch).
+        seqlen: Input sequence length (must be static for JIT compilation).
         kv_cache: KV cache containing keys, values, and positions.
         true_len: Actual (non-padded) input lengths for each sequence [bsz].
 
@@ -232,7 +232,7 @@ def build_attn_mask(
         Boolean attention mask of shape [bsz, seqlen, max_seqlen] where True means attend
         and False means don't attend.
     """
-    bsz, seqlen, _ = x.shape
+    bsz = kv_cache.positions.shape[0]
     
     max_seqlen = kv_cache.k.shape[3] 
     
@@ -265,7 +265,7 @@ def build_attn_mask(
     return mask
 
 
-# @partial(jit, static_argnames=["layer_idx"], donate_argnums=[0, 1, 3])
+@partial(jit, static_argnames=["layer_idx"], donate_argnums=[0,3])
 def grouped_query_attention(
     x: jax.Array,
     freqs_cis: jax.Array,  # Precomputed freqs for max_seqlen
