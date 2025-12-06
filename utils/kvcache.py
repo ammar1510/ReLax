@@ -7,7 +7,7 @@ from flax import struct
 class KVCache:
     k: jax.Array
     v: jax.Array
-    positions: jax.Array  # [bsz] - tracks current filled position for each sequence
+    seq_positions: jax.Array  # [bsz] - tracks current filled position for each sequence
 
     @classmethod
     # @functools.partial(jax.jit, static_argnums=(0,1,2,3,4,5)) 
@@ -23,7 +23,7 @@ class KVCache:
         return cls(
             k=jnp.zeros((n_layers, bsz, kv_heads, max_seqlen, head_dim), dtype=dtype),
             v=jnp.zeros((n_layers, bsz, kv_heads, max_seqlen, head_dim), dtype=dtype),
-            positions=jnp.zeros(bsz, dtype=jnp.int32),
+            seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
         )
 
     def update(self, xk: jax.Array, xv: jax.Array, layer_idx: int):
@@ -31,7 +31,7 @@ class KVCache:
 
         Each sequence in the batch can be at a different cache position. This method
         writes each sequence's keys/values at its corresponding position tracked in
-        self.positions.
+        self.seq_positions.
 
         Args:
           xk: The new key tensor to be added to the cache.
@@ -64,7 +64,7 @@ class KVCache:
         # Loop over batch dimension - unrolls at compile time (bsz is static)
         for i in range(bsz):
             # Get this sequence's current cache position
-            start_pos = self.positions[i]  # Dynamic value, different per sequence
+            start_pos = self.seq_positions[i]  # Dynamic value, different per sequence
 
             # Extract this sequence's keys/values: [n_kv_heads, seqlen, head_dim]
             xk_i = xk[i]
@@ -87,7 +87,7 @@ class KVCache:
                 xv_update,
                 (layer_idx, i, 0, start_pos, 0)
             )
-        return KVCache(k=new_k, v=new_v, positions=self.positions)
+        return KVCache(k=new_k, v=new_v, seq_positions=self.seq_positions)
 
 
     def update_positions(self, true_len: jax.Array):
@@ -97,7 +97,7 @@ class KVCache:
             true_len: Actual (non-padded) sequence lengths for each sequence.
                 Shape: `(bsz,)`
         """
-        return KVCache(k=self.k, v=self.v, positions=self.positions + true_len)
+        return KVCache(k=self.k, v=self.v, seq_positions=self.seq_positions + true_len)
     def get_layer(self, layer_idx: int):
         """Retrieves K/V for a specific layer.
 

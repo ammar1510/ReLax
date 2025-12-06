@@ -64,7 +64,7 @@ class DecodeState:
     efficient batching of multiple concurrent requests.
 
     Attributes:
-        kv_cache: Key-value cache for all slots (also tracks positions per sequence)
+        kv_cache: Key-value cache for all slots
                   Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
         tokens: Current token for each slot
                 Shape: [max_slots, 1]
@@ -226,7 +226,8 @@ class InferenceEngine:
         # tokens shape: [max_slots, 1]
         # true_lengths represents the actual (non-padded) input length for THIS step
         # For generation, we're processing 1 token at a time
-        true_lengths = jnp.ones(self.max_slots, dtype=jnp.int32)
+        # Only active slots should have true_length=1, inactive slots should be 0
+        true_lengths = decode_state.active_mask.astype(jnp.int32)
 
         # Build attention mask - pass seqlen directly instead of dummy tensor
         bsz, seqlen = decode_state.tokens.shape
@@ -246,11 +247,11 @@ class InferenceEngine:
         # Take first (and only) position: [max_slots, vocab_size]
         batch_logits = logits[:, 0, :]
 
-        # Debug: Print cache positions to diagnose repetition
-        print(f"[DEBUG] Cache positions before: {decode_state.kv_cache.positions}")
-        print(f"[DEBUG] Cache positions after: {updated_cache.positions}")
-        print(f"[DEBUG] Tokens being fed: {decode_state.tokens.flatten()[:5]}")
-        print(f"[DEBUG] Top 5 logits: {batch_logits[0, :5]}")
+        # # Debug: Print cache positions to diagnose repetition
+        # print(f"[DEBUG] Cache positions before: {decode_state.kv_cache.seq_positions}")
+        # print(f"[DEBUG] Cache positions after: {updated_cache.seq_positions}")
+        # print(f"[DEBUG] Tokens being fed: {decode_state.tokens.flatten()[:5]}")
+        # print(f"[DEBUG] Top 5 logits: {batch_logits[0, :5]}")
 
         # Greedy sampling (TODO: support temperature, top-k, etc.)
         new_tokens = jnp.argmax(batch_logits, axis=-1, keepdims=True)  # [max_slots, 1]
@@ -320,7 +321,9 @@ class InferenceEngine:
         updated_cache = KVCache(
             k=new_k,
             v=new_v,
-            positions=decode_state.kv_cache.positions.at[slot_idx].set(seq_length),
+            seq_positions=decode_state.kv_cache.seq_positions.at[slot_idx].set(
+                seq_length
+            ),
         )
 
         # Update token for this slot
@@ -561,14 +564,13 @@ class InferenceOrchestrator:
 
             except Exception as e:
                 # Send error to response queue
-                if request.response_queue:
-                    request.response_queue.put(
-                        {
-                            "status": "error",
-                            "error": str(e),
-                            "request_id": request.request_id,
-                        }
-                    )
+                request.response_queue.put(
+                    {
+                        "status": "error",
+                        "error": str(e),
+                        "request_id": request.request_id,
+                    }
+                )
 
         print("[Prefill Thread] Stopped")
 
@@ -607,13 +609,12 @@ class InferenceOrchestrator:
                         active_requests[slot_idx] = (request, [first_token])
 
                         # Send first token to response queue
-                        if request.response_queue:
-                            request.response_queue.put(
-                                {
-                                    "status": "generating",
-                                    "token": first_token,
-                                }
-                            )
+                        request.response_queue.put(
+                            {
+                                "status": "generating",
+                                "token": first_token,
+                            }
+                        )
 
                     except queue.Empty:
                         # No prefilled requests available, put slot back
@@ -642,27 +643,25 @@ class InferenceOrchestrator:
 
                             if is_eos or is_max_length:
                                 # Send final response
-                                if request.response_queue:
-                                    request.response_queue.put(
-                                        {
-                                            "status": "complete",
-                                            "tokens": tokens,
-                                            "request_id": request.request_id,
-                                            "finish_reason": (
-                                                "eos" if is_eos else "length"
-                                            ),
-                                        }
-                                    )
+                                request.response_queue.put(
+                                    {
+                                        "status": "complete",
+                                        "tokens": tokens,
+                                        "request_id": request.request_id,
+                                        "finish_reason": (
+                                            "eos" if is_eos else "length"
+                                        ),
+                                    }
+                                )
                                 finished_slots.append(slot_idx)
                             else:
                                 # Send streaming update
-                                if request.response_queue:
-                                    request.response_queue.put(
-                                        {
-                                            "status": "generating",
-                                            "token": token,
-                                        }
-                                    )
+                                request.response_queue.put(
+                                    {
+                                        "status": "generating",
+                                        "token": token,
+                                    }
+                                )
 
                     # Remove finished sequences and free slots
                     for slot_idx in finished_slots:
@@ -674,9 +673,7 @@ class InferenceOrchestrator:
 
                 except Exception as e:
                     print(f"[Generate Thread] Error during generation: {e}")
-                    # In production, would want better error handling here
             else:
-                # No active slots, sleep briefly to avoid busy waiting
                 time.sleep(0.001)
 
         print("[Generate Thread] Stopped")

@@ -51,8 +51,10 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     else:
         config = ModelConfig.from_json_file(str(model_path))
 
-    print(f"Loaded config: {config.n_layers} layers, {config.dim} dim, "
-          f"{config.n_heads} heads, {config.n_kv_heads} kv_heads")
+    print(
+        f"Loaded config: {config.n_layers} layers, {config.dim} dim, "
+        f"{config.n_heads} heads, {config.n_kv_heads} kv_heads, {config.max_seqlen} max_seqlen"
+    )
 
     # Initialize model
     model = LLaMa(config)
@@ -80,7 +82,7 @@ def generate_single(
     orchestrator: InferenceOrchestrator,
     tokenizer: Tokenizer,
     prompt: str,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 512,
     verbose: bool = True,
 ) -> str:
     """Generate text for a single prompt.
@@ -96,11 +98,12 @@ def generate_single(
         Generated text (decoded)
     """
     # Encode prompt
-    prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
+    formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+    prompt_tokens = tokenizer.encode(formatted_prompt, bos=False, eos=False)
     prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
 
     if verbose:
-        print(f"\nPrompt: {prompt}")
+        print(f"\nPrompt: {formatted_prompt}")
         print(f"Prompt tokens: {len(prompt_tokens)}")
         print("\nGenerating: ", end="", flush=True)
 
@@ -109,7 +112,7 @@ def generate_single(
         request_id="single-request",
         prompt_tokens=prompt_array,
         max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eos_id,
+        eos_token_id=tokenizer.eot_id,
     )
 
     # Submit and collect results
@@ -215,8 +218,10 @@ def generate_concurrent(
                     output_text = tokenizer.decode(result["tokens"])
                     print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
                     print(f"  Output: {output_text[:80]}...")
-                    print(f"  Tokens: {len(result['tokens'])}, "
-                          f"Reason: {result['finish_reason']}\n")
+                    print(
+                        f"  Tokens: {len(result['tokens'])}, "
+                        f"Reason: {result['finish_reason']}\n"
+                    )
 
             except:
                 pass  # Queue empty
@@ -382,16 +387,17 @@ def main():
                 orchestrator,
                 tokenizer,
                 args.prompt,
-                max_new_tokens=args.max_new_tokens,
                 verbose=True,
             )
 
         else:
             print("\nNo mode specified. Use --prompt, --interactive, or --concurrent")
             print("Examples:")
-            print('  python inference.py --model_path /path/to/model --prompt "Once upon a time"')
-            print('  python inference.py --model_path /path/to/model --interactive')
-            print('  python inference.py --model_path /path/to/model --concurrent')
+            print(
+                '  python inference.py --model_path /path/to/model --prompt "Once upon a time"'
+            )
+            print("  python inference.py --model_path /path/to/model --interactive")
+            print("  python inference.py --model_path /path/to/model --concurrent")
 
     finally:
         # Cleanup

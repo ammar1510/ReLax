@@ -232,18 +232,16 @@ def build_attn_mask(
         Boolean attention mask of shape [bsz, seqlen, max_seqlen] where True means attend
         and False means don't attend.
     """
-    bsz = kv_cache.positions.shape[0]
-    
     max_seqlen = kv_cache.k.shape[3] 
     
-    cache_positions = kv_cache.positions 
+    cache_positions = kv_cache.seq_positions 
     
     def build_mask_for_sequence(true_length, cache_pos):
         """Build attention mask for one sequence.
 
         Args:
             true_length: Actual input length (non-padded)
-            cache_pos: Cache position (start_pos) for this sequence
+            cache_pos: Cache position (seq_position) for this sequence
         """
         query_offsets = jnp.arange(seqlen)  # [seqlen] - Static: [0, 1, 2, ..., seqlen-1]
         key_positions = jnp.arange(max_seqlen)  # [max_seqlen] - Static
@@ -291,7 +289,7 @@ def grouped_query_attention(
     """
     bsz, seqlen, dim = x.shape
 
-    start_positions = kv_cache.positions  # [bsz] - can be different per sequence
+    start_positions = kv_cache.seq_positions  # [bsz] - can be different per sequence
 
     # logger.debug(f"Start positions: {start_positions}, Sequence length: {seqlen}")
 
