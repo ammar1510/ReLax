@@ -78,6 +78,11 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     return model, params, config, tokenizer
 
 
+def generic_tokenizer(prompt: str, tokenizer: Tokenizer) -> List[int]:
+    formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+    return tokenizer.encode(formatted_prompt, bos=False, eos=False)
+
+
 def generate_single(
     orchestrator: InferenceOrchestrator,
     tokenizer: Tokenizer,
@@ -98,12 +103,11 @@ def generate_single(
         Generated text (decoded)
     """
     # Encode prompt
-    formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
-    prompt_tokens = tokenizer.encode(formatted_prompt, bos=False, eos=False)
+    prompt_tokens = generic_tokenizer(prompt, tokenizer)
     prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
 
     if verbose:
-        print(f"\nPrompt: {formatted_prompt}")
+        print(f"\nPrompt: {prompt}")
         print(f"Prompt tokens: {len(prompt_tokens)}")
         print("\nGenerating: ", end="", flush=True)
 
@@ -176,7 +180,7 @@ def generate_concurrent(
 
     for i, prompt in enumerate(prompts):
         # Encode prompt
-        prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
+        prompt_tokens = generic_tokenizer(prompt, tokenizer)
         prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
 
         # Create request
@@ -184,7 +188,7 @@ def generate_concurrent(
             request_id=f"request-{i}",
             prompt_tokens=prompt_array,
             max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eos_id,
+            eos_token_id=tokenizer.eot_id,
         )
 
         print(f"[{request.request_id}] Prompt: {prompt[:60]}...")
@@ -217,7 +221,7 @@ def generate_concurrent(
 
                     output_text = tokenizer.decode(result["tokens"])
                     print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
-                    print(f"  Output: {output_text[:80]}...")
+                    print(f"  Output: {output_text}")
                     print(
                         f"  Tokens: {len(result['tokens'])}, "
                         f"Reason: {result['finish_reason']}\n"
@@ -378,7 +382,7 @@ def main():
                 orchestrator,
                 tokenizer,
                 demo_prompts,
-                max_new_tokens=args.max_new_tokens,
+                max_new_tokens=512,
             )
 
         elif args.prompt:
