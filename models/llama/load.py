@@ -1,157 +1,224 @@
 """
-Functions to load model weights.
+Functions to load model weights from PyTorch checkpoint format.
+
+This module handles loading LLaMA weights from sharded .pth files
+in the PyTorch format, converting them to the ReLax model structure.
 """
 
-import jax
 import jax.numpy as jnp
-from safetensors.torch import safe_open
-from safetensors.flax import save_file, load_file
-import flax
-from flax.traverse_util import flatten_dict, unflatten_dict
-from pathlib import Path
-import numpy as np
 import torch
+from pathlib import Path
+from typing import Dict, Any
+import numpy as np
 
 from .config import ModelConfig
-from .model import LLaMa
 
 
-def load_llama_weights(model_path: str, config: ModelConfig) -> LLaMa:
+def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
     """
-    Loads LLaMa model weights from a .safetensors file into a LLaMa model instance.
+    Loads LLaMA model weights from PyTorch sharded .pth format.
+
     Args:
-        model_path: Path to the .safetensors file.
+        model_path: Path to directory containing *.pth files
         config: ModelConfig instance for the LLaMa model.
+
     Returns:
-        Parameters for the LLaMa model.
+        Flax parameter dictionary matching the LLaMa model structure.
+
+    PyTorch weight naming (input):
+        - model.embed_tokens.weight
+        - model.layers.{i}.self_attn.q_proj.weight
+        - model.layers.{i}.self_attn.k_proj.weight
+        - model.layers.{i}.self_attn.v_proj.weight
+        - model.layers.{i}.self_attn.o_proj.weight
+        - model.layers.{i}.mlp.gate_proj.weight
+        - model.layers.{i}.mlp.up_proj.weight
+        - model.layers.{i}.mlp.down_proj.weight
+        - model.layers.{i}.input_layernorm.weight
+        - model.layers.{i}.post_attention_layernorm.weight
+        - model.norm.weight
+        - lm_head.weight
+
+    ReLax model structure (output):
+        - tok_embeddings.embedding
+        - layer_{i}.wq, wk, wv, wo
+        - layer_{i}.w_gate, w_up, w_down
+        - layer_{i}.attention_norm_weight
+        - layer_{i}.ffn_norm_weight
+        - norm_weight
+        - output
     """
-    tensors = load_file(model_path)
-    params = unflatten_dict(tensors, sep=".")
+    model_path = Path(model_path)/"original"
+    
+    # Find all .pth checkpoint files
+    shard_files = sorted(model_path.glob("*.pth"))
+    print(model_path)
+    
+    if len(shard_files) == 0:
+        raise FileNotFoundError(
+            f"No .pth checkpoint files found in {model_path}\n"
+            f"Expected *.pth files"
+        )
+    
+    print(f"Loading model from {model_path}")
+    print(f"Found {len(shard_files)} checkpoint file(s)")
+    
+    # Load all weights from all shards
+    all_weights = {}
+    for shard_path in shard_files:
+        print(f"  Loading {shard_path.name}...")
+        checkpoint = torch.load(shard_path, map_location="cpu", weights_only=True)
+        # Convert PyTorch tensors to numpy arrays
+        for key, value in checkpoint.items():
+            if isinstance(value, torch.Tensor):
+                # Convert BFloat16 to float32 (numpy doesn't support bfloat16)
+                if value.dtype == torch.bfloat16:
+                    value = value.float()
+                all_weights[key] = value.detach().cpu().numpy()
+            else:
+                all_weights[key] = value
+    
+    print(f"Loaded {len(all_weights)} tensors total")
+
+    # Convert to ReLax format
+    params = _convert_hf_to_relax(all_weights, config)
 
     return params
 
 
-def pth_to_safetensors(pth_model_path: str, config_dir: str, output_dir: str):
+def _convert_hf_to_relax(
+    hf_weights: Dict[str, np.ndarray],
+    config: ModelConfig,
+) -> Dict[str, Any]:
     """
-    Reads model weights from a .pth file, converts them to JAX arrays
-    compatible with the LLaMa model, and saves them to a .safetensors file.
+    Convert PyTorch/HuggingFace weight format to ReLax model structure.
+
     Args:
-        pth_model_path: Path to the .pth file containing model weights.
-        config_dir: Path to the directory containing config.json.
-        output_dir: Directory where the .safetensors file will be saved.
+        hf_weights: Dictionary of PyTorch weights (numpy arrays)
+        config: Model configuration
+
+    Returns:
+        Flax parameter dictionary for ReLax LLaMa model
     """
-    # Load tensors from .pth file
-    tensors = torch.load(pth_model_path, map_location="cpu")
+    print("Converting PyTorch weights to ReLax format...")
 
-    config = ModelConfig.from_json_file(config_dir)
-
-    # This will be the final Flax parameter dictionary, structured to match model.py
     params = {}
-    torch_dtypes = {}
-    torch_dtypes["float32"] = torch.float32
-    torch_dtypes["float64"] = torch.float64
-    torch_dtypes["float16"] = torch.float16
-    torch_dtypes["bfloat16"] = torch.bfloat16
-    torch_dtypes["int8"] = torch.int8
 
     # Token embeddings
-    params["tok_embeddings"] = {
-        "embedding": jnp.asarray(
-            tensors["tok_embeddings.weight"].to(torch_dtypes[config.dtype]),
-            dtype=config.dtype,
-        )
-    }
+    # HF: model.embed_tokens.weight [vocab_size, dim]
+    # ReLax: tok_embeddings.embedding [vocab_size, dim]
+    embed_weight = hf_weights.get("tok_embeddings.weight")
+    if embed_weight is None:
+        raise ValueError("model.embed_tokens.weight not found in checkpoint")
 
-    # Final normalization
-    params["norm_weight"] = jnp.asarray(
-        tensors["norm.weight"].to(torch_dtypes[config.dtype]), dtype=config.dtype
-    )
-    params["output"] = jnp.asarray(
-        tensors["output.weight"].to(torch_dtypes[config.dtype]), dtype=config.dtype
-    ).T
+    params["tok_embeddings"] = {
+        "embedding": jnp.asarray(embed_weight, dtype=config.dtype)
+    }
+    print(f"  ✓ Embeddings: {embed_weight.shape}")
+
+    # Output layer (language model head)
+    # PyTorch: lm_head.weight [vocab_size, dim] or output.weight [dim, vocab_size] (if exists)
+    # Otherwise: use tied embeddings (reuse embed_tokens.weight)
+    # ReLax: output [dim, vocab_size]
+    output_weight = hf_weights.get("output.weight")
+    
+    params["output"] = jnp.asarray(output_weight.T, dtype=config.dtype)
+
+    # Final norm
+    # HF: model.norm.weight [dim]
+    # ReLax: norm_weight [dim]
+    norm = hf_weights.get("norm.weight")
+    params["norm_weight"] = jnp.asarray(norm, dtype=config.dtype)
 
     # Transformer layers
+    print(f"  Converting {config.n_layers} transformer layers...")
     for i in range(config.n_layers):
-        layer_prefix = f"layers.{i}."
+        layer_params = _convert_layer(hf_weights, i, config)
+        params[f"layer_{i}"] = layer_params
 
-        # Get all weights from the tensor dict
-        q_proj = jnp.asarray(
-            tensors[layer_prefix + "attention.wq.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        )
-        k_proj = jnp.asarray(
-            tensors[layer_prefix + "attention.wk.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        )
-        v_proj = jnp.asarray(
-            tensors[layer_prefix + "attention.wv.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        )
-        o_proj = jnp.asarray(
-            tensors[layer_prefix + "attention.wo.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        )
+        if i == 0:
+            # Print shapes for first layer as reference
+            print(f"    Layer 0 shapes:")
+            for k, v in layer_params.items():
+                print(f"      {k}: {v.shape}")
 
-        # Reshape attention weights to match the model's expected format (dim, n_heads, head_dim)
-        wq = q_proj.T.reshape(config.dim, config.n_heads, config.head_dim)
-        wk = k_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
-        wv = v_proj.T.reshape(config.dim, config.n_kv_heads, config.head_dim)
-        wo = o_proj.T
+    print(f"  ✓ Converted all {config.n_layers} layers")
 
-        # Get feed-forward weights
-        w_gate = jnp.asarray(
-            tensors[layer_prefix + "feed_forward.w1.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        ).T
-        w_down = jnp.asarray(
-            tensors[layer_prefix + "feed_forward.w2.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        ).T
-        w_up = jnp.asarray(
-            tensors[layer_prefix + "feed_forward.w3.weight"].to(
-                torch_dtypes[config.dtype]
-            ),
-            dtype=config.dtype,
-        ).T
+    return params
 
-        # Assign weights to the layer's parameter dictionary
-        # The key 'layers_i' is automatically created by Flax for lists of modules.
-        params[f"layer_{i}"] = {
-            "attention_norm_weight": jnp.asarray(
-                tensors[layer_prefix + "attention_norm.weight"].to(
-                    torch_dtypes[config.dtype]
-                ),
-                dtype=config.dtype,
-            ),
-            "ffn_norm_weight": jnp.asarray(
-                tensors[layer_prefix + "ffn_norm.weight"].to(
-                    torch_dtypes[config.dtype]
-                ),
-                dtype=config.dtype,
-            ),
-            "wq": wq,
-            "wk": wk,
-            "wv": wv,
-            "wo": wo,
-            "w_gate": w_gate,
-            "w_up": w_up,
-            "w_down": w_down,
-        }
 
-    # Save the parameters to a .safetensors file
-    output_path = Path(output_dir) / "model.safetensors"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(flatten_dict(params, sep="."), output_path)
-    print(f"Model weights saved to {output_path}")
+def _convert_layer(
+    hf_weights: Dict[str, np.ndarray],
+    layer_idx: int,
+    config: ModelConfig,
+) -> Dict[str, jnp.ndarray]:
+    """
+    Convert a single transformer layer from HF to ReLax format.
+
+    HF format:
+        - model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+        - model.layers.{i}.mlp.{gate,up,down}_proj.weight
+        - model.layers.{i}.input_layernorm.weight
+        - model.layers.{i}.post_attention_layernorm.weight
+
+    ReLax format:
+        - wq: [dim, n_heads, head_dim]
+        - wk: [dim, n_kv_heads, head_dim]
+        - wv: [dim, n_kv_heads, head_dim]
+        - wo: [n_heads * head_dim, dim]
+        - w_gate: [dim, ffn_hidden_dim]
+        - w_up: [dim, ffn_hidden_dim]
+        - w_down: [ffn_hidden_dim, dim]
+        - attention_norm_weight: [dim]
+        - ffn_norm_weight: [dim]
+    """
+    prefix = f"layers.{layer_idx}"
+
+    # Attention weights
+    # HF: [n_heads * head_dim, dim] or [n_kv_heads * head_dim, dim]
+    # ReLax: need to transpose and reshape
+    q_proj = hf_weights[f"{prefix}.attention.wq.weight"]  # [n_heads * head_dim, dim]
+    k_proj = hf_weights[f"{prefix}.attention.wk.weight"]  # [n_kv_heads * head_dim, dim]
+    v_proj = hf_weights[f"{prefix}.attention.wv.weight"]  # [n_kv_heads * head_dim, dim]
+    o_proj = hf_weights[f"{prefix}.attention.wo.weight"]  # [dim, n_heads * head_dim]
+
+    # Transpose and reshape for ReLax format
+    # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
+    wq = jnp.asarray(q_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_heads, config.head_dim
+    )
+    wk = jnp.asarray(k_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_kv_heads, config.head_dim
+    )
+    wv = jnp.asarray(v_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_kv_heads, config.head_dim
+    )
+    # o_proj: [dim, n_heads * head_dim] -> [n_heads * head_dim, dim]
+    wo = jnp.asarray(o_proj.T, dtype=config.dtype)
+
+    # MLP/Feed-forward weights
+    # HF: [ffn_hidden_dim, dim]
+    # ReLax: transpose to [dim, ffn_hidden_dim] or [ffn_hidden_dim, dim]
+    gate_proj = hf_weights[f"{prefix}.feed_forward.w1.weight"]  # [ffn_hidden_dim, dim]
+    up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]      # [ffn_hidden_dim, dim]
+    down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
+
+    w_gate = jnp.asarray(gate_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
+    w_up = jnp.asarray(up_proj.T, dtype=config.dtype)      # [dim, ffn_hidden_dim]
+    w_down = jnp.asarray(down_proj.T, dtype=config.dtype)  # [ffn_hidden_dim, dim]
+
+    # Normalization weights
+    attention_norm = hf_weights[f"{prefix}.attention_norm.weight"]
+    ffn_norm = hf_weights[f"{prefix}.ffn_norm.weight"]
+
+    return {
+        "wq": wq,
+        "wk": wk,
+        "wv": wv,
+        "wo": wo,
+        "w_gate": w_gate,
+        "w_up": w_up,
+        "w_down": w_down,
+        "attention_norm_weight": jnp.asarray(attention_norm, dtype=config.dtype),
+        "ffn_norm_weight": jnp.asarray(ffn_norm, dtype=config.dtype),
+    }
