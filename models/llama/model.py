@@ -171,13 +171,13 @@ class LLaMa(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,
-        true_lengths : jax.Array,
+        true_lengths: jax.Array,
         kv_cache: KVCache,
         mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
     ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        
+
         # Debug: After embeddings
         # h_np = np.array(h, dtype=np.float32)
         # print(f"\n[JAX] After embeddings:\n")
