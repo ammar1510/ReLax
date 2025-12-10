@@ -24,7 +24,6 @@ class TransformerBlock(nn.Module):
     args: ModelConfig
 
     def setup(self):
-        # Attention parameters
         self.attention = AttentionParams(
             wq=self.param(
                 "wq",
@@ -51,7 +50,6 @@ class TransformerBlock(nn.Module):
                 dtype=self.args.dtype,
             ),
         )
-        # Feed-forward parameters
         self.feed_forward = FeedForwardParams(
             w_gate=self.param(
                 "w_gate",
@@ -72,7 +70,6 @@ class TransformerBlock(nn.Module):
                 dtype=self.args.dtype,
             ),
         )
-        # Normalization layer parameters
         self.attention_norm_weight = self.param(
             "attention_norm_weight",
             nn.initializers.ones,
@@ -92,9 +89,8 @@ class TransformerBlock(nn.Module):
         freqs_cis: jax.Array,
         kv_cache: KVCache,
         layer_idx: int,
-        mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
+        mask: jax.Array,  
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        # Attention block
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
         attn_output, updated_cache = grouped_query_attention(
             h_norm,
@@ -104,23 +100,15 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             mask=mask,
         )
-        x = x + attn_output  # Residual connection
-        # Debug: After attention
-        # h_np = np.array(x, dtype=np.float32)
-        # logger.debug(f"Layer {layer_idx} - After attention: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
+        x = x + attn_output  
 
-        # Feed-forward block
         h_ffn_norm = rms_norm(x, self.ffn_norm_weight, eps=self.args.rms_norm_eps)
         ffn_output = feed_forward(
             h_ffn_norm,
             params=self.feed_forward,
             activation_fn=self.args.activation_fn,
         )
-        x = x + ffn_output  # Residual connection
-        # Debug: After feedforward (commented out for performance)
-        # h_np = np.array(x, dtype=np.float32)
-        # logger.debug(f"Layer {layer_idx} - After feedforward: Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
-
+        x = x + ffn_output  
         return x, updated_cache
 
 
@@ -128,7 +116,6 @@ class LLaMa(nn.Module):
     args: ModelConfig
 
     def setup(self):
-        # Token embeddings
         self.tok_embeddings = nn.Embed(
             num_embeddings=self.args.vocab_size,
             features=self.args.dim,
@@ -141,12 +128,10 @@ class LLaMa(nn.Module):
             for i in range(self.args.n_layers)
         ]
 
-        # Final normalization weight
         self.norm_weight = self.param(
             "norm_weight", nn.initializers.ones, (self.args.dim,), dtype=self.args.dtype
         )
 
-        # Final output layer
         self.output = self.param(
             "output",
             nn.initializers.normal(stddev=0.02),
@@ -154,8 +139,6 @@ class LLaMa(nn.Module):
             self.args.dtype,
         )
 
-        # Precompute RoPE frequencies
-        # Used float64 to match the precision of the torch/numpy implementation
         jax.config.update("jax_enable_x64", True)
         jax.config.update("jax_default_matmul_precision", "highest")
         self.freqs_cis = precompute_freqs_cis(
@@ -166,7 +149,6 @@ class LLaMa(nn.Module):
             use_scaled=self.args.use_scaled_rope,
         ).astype(self.args.dtype)
         jax.config.update("jax_enable_x64", False)
-        # jax.config.update("jax_default_matmul_precision", "default")
 
     def __call__(
         self,
@@ -178,23 +160,13 @@ class LLaMa(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
-        # Debug: After embeddings
-        # h_np = np.array(h, dtype=np.float32)
-        # print(f"\n[JAX] After embeddings:\n")
-        # print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
 
-        # Transformer layers
         for layer_idx, layer in enumerate(self.layers):
             h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask)
 
-        # Final normalization and output projection
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
-        # Debug: After final norm
-        # h_np = np.array(h, dtype=np.float32)
-        # print(f"\n[JAX] After final norm:\n")
-        # print(f"  Sample values (first batch, first position, first 10 dims): {h_np[0, 0, :10]}")
-        # Tie weights: use the token embedding matrix for the final linear layer
+        
         logits = jnp.einsum("bsd,dv->bsv", h, self.output)
         kv_cache = kv_cache.update_positions(true_lengths)
 
-        return logits, kv_cache  # Return logits and the updated KVCache
+        return logits, kv_cache  

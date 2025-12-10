@@ -13,7 +13,7 @@ from typing import Dict, Any
 import numpy as np
 
 from .config import ModelConfig
-from utils.sharding import get_partition_spec
+from utils.sharding import mesh_sharding,mesh_sharding
 
 
 def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
@@ -188,18 +188,18 @@ def _convert_layer(
     # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
     wq = jax.device_put(jnp.asarray(q_proj.T, dtype=config.dtype).reshape(
         config.dim, config.n_heads, config.head_dim
-    ),get_partition_spec("wq"))
+    ),mesh_sharding("wq"))
 
     wk = jax.device_put(jnp.asarray(k_proj.T, dtype=config.dtype).reshape(
         config.dim, config.n_kv_heads, config.head_dim
-    ),get_partition_spec("wk"))
+    ),mesh_sharding("wk"))
 
     wv = jax.device_put(jnp.asarray(v_proj.T, dtype=config.dtype).reshape(
         config.dim, config.n_kv_heads, config.head_dim
-    ),get_partition_spec("wv"))
+    ),mesh_sharding("wv"))
 
     # o_proj: [dim, n_heads * head_dim] -> [n_heads * head_dim, dim]
-    wo = jax.device_put(jnp.asarray(o_proj.T, dtype=config.dtype),get_partition_spec("wo"))
+    wo = jax.device_put(jnp.asarray(o_proj.T, dtype=config.dtype),mesh_sharding("wo"))
 
     # MLP/Feed-forward weights
     # HF: [ffn_hidden_dim, dim]
@@ -208,14 +208,14 @@ def _convert_layer(
     up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]      # [ffn_hidden_dim, dim]
     down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
 
-    w_gate = jax.device_put(jnp.asarray(gate_proj.T, dtype=config.dtype),get_partition_spec("w_gate"))  # [dim, ffn_hidden_dim]
-    w_up = jax.device_put(jnp.asarray(up_proj.T, dtype=config.dtype),get_partition_spec("w_up"))      # [dim, ffn_hidden_dim]
-    w_down = jax.device_put(jnp.asarray(down_proj.T, dtype=config.dtype),get_partition_spec("w_down"))  # [ffn_hidden_dim, dim]
+    w_gate = jax.device_put(jnp.asarray(gate_proj.T, dtype=config.dtype),mesh_sharding("w_gate"))  # [dim, ffn_hidden_dim]
+    w_up = jax.device_put(jnp.asarray(up_proj.T, dtype=config.dtype),mesh_sharding("w_up"))      # [dim, ffn_hidden_dim]
+    w_down = jax.device_put(jnp.asarray(down_proj.T, dtype=config.dtype),mesh_sharding("w_down"))  # [ffn_hidden_dim, dim]
 
     # Normalization weights
-    attention_norm = jax.device_put(jnp.asarray(hf_weights[f"{prefix}.attention_norm.weight"],dtype=config.dtype),get_partition_spec("attention_norm_weight"))
+    attention_norm = jax.device_put(jnp.asarray(hf_weights[f"{prefix}.attention_norm.weight"],dtype=config.dtype),mesh_sharding("attention_norm_weight"))
 
-    ffn_norm = jax.device_put(jnp.asarray(hf_weights[f"{prefix}.ffn_norm.weight"],dtype=config.dtype),get_partition_spec("ffn_norm_weight"))
+    ffn_norm = jax.device_put(jnp.asarray(hf_weights[f"{prefix}.ffn_norm.weight"],dtype=config.dtype),mesh_sharding("ffn_norm_weight"))
 
     return {
         "wq": wq,

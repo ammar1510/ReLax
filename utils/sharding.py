@@ -9,7 +9,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Legacy default mesh for backward compatibility
-default_mesh = jax.make_mesh((2, 2), ("x", "y"))
+default_mesh = jax.make_mesh((jax.devices(),1), ("x", "y"))
+
+def mesh_sharding(param_type:str, mesh:default_mesh)->NamedSharding:
+    pspec = get_partition_spec(param_type)
+    return NamedSharding(mesh,pspec)
+    
 
 
 # ============================================================================
@@ -105,38 +110,36 @@ FSDP_SHARDING_RULES = {
     "output": PS(None, "fsdp"),  # [dim, vocab_size] - shard vocab
 }
 
-
 def get_partition_spec(param_type: str) -> PS:
     """
-    Get PartitionSpec for a parameter based on its path in the pytree.
+    Return a PartitionSpec for a parameter name.
 
     Args:
-        param_type: String like 'wq' or 'tok_embeddings'
+        param_type: string name, e.g. 'wq', 'tok_embeddings', 'norm_weight'
 
     Returns:
-        PartitionSpec for that parameter
+        A PartitionSpec for sharding the parameter.
 
-    Examples:
-        >>> get_partition_spec(('layer_0', 'wq'))
-        PartitionSpec(None, 'fsdp', None)
-        >>> get_partition_spec(('tok_embeddings', 'embedding'))
-        PartitionSpec('fsdp', None)
-        >>> get_partition_spec(('norm_weight',))
-        PartitionSpec()
+    Raises:
+        ValueError: if no sharding rule is defined for the parameter.
     """
+    # Empty path → nothing to shard
     if len(param_type) == 0:
         return PS()
 
-    # Check if param name matches any sharding rule
+    # Explicit rule found
     if param_type in FSDP_SHARDING_RULES:
         return FSDP_SHARDING_RULES[param_type]
 
-    # Check for norm weights (any name containing 'norm')
+    # Norms → always replicate
     if "norm" in param_type.lower():
-        return PS()  # Replicate norms
+        return PS()
 
-    # Default: replicate small parameters
-    return PS()
+    # No rule found → this is an error
+    raise ValueError(
+        f"Sharding rule not found for parameter '{param_type}'. "
+        f"Add a rule to FSDP_SHARDING_RULES or handle this name explicitly."
+    )
 
 
 def get_data_sharding_spec(shape: tuple, batch_axis: int = 0) -> PS:
