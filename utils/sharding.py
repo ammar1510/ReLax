@@ -9,12 +9,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Legacy default mesh for backward compatibility
-default_mesh = jax.make_mesh((jax.devices(),1), ("x", "y"))
+default_mesh = jax.make_mesh((len(jax.devices()), 1), ("fsdp", "tp"))
 
-def mesh_sharding(param_type:str, mesh:default_mesh)->NamedSharding:
+
+def mesh_sharding(param_type: str, mesh: Mesh = default_mesh) -> NamedSharding:
     pspec = get_partition_spec(param_type)
-    return NamedSharding(mesh,pspec)
-    
+    return NamedSharding(mesh, pspec)
 
 
 # ============================================================================
@@ -109,6 +109,7 @@ FSDP_SHARDING_RULES = {
     # Output layer
     "output": PS(None, "fsdp"),  # [dim, vocab_size] - shard vocab
 }
+
 
 def get_partition_spec(param_type: str) -> PS:
     """
