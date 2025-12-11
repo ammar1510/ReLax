@@ -15,11 +15,14 @@ Usage:
     python inference.py --model_path /path/to/model --interactive
 """
 
+# Initialize JAX distributed BEFORE any JAX imports
+import jax
+jax.distributed.initialize()
+
 import argparse
 import time
 from pathlib import Path
 from typing import List, Optional
-import jax
 import jax.numpy as jnp
 
 from models.llama.model import LLaMa
@@ -345,9 +348,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    # multi-TPU inference
-    jax.distributed.initialize()
 
     # Load model
     print("Loading model...")
