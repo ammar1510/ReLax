@@ -19,7 +19,6 @@ import argparse
 import time
 from pathlib import Path
 from typing import List, Optional
-import jax
 import jax.numpy as jnp
 
 from models.llama.model import LLaMa
@@ -195,11 +194,12 @@ def generate_concurrent(
         print(f"            Tokens: {len(prompt_tokens)}")
 
         # Submit
-        response_queue = orchestrator.submit(request)
-        response_queues[request.request_id] = response_queue
-        requests.append(request)
+        if jax.process_index() == i:
+            response_queue = orchestrator.submit(request)
+            response_queues[request.request_id] = response_queue
+            requests.append(request)
 
-    print(f"\nProcessing {len(requests)} requests concurrently...\n")
+    print(f"\nProcessing {len(prompts)} requests concurrently...\n")
 
     # Collect results
     results = {}
@@ -344,6 +344,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # multi-TPU inference
+    jax.distributed.initialize()
 
     # Load model
     print("Loading model...")
