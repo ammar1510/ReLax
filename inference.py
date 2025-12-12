@@ -15,14 +15,11 @@ Usage:
     python inference.py --model_path /path/to/model --interactive
 """
 
-# Initialize JAX distributed BEFORE any JAX imports
-import jax
-jax.distributed.initialize()
-
 import argparse
 import time
 from pathlib import Path
 from typing import List, Optional
+import jax
 import jax.numpy as jnp
 
 from models.llama.model import LLaMa
@@ -247,6 +244,9 @@ def generate_concurrent(
     print(f"  Avg latency: {total_time / len(requests):.2f}s/request")
     print(f"{'='*80}\n")
 
+    # Synchronize all workers before returning to ensure they stay in sync
+    jax.experimental.multihost_utils.sync_global_devices("generate_concurrent_done")
+
     # Return outputs in order
     outputs = []
     for i in range(len(prompts)):
@@ -349,6 +349,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Initialize JAX distributed for multi-TPU inference
+    jax.distributed.initialize()
+
     # Load model
     print("Loading model...")
     model, params, config, tokenizer = load_model(
@@ -411,6 +414,10 @@ def main():
         # Cleanup
         print("\nShutting down...")
         orchestrator.stop()
+
+        # Synchronize all workers before exit to prevent barrier timeout
+        # This ensures all processes reach the shutdown point together
+        jax.experimental.multihost_utils.sync_global_devices("shutdown_sync")
         print("Done!")
 
 
