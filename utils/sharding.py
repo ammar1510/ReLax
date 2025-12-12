@@ -94,9 +94,9 @@ FSDP_SHARDING_RULES = {
     "tok_embeddings": PS("fsdp", None),  # [vocab_size, dim]
     "embedding": PS("fsdp", None),  # Alternative name for embeddings
     # Attention weights
-    "wq": PS(None, "fsdp", None),  # [dim, n_heads, head_dim] - shard heads
-    "wk": PS(None, "fsdp", None),  # [dim, n_kv_heads, head_dim] - shard kv_heads
-    "wv": PS(None, "fsdp", None),  # [dim, n_kv_heads, head_dim]
+    "wq": PS("fsdp", None, None),  # [dim, n_heads, head_dim] - shard heads
+    "wk": PS("fsdp", None, None),  # [dim, n_kv_heads, head_dim] - shard kv_heads
+    "wv": PS("fsdp", None, None),  # [dim, n_kv_heads, head_dim]
     "wo": PS("fsdp", None),  # [n_heads*head_dim, dim] - shard input dim
     # FFN weights - shard hidden dimension
     "w_gate": PS(None, "fsdp"),  # [dim, ffn_hidden_dim]
