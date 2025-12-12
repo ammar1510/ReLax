@@ -19,7 +19,9 @@ import argparse
 import time
 from pathlib import Path
 from typing import List, Optional
+# Initialize JAX distributed for multi-TPU inference
 import jax
+jax.distributed.initialize()
 import jax.numpy as jnp
 
 from models.llama.model import LLaMa
@@ -349,8 +351,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Initialize JAX distributed for multi-TPU inference
-    jax.distributed.initialize()
 
     # Load model
     print("Loading model...")
