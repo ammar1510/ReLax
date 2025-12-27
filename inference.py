@@ -24,6 +24,8 @@ import jax
 # TODO: Uncomment for multi-process testing
 # jax.distributed.initialize()
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
@@ -93,7 +95,7 @@ def generate_single(
     max_new_tokens: int = 512,
     verbose: bool = True,
 ) -> str:
-    """Generate text for a single prompt.
+    """Generate text for a single prompt (TEST: submits 2 prompts for batching).
 
     Args:
         orchestrator: Running InferenceOrchestrator instance
@@ -105,30 +107,41 @@ def generate_single(
     Returns:
         Generated text (decoded)
     """
-    # Encode prompt
-    prompt_tokens = generic_tokenizer(prompt, tokenizer)
-    prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
+    # TEST: Submit 2 prompts to fill the batch
+    prompts = [prompt, "Once upon a time"]
+
+    requests = []
+    response_queues = []
+
+    for i, p in enumerate(prompts):
+        prompt_tokens = generic_tokenizer(p, tokenizer)
+        prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
+
+        if verbose:
+            print(f"\nPrompt {i+1}: {p}")
+            print(f"Prompt tokens: {len(prompt_tokens)}")
+
+        # Create request
+        request = InferenceRequest(
+            request_id=f"request-{i}",
+            prompt_tokens=prompt_array,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eot_id,
+        )
+
+        response_queue = orchestrator.submit(request)
+        requests.append(request)
+        response_queues.append(response_queue)
 
     if verbose:
-        print(f"\nPrompt: {prompt}")
-        print(f"Prompt tokens: {len(prompt_tokens)}")
-        print("\nGenerating: ", end="", flush=True)
+        print("\nGenerating (showing first prompt only): ", end="", flush=True)
 
-    # Create request
-    request = InferenceRequest(
-        request_id="single-request",
-        prompt_tokens=prompt_array,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eot_id,
-    )
-
-    # Submit and collect results
-    response_queue = orchestrator.submit(request)
+    # Collect results from first prompt only (for display)
     generated_tokens = []
     start_time = time.time()
 
     while True:
-        result = response_queue.get()
+        result = response_queues[0].get()  # First prompt
 
         if result["status"] == "generating":
             token = result["token"]
@@ -360,11 +373,18 @@ def main():
         args.config_path,
     )
 
+    # Create mesh for single-device run
+    devices = np.array(jax.devices())
+    mesh = Mesh(devices, ("i",))
+    print(f"Created mesh with {len(devices)} device(s): {mesh}")
+
     # Create engine and orchestrator
     print(f"\nInitializing inference engine (max_slots={args.max_concurrent_slots})...")
     engine = InferenceEngine(
         model=model,
         params=params,
+        prefill_mesh=mesh,
+        generate_mesh=mesh,
         max_concurrent_slots=args.max_concurrent_slots,
         pad_id=tokenizer.pad_id,
     )

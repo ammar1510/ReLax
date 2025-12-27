@@ -97,8 +97,6 @@ class InferenceEngine:
         self,
         model: LLaMa,
         params: FrozenDict,
-        prefill_params: Optional[FrozenDict] = None,
-        generate_params: Optional[FrozenDict] = None,
         prefill_mesh: Optional[Mesh] = None,
         generate_mesh: Optional[Mesh] = None,
         max_concurrent_slots: int = 8,
@@ -109,21 +107,30 @@ class InferenceEngine:
 
         Args:
             model: LLaMa model instance
-            params: Model parameters (Flax FrozenDict)
+            params: Model parameters (Flax FrozenDict) - will be placed on both meshes
+            prefill_mesh: Optional mesh for prefill operations
+            generate_mesh: Optional mesh for generate operations (defaults to prefill_mesh)
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
             buckets: List of bucket sizes for prompt padding (default: power-of-2)
         """
         self.model = model
-        self.params = params
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
         self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
         self.prefill_mesh = prefill_mesh
         self.generate_mesh = generate_mesh or prefill_mesh
-        self.prefill_params = prefill_params or params
-        self.generate_params = generate_params or params
-        # the idea is to place prefill and generate params on separate mesh and run inference in disaggregated mode
+
+        # Place params on both meshes for disaggregated inference
+        if prefill_mesh is not None:
+            self.prefill_params = jax.block_until_ready(jax.device_put(params, prefill_mesh.devices))
+        else:
+            self.prefill_params = params
+
+        if self.generate_mesh is not None:
+            self.generate_params = jax.block_until_ready(jax.device_put(params, self.generate_mesh.devices))
+        else:
+            self.generate_params = params
 
         # Cache model config for convenience
         self.config = model.args
