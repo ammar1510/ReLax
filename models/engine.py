@@ -651,6 +651,7 @@ class InferenceOrchestrator:
         Args:
             requests: List of InferenceRequests to process together
         """
+        print(f"[Prefill] Processing batch of {len(requests)} requests")
         bsz = len(requests)
 
         # Find max length in batch
@@ -675,6 +676,7 @@ class InferenceOrchestrator:
 
         # Call batched prefill
         prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
+        print(f"[Prefill] Completed, sending to transfer backlog")
 
         # Unpack and send to transfer backlog
         for i, req in enumerate(requests):
@@ -762,6 +764,7 @@ class InferenceOrchestrator:
                         slot_idx,
                         request.request_id,
                     )
+                    print(f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}")
 
                     # Send slot assignment to detokenize thread
                     # Message format: (slot_idx, request, first_token)
@@ -803,6 +806,7 @@ class InferenceOrchestrator:
             # Detect by checking if data[0] is an integer (slot index)
             if isinstance(data[0], int) and len(data) == 3:
                 slot_idx, request, first_token = data
+                print(f"[Detokenize] Received first token for '{request.request_id}' in slot {slot_idx}")
 
                 # Initialize tracking for this slot
                 active_requests[slot_idx] = (request, [first_token])
@@ -838,6 +842,7 @@ class InferenceOrchestrator:
                             "request_id": request.request_id,
                             "finish_reason": "eos" if is_eos else "length"
                         })
+                        print(f"[Detokenize] Completed '{request.request_id}' ({len(tokens)} tokens, {'EOS' if is_eos else 'max length'})")
                         finished_slots.append(slot_idx)
                     else:
                         # Send streaming update
@@ -850,5 +855,6 @@ class InferenceOrchestrator:
                 for slot_idx in finished_slots:
                     del active_requests[slot_idx]
                     self._free_slots.put(slot_idx)
+                    print(f"[Detokenize] Freed slot {slot_idx}")
 
         print("[Detokenize Thread] Stopped")
