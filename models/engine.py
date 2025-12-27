@@ -123,12 +123,12 @@ class InferenceEngine:
 
         # Place params on both meshes for disaggregated inference
         if prefill_mesh is not None:
-            self.prefill_params = jax.block_until_ready(jax.device_put(params, prefill_mesh.devices))
+            self.prefill_params = jax.block_until_ready(jax.device_put(params, prefill_mesh))
         else:
             self.prefill_params = params
 
         if self.generate_mesh is not None:
-            self.generate_params = jax.block_until_ready(jax.device_put(params, self.generate_mesh.devices))
+            self.generate_params = jax.block_until_ready(jax.device_put(params, self.generate_mesh))
         else:
             self.generate_params = params
 
