@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import List, Optional
 # Initialize JAX distributed for multi-TPU inference
 import jax
-jax.distributed.initialize()
+# TODO: Uncomment for multi-process testing
+# jax.distributed.initialize()
 import jax.numpy as jnp
 
 from models.llama.model import LLaMa
@@ -196,11 +197,10 @@ def generate_concurrent(
         print(f"[{request.request_id}] Prompt: {prompt[:60]}...")
         print(f"            Tokens: {len(prompt_tokens)}")
 
-        # Submit
-        if jax.process_index() == i:
-            response_queue = orchestrator.submit(request)
-            response_queues[request.request_id] = response_queue
-            requests.append(request)
+        # Submit (single-process mode - all requests submitted)
+        response_queue = orchestrator.submit(request)
+        response_queues[request.request_id] = response_queue
+        requests.append(request)
 
     print(f"\nProcessing {len(prompts)} requests concurrently...\n")
 
@@ -247,7 +247,8 @@ def generate_concurrent(
     print(f"{'='*80}\n")
 
     # Synchronize all workers before returning to ensure they stay in sync
-    jax.experimental.multihost_utils.sync_global_devices("generate_concurrent_done")
+    # TODO: Uncomment for multi-process testing
+    # jax.experimental.multihost_utils.sync_global_devices("generate_concurrent_done")
 
     # Return outputs in order
     outputs = []
@@ -417,7 +418,8 @@ def main():
 
         # Synchronize all workers before exit to prevent barrier timeout
         # This ensures all processes reach the shutdown point together
-        jax.experimental.multihost_utils.sync_global_devices("shutdown_sync")
+        # TODO: Uncomment for multi-process testing
+        # jax.experimental.multihost_utils.sync_global_devices("shutdown_sync")
         print("Done!")
 
 
