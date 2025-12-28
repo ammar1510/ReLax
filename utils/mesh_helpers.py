@@ -1,8 +1,9 @@
 """Mesh and sharding helper utilities for distributed inference."""
 
-from typing import Optional
+from typing import Optional, Any
 import jax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
+from numpy import format_float_positional
 
 from utils.kvcache import KVCache
 
@@ -25,7 +26,7 @@ class MeshHelper:
         return mesh.axis_names[0]
 
     @staticmethod
-    def batch_axis_spec(mesh: Optional[Mesh], rank: int, batch_axis: int) -> P:
+    def batch_axis_spec(mesh: Optional[Mesh], rank: int, batch_axis: int) -> PS:
         """Create a partition spec with batch axis sharded.
 
         Args:
@@ -38,13 +39,13 @@ class MeshHelper:
         """
         axis_name = MeshHelper.get_axis_name(mesh)
         if axis_name is None:
-            return P()
+            return PS()
         spec = [None] * rank
         spec[batch_axis] = axis_name
-        return P(*spec)
+        return PS(*spec)
 
     @staticmethod
-    def put_on_mesh(value: jax.Array, mesh: Optional[Mesh], spec: P) -> jax.Array:
+    def put_on_mesh(value: jax.Array, mesh: Optional[Mesh], spec: PS) -> jax.Array:
         """Place an array on a mesh with the given sharding spec.
 
         Args:
@@ -89,3 +90,34 @@ class MeshHelper:
             v=MeshHelper.put_on_mesh(cache.v, mesh, v_spec),
             seq_positions=MeshHelper.put_on_mesh(cache.seq_positions, mesh, pos_spec),
         )
+
+    @staticmethod
+    def param_sharding(x, name: str, mesh: Mesh):
+        if "norm" in name or "freqs_cis" in name:
+            return PS()
+        if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
+            return MeshHelper.batch_axis_spec(mesh, x.ndim, 1)
+        if any(k in name for k in ("down", "output", "wo")):
+            return MeshHelper.batch_axis_spec(mesh, x.ndim, 0)
+        return PS()
+
+    @staticmethod
+    def shard_params(params: Any, mesh: Mesh) -> Any:
+        """Apply parameter sharding to a pytree of parameters.
+
+        Args:
+            params: Pytree of parameters
+            mesh: JAX mesh for sharding
+
+        Returns:
+            Pytree of PartitionSpecs matching the structure of params
+        """
+
+        def get_spec(path, x):
+            # Convert path to string name (e.g., ('layers', 0, 'attention', 'wq') -> 'layers.0.attention.wq')
+            name = ".".join(
+                str(key.key) if hasattr(key, "key") else str(key) for key in path
+            )
+            return MeshHelper.param_sharding(x, name, mesh)
+
+        return jax.tree.map_with_path(get_spec, params)

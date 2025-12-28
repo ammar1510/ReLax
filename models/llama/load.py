@@ -13,7 +13,6 @@ from typing import Dict, Any
 import numpy as np
 
 from .config import ModelConfig
-from utils.sharding import mesh_sharding
 
 
 def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
@@ -113,9 +112,7 @@ def _convert_hf_to_relax(
         raise ValueError("model.embed_tokens.weight not found in checkpoint")
 
     params["tok_embeddings"] = {
-        "embedding": jax.device_put(
-            jnp.asarray(embed_weight, dtype=config.dtype), mesh_sharding("embedding")
-        )
+        "embedding": jnp.asarray(embed_weight, dtype=config.dtype)
     }
     print(f"  ✓ Embeddings: {embed_weight.shape}")
 
@@ -125,17 +122,13 @@ def _convert_hf_to_relax(
     # ReLax: output [dim, vocab_size]
     output_weight = hf_weights.get("output.weight")
 
-    params["output"] = jax.device_put(
-        jnp.asarray(output_weight.T, dtype=config.dtype), mesh_sharding("output")
-    )
+    params["output"] = jnp.asarray(output_weight.T, dtype=config.dtype)
 
     # Final norm
     # HF: model.norm.weight [dim]
     # ReLax: norm_weight [dim]
     norm = hf_weights.get("norm.weight")
-    params["norm_weight"] = jax.device_put(
-        jnp.asarray(norm, dtype=config.dtype), mesh_sharding("norm_weight")
-    )
+    params["norm_weight"] = jnp.asarray(norm, dtype=config.dtype)
 
     # Transformer layers
     print(f"  Converting {config.n_layers} transformer layers...")
@@ -191,29 +184,20 @@ def _convert_layer(
 
     # Transpose and reshape for ReLax format
     # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
-    wq = jax.device_put(
-        jnp.asarray(q_proj.T, dtype=config.dtype).reshape(
-            config.dim, config.n_heads, config.head_dim
-        ),
-        mesh_sharding("wq"),
+    wq = jnp.asarray(q_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_heads, config.head_dim
     )
 
-    wk = jax.device_put(
-        jnp.asarray(k_proj.T, dtype=config.dtype).reshape(
-            config.dim, config.n_kv_heads, config.head_dim
-        ),
-        mesh_sharding("wk"),
+    wk = jnp.asarray(k_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_kv_heads, config.head_dim
     )
 
-    wv = jax.device_put(
-        jnp.asarray(v_proj.T, dtype=config.dtype).reshape(
-            config.dim, config.n_kv_heads, config.head_dim
-        ),
-        mesh_sharding("wv"),
+    wv = jnp.asarray(v_proj.T, dtype=config.dtype).reshape(
+        config.dim, config.n_kv_heads, config.head_dim
     )
 
     # o_proj: [dim, n_heads * head_dim] -> [n_heads * head_dim, dim]
-    wo = jax.device_put(jnp.asarray(o_proj.T, dtype=config.dtype), mesh_sharding("wo"))
+    wo = jnp.asarray(o_proj.T, dtype=config.dtype)
 
     # MLP/Feed-forward weights
     # HF: [ffn_hidden_dim, dim]
@@ -222,25 +206,17 @@ def _convert_layer(
     up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]  # [ffn_hidden_dim, dim]
     down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
 
-    w_gate = jax.device_put(
-        jnp.asarray(gate_proj.T, dtype=config.dtype), mesh_sharding("w_gate")
-    )  # [dim, ffn_hidden_dim]
-    w_up = jax.device_put(
-        jnp.asarray(up_proj.T, dtype=config.dtype), mesh_sharding("w_up")
-    )  # [dim, ffn_hidden_dim]
-    w_down = jax.device_put(
-        jnp.asarray(down_proj.T, dtype=config.dtype), mesh_sharding("w_down")
-    )  # [ffn_hidden_dim, dim]
+    w_gate = jnp.asarray(gate_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
+    w_up = jnp.asarray(up_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
+    w_down = jnp.asarray(down_proj.T, dtype=config.dtype)  # [ffn_hidden_dim, dim]
 
     # Normalization weights
-    attention_norm = jax.device_put(
-        jnp.asarray(hf_weights[f"{prefix}.attention_norm.weight"], dtype=config.dtype),
-        mesh_sharding("attention_norm_weight"),
+    attention_norm = jnp.asarray(
+        hf_weights[f"{prefix}.attention_norm.weight"], dtype=config.dtype
     )
 
-    ffn_norm = jax.device_put(
-        jnp.asarray(hf_weights[f"{prefix}.ffn_norm.weight"], dtype=config.dtype),
-        mesh_sharding("ffn_norm_weight"),
+    ffn_norm = jnp.asarray(
+        hf_weights[f"{prefix}.ffn_norm.weight"], dtype=config.dtype
     )
 
     return {

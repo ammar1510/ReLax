@@ -89,7 +89,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: jax.Array,
         kv_cache: KVCache,
         layer_idx: int,
-        mask: jax.Array,  
+        mask: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         h_norm = rms_norm(x, self.attention_norm_weight, eps=self.args.rms_norm_eps)
         attn_output, updated_cache = grouped_query_attention(
@@ -100,7 +100,7 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             mask=mask,
         )
-        x = x + attn_output  
+        x = x + attn_output
 
         h_ffn_norm = rms_norm(x, self.ffn_norm_weight, eps=self.args.rms_norm_eps)
         ffn_output = feed_forward(
@@ -108,7 +108,7 @@ class TransformerBlock(nn.Module):
             params=self.feed_forward,
             activation_fn=self.args.activation_fn,
         )
-        x = x + ffn_output  
+        x = x + ffn_output
         return x, updated_cache
 
 
@@ -160,13 +160,12 @@ class LLaMa(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
-
         for layer_idx, layer in enumerate(self.layers):
             h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask)
 
         h = rms_norm(h, self.norm_weight, eps=self.args.rms_norm_eps)
-        
+
         logits = jnp.einsum("bsd,dv->bsv", h, self.output)
         kv_cache = kv_cache.update_positions(true_lengths)
 
-        return logits, kv_cache  
+        return logits, kv_cache

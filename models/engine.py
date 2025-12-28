@@ -97,8 +97,8 @@ class InferenceEngine:
         self,
         model: LLaMa,
         params: FrozenDict,
-        prefill_mesh: Optional[Mesh] = None,
-        generate_mesh: Optional[Mesh] = None,
+        prefill_mesh: Mesh,
+        generate_mesh: Mesh,
         max_concurrent_slots: int = 8,
         pad_id: int = 0,
         buckets: Optional[List[int]] = None,
@@ -122,15 +122,13 @@ class InferenceEngine:
         self.generate_mesh = generate_mesh or prefill_mesh
 
         # Place params on both meshes for disaggregated inference
-        if prefill_mesh is not None:
-            self.prefill_params = jax.block_until_ready(jax.device_put(params, prefill_mesh))
-        else:
-            self.prefill_params = params
+        self.prefill_params = jax.block_until_ready(
+            MeshHelper.shard_params(params, self.prefill_mesh)
+        )
 
-        if self.generate_mesh is not None:
-            self.generate_params = jax.block_until_ready(jax.device_put(params, self.generate_mesh))
-        else:
-            self.generate_params = params
+        self.generate_params = jax.block_until_ready(
+            MeshHelper.shard_params(params, self.generate_mesh)
+        )
 
         # Cache model config for convenience
         self.config = model.args
@@ -751,10 +749,12 @@ class InferenceOrchestrator:
                 # Block if ALL slots are inactive (ensures at least one request before generate)
                 # Use int() to convert to Python scalar for comparison
                 active_count = int(jnp.sum(decode_state.active_mask))
-                block = (active_count == 0)
+                block = active_count == 0
 
                 try:
-                    prefill_result = self._transfer_backlog.get(block=block, timeout=1.0)
+                    prefill_result = self._transfer_backlog.get(
+                        block=block, timeout=1.0
+                    )
 
                     # CRITICAL: Transfer to generate mesh before insertion
                     prefill_result = self.engine.transfer_prefill_to_generate(
@@ -771,11 +771,15 @@ class InferenceOrchestrator:
                         slot_idx,
                         request.request_id,
                     )
-                    print(f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}")
+                    print(
+                        f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}"
+                    )
 
                     # Send slot assignment to detokenize thread
                     # Message format: (slot_idx, request, first_token)
-                    self._detokenize_backlog.put((slot_idx, request, first_token), block=True)
+                    self._detokenize_backlog.put(
+                        (slot_idx, request, first_token), block=True
+                    )
 
                 except queue.Empty:
                     # Put slot back if no request available
@@ -813,16 +817,17 @@ class InferenceOrchestrator:
             # Detect by checking if data[0] is an integer (slot index)
             if isinstance(data[0], int) and len(data) == 3:
                 slot_idx, request, first_token = data
-                print(f"[Detokenize] Received first token for '{request.request_id}' in slot {slot_idx}")
+                print(
+                    f"[Detokenize] Received first token for '{request.request_id}' in slot {slot_idx}"
+                )
 
                 # Initialize tracking for this slot
                 active_requests[slot_idx] = (request, [first_token])
 
                 # Send first token to user
-                request.response_queue.put({
-                    "status": "generating",
-                    "token": first_token
-                })
+                request.response_queue.put(
+                    {"status": "generating", "token": first_token}
+                )
                 continue
 
             # Case 2: Generate step - (generate_timestep, new_tokens)
@@ -838,25 +843,28 @@ class InferenceOrchestrator:
                     tokens.append(token)
 
                     # Check for completion
-                    is_eos = (token == request.eos_token_id)
-                    is_max_length = (len(tokens) >= request.max_new_tokens)
+                    is_eos = token == request.eos_token_id
+                    is_max_length = len(tokens) >= request.max_new_tokens
 
                     if is_eos or is_max_length:
                         # Send final response
-                        request.response_queue.put({
-                            "status": "complete",
-                            "tokens": tokens,
-                            "request_id": request.request_id,
-                            "finish_reason": "eos" if is_eos else "length"
-                        })
-                        print(f"[Detokenize] Completed '{request.request_id}' ({len(tokens)} tokens, {'EOS' if is_eos else 'max length'})")
+                        request.response_queue.put(
+                            {
+                                "status": "complete",
+                                "tokens": tokens,
+                                "request_id": request.request_id,
+                                "finish_reason": "eos" if is_eos else "length",
+                            }
+                        )
+                        print(
+                            f"[Detokenize] Completed '{request.request_id}' ({len(tokens)} tokens, {'EOS' if is_eos else 'max length'})"
+                        )
                         finished_slots.append(slot_idx)
                     else:
                         # Send streaming update
-                        request.response_queue.put({
-                            "status": "generating",
-                            "token": token
-                        })
+                        request.response_queue.put(
+                            {"status": "generating", "token": token}
+                        )
 
                 # Free finished slots
                 for slot_idx in finished_slots:
