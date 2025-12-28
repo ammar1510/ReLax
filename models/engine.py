@@ -749,9 +749,7 @@ class InferenceOrchestrator:
                 # Use int() to convert to Python scalar for comparison
 
                 try:
-                    prefill_result = self._transfer_backlog.get(
-                        block=block, timeout=1.0
-                    )
+                    prefill_result = self._transfer_backlog.get(block=True, timeout=1.0)
 
                     # CRITICAL: Transfer to generate mesh before insertion
                     prefill_result = self.engine.transfer_prefill_to_generate(
