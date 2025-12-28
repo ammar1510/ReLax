@@ -376,11 +376,11 @@ def main():
 
     # Create mesh for single-device run
     all_devices = np.array(jax.devices())
-    prefill_mesh = Mesh(all_devices[: len(all_devices) / 2], "i")
-    generate_mesh = Mesh(all_devices[len(all_devices) / 2 :], "i")
+    prefill_mesh = Mesh(all_devices[: len(all_devices) // 2], "i")
+    generate_mesh = Mesh(all_devices[len(all_devices) // 2 :], "i")
 
-    print(f"Created prefill mesh with {len(all_devices)/2} device(s): {prefill_mesh}")
-    print(f"Created generate mesh with {len(all_devices)/2} device(s): {generate_mesh}")
+    print(f"Created prefill mesh with {len(all_devices)//2} device(s): {prefill_mesh}")
+    print(f"Created generate mesh with {len(all_devices)//2} device(s): {generate_mesh}")
 
     # Create engine and orchestrator
     print(f"\nInitializing inference engine (max_slots={args.max_concurrent_slots})...")
