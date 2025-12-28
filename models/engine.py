@@ -795,9 +795,12 @@ class InferenceOrchestrator:
             # PHASE 2: ALWAYS generate (no conditional) - ensures device sync
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
 
+            # Gather tokens while all hosts are synchronized
+            new_tokens_gathered = multihost_utils.process_allgather(new_tokens, tiled=True)
+
             # PHASE 3: Send generated tokens to detokenize thread
-            # Message format: (generate_timestep, new_tokens)
-            self._detokenize_backlog.put((generate_timestep, new_tokens), block=True)
+            # Message format: (generate_timestep, new_tokens_gathered)
+            self._detokenize_backlog.put((generate_timestep, new_tokens_gathered), block=True)
             generate_timestep += 1
 
         print("[Generate Thread] Stopped")
@@ -835,15 +838,12 @@ class InferenceOrchestrator:
                 )
                 continue
 
-            # Case 2: Generate step - (generate_timestep, new_tokens)
+            # Case 2: Generate step - (generate_timestep, new_tokens_gathered)
             # Detect by checking if data[0] is int and data[1] is jax.Array
             if isinstance(data[0], int) and len(data) == 2:
-                generate_timestep, new_tokens = data
+                generate_timestep, new_tokens_gathered = data
 
-                # Gather sharded tokens before extracting scalars
-                new_tokens_gathered = multihost_utils.process_allgather(
-                    new_tokens, tiled=True
-                )
+                # Tokens already gathered in generate loop (all hosts synchronized)
 
                 # Process each active slot
                 finished_slots = []
