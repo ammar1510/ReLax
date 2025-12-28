@@ -19,8 +19,10 @@ import argparse
 import time
 from pathlib import Path
 from typing import List, Optional
+
 # Initialize JAX distributed for multi-TPU inference
 import jax
+
 # TODO: Uncomment for multi-process testing
 # jax.distributed.initialize()
 import jax.numpy as jnp
@@ -365,7 +367,6 @@ def main():
 
     args = parser.parse_args()
 
-
     # Load model
     print("Loading model...")
     model, params, config, tokenizer = load_model(
@@ -374,17 +375,20 @@ def main():
     )
 
     # Create mesh for single-device run
-    devices = np.array(jax.devices())
-    mesh = Mesh(devices, ("i",))
-    print(f"Created mesh with {len(devices)} device(s): {mesh}")
+    all_devices = np.array(jax.devices())
+    prefill_mesh = Mesh(all_devices[: len(all_devices) / 2], "i")
+    generate_mesh = Mesh(all_devices[len(all_devices) / 2 :], "i")
+
+    print(f"Created prefill mesh with {len(all_devices)/2} device(s): {prefill_mesh}")
+    print(f"Created generate mesh with {len(all_devices)/2} device(s): {generate_mesh}")
 
     # Create engine and orchestrator
     print(f"\nInitializing inference engine (max_slots={args.max_concurrent_slots})...")
     engine = InferenceEngine(
         model=model,
         params=params,
-        prefill_mesh=mesh,
-        generate_mesh=mesh,
+        prefill_mesh=prefill_mesh,
+        generate_mesh=generate_mesh,
         max_concurrent_slots=args.max_concurrent_slots,
         pad_id=tokenizer.pad_id,
     )
