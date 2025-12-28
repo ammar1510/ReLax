@@ -736,11 +736,6 @@ class InferenceOrchestrator:
 
         # Initialize generate timestep counter
         generate_timestep = 0
-
-        @jit
-        def any_active(active_mask: jax.Array):
-            return jnp.sum(active_mask)
-
         while self._running:
             # PHASE 1: Insert one request from transfer_backlog (if available and slot free)
             try:
@@ -752,12 +747,10 @@ class InferenceOrchestrator:
                 # Determine blocking behavior (JetStream pattern)
                 # Block if ALL slots are inactive (ensures at least one request before generate)
                 # Use int() to convert to Python scalar for comparison
-                active_count = int(any_active(decode_state.active_mask))
-                block = active_count == 0
 
                 try:
                     prefill_result = self._transfer_backlog.get(
-                        block=block, timeout=1.0
+                        block=True, timeout=0.5
                     )
 
                     # CRITICAL: Transfer to generate mesh before insertion
