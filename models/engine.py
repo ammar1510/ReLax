@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 from flax.core import FrozenDict
 from jax.sharding import Mesh, PartitionSpec as PS
 
@@ -644,10 +645,15 @@ class InferenceOrchestrator:
             seq_positions=cache.seq_positions[idx : idx + 1],
         )
 
+        # Gather sharded arrays before extracting scalars
+        seq_length_gathered = multihost_utils.process_allgather(
+            batched_result["seq_lengths"][idx]
+        )
+
         return {
             "cache": single_cache,
             "next_token": batched_result["next_tokens"][idx],
-            "seq_length": batched_result["seq_lengths"][idx].item(),
+            "seq_length": seq_length_gathered.item(),
         }
 
     def _process_batch(self, requests: List[InferenceRequest]):
@@ -757,7 +763,11 @@ class InferenceOrchestrator:
                     )
 
                     request = prefill_result["request"]
-                    first_token = prefill_result["next_token"].item()  # Extract scalar
+                    # Gather sharded array before extracting scalar
+                    first_token_gathered = multihost_utils.process_allgather(
+                        prefill_result["next_token"]
+                    )
+                    first_token = first_token_gathered.item()  # Extract scalar
 
                     # Insert into decode state
                     decode_state = self.engine.insert_into_slot(
@@ -830,11 +840,14 @@ class InferenceOrchestrator:
             if isinstance(data[0], int) and len(data) == 2:
                 generate_timestep, new_tokens = data
 
+                # Gather sharded tokens before extracting scalars
+                new_tokens_gathered = multihost_utils.process_allgather(new_tokens)
+
                 # Process each active slot
                 finished_slots = []
 
                 for slot_idx, (request, tokens) in list(active_requests.items()):
-                    token = new_tokens[slot_idx, 0].item()
+                    token = new_tokens_gathered[slot_idx, 0].item()
                     tokens.append(token)
 
                     # Check for completion
