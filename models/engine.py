@@ -750,7 +750,7 @@ class InferenceOrchestrator:
 
                 try:
                     prefill_result = self._transfer_backlog.get(
-                        block=True, timeout=0.5
+                        block=block, timeout=1.0
                     )
 
                     # CRITICAL: Transfer to generate mesh before insertion
