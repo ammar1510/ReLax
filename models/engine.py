@@ -647,7 +647,7 @@ class InferenceOrchestrator:
 
         # Gather sharded arrays before extracting scalars
         seq_length_gathered = multihost_utils.process_allgather(
-            batched_result["seq_lengths"][idx]
+            batched_result["seq_lengths"][idx], tiled=True
         )
 
         return {
@@ -765,7 +765,7 @@ class InferenceOrchestrator:
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
                     first_token_gathered = multihost_utils.process_allgather(
-                        prefill_result["next_token"]
+                        prefill_result["next_token"], tiled=True
                     )
                     first_token = first_token_gathered.item()  # Extract scalar
 
@@ -841,7 +841,9 @@ class InferenceOrchestrator:
                 generate_timestep, new_tokens = data
 
                 # Gather sharded tokens before extracting scalars
-                new_tokens_gathered = multihost_utils.process_allgather(new_tokens)
+                new_tokens_gathered = multihost_utils.process_allgather(
+                    new_tokens, tiled=True
+                )
 
                 # Process each active slot
                 finished_slots = []
