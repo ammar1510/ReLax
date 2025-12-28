@@ -62,7 +62,9 @@ class MeshHelper:
         return jax.block_until_ready(value)
 
     @staticmethod
-    def place_kv_cache(cache: KVCache, mesh: Optional[Mesh]) -> KVCache:
+    def place_kv_cache(
+        cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
+    ) -> KVCache:
         """Place a KV cache on a mesh with appropriate sharding.
 
         The cache is sharded along the batch dimension (axis 1 for k/v,
@@ -79,11 +81,20 @@ class MeshHelper:
             return cache
 
         # Create sharding specs for k, v, and seq_positions
-        k_spec = MeshHelper.batch_axis_spec(mesh, rank=len(cache.k.shape), batch_axis=1)
-        v_spec = MeshHelper.batch_axis_spec(mesh, rank=len(cache.k.shape), batch_axis=1)
-        pos_spec = MeshHelper.batch_axis_spec(
-            mesh, rank=len(cache.seq_positions.shape), batch_axis=0
-        )
+        if pspec is None:
+            k_spec = MeshHelper.batch_axis_spec(
+                mesh, rank=len(cache.k.shape), batch_axis=1
+            )
+            v_spec = MeshHelper.batch_axis_spec(
+                mesh, rank=len(cache.k.shape), batch_axis=1
+            )
+            pos_spec = MeshHelper.batch_axis_spec(
+                mesh, rank=len(cache.seq_positions.shape), batch_axis=0
+            )
+        else:
+            k_spec = pspec
+            v_spec = pspec
+            pos_spec = pspec
 
         return KVCache(
             k=MeshHelper.put_on_mesh(cache.k, mesh, k_spec),

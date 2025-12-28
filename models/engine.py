@@ -23,7 +23,7 @@ from typing import Optional, Tuple, Dict, List
 import jax
 import jax.numpy as jnp
 from flax.core import FrozenDict
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as PS
 
 from models.llama.model import LLaMa
 from utils.kvcache import KVCache
@@ -208,10 +208,10 @@ class InferenceEngine:
             return prefill_result
         transferred = dict(prefill_result)
         transferred["cache"] = self.mesh_helper.place_kv_cache(
-            prefill_result["cache"], self.generate_mesh
+            prefill_result["cache"], self.generate_mesh, PS()
         )
         transferred["next_token"] = self.mesh_helper.put_on_mesh(
-            prefill_result["next_token"], self.generate_mesh, P()
+            prefill_result["next_token"], self.generate_mesh, PS()
         )
         return transferred
 
@@ -681,7 +681,7 @@ class InferenceOrchestrator:
 
         # Call batched prefill
         prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
-        print(f"[Prefill] Completed, sending to transfer backlog")
+        print("[Prefill] Completed, sending to transfer backlog")
 
         # Unpack and send to transfer backlog
         for i, req in enumerate(requests):
