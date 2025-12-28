@@ -110,14 +110,23 @@ class MeshHelper:
             mesh: JAX mesh for sharding
 
         Returns:
-            Pytree of PartitionSpecs matching the structure of params
+            Pytree of parameters with sharding applied
         """
 
-        def get_spec(path, x):
-            # Convert path to string name (e.g., ('layers', 0, 'attention', 'wq') -> 'layers.0.attention.wq')
-            name = ".".join(
-                str(key.key) if hasattr(key, "key") else str(key) for key in path
-            )
-            return MeshHelper.param_sharding(x, name, mesh)
+        def _get_key_name(key) -> str:
+            """Extract string name from a JAX pytree path key."""
+            if hasattr(key, "key"):  # DictKey
+                return str(key.key)
+            elif hasattr(key, "idx"):  # SequenceKey
+                return str(key.idx)
+            elif hasattr(key, "name"):  # GetAttrKey
+                return str(key.name)
+            return str(key)
 
-        return jax.tree.map_with_path(get_spec, params)
+        def shard_leaf(path, x):
+            # Convert path to string name for sharding decisions
+            name = "/".join(_get_key_name(k) for k in path)
+            spec = MeshHelper.param_sharding(x, name, mesh)
+            return MeshHelper.put_on_mesh(x, mesh, spec)
+
+        return jax.tree_util.tree_map_with_path(shard_leaf, params)
