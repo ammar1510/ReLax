@@ -25,13 +25,14 @@ import jax.numpy as jnp
 from jax.experimental import multihost_utils
 from flax.core import FrozenDict
 from jax.sharding import Mesh, PartitionSpec as PS
+import numpy as np
+from jax import jit
 
 from models.llama.model import LLaMa
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
-from jax import jit
 
 
 @dataclass
@@ -121,6 +122,7 @@ class InferenceEngine:
         self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
         self.prefill_mesh = prefill_mesh
         self.generate_mesh = generate_mesh or prefill_mesh
+        self.detokenize_mesh = Mesh(np.array(jax.devices()), axis_names=("i"))
 
         # Place params on both meshes for disaggregated inference
         self.prefill_params = jax.block_until_ready(
@@ -646,8 +648,8 @@ class InferenceOrchestrator:
         )
 
         # Gather sharded arrays before extracting scalars
-        seq_length_gathered = multihost_utils.process_allgather(
-            batched_result["seq_lengths"][idx], tiled=True
+        seq_length_gathered = jax.device_put(
+            batched_result["seq_lengths"][idx], self.engine.detokenize_mesh
         )
 
         return {
@@ -764,8 +766,8 @@ class InferenceOrchestrator:
 
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
-                    first_token_gathered = multihost_utils.process_allgather(
-                        prefill_result["next_token"], tiled=True
+                    first_token_gathered = jax.device_put(
+                        prefill_result["next_token"], self.engine.detokenize_mesh
                     )
                     first_token = first_token_gathered.item()  # Extract scalar
 
@@ -841,8 +843,8 @@ class InferenceOrchestrator:
                 generate_timestep, new_tokens = data
 
                 # Gather sharded tokens before extracting scalars
-                new_tokens_gathered = multihost_utils.process_allgather(
-                    new_tokens, tiled=True
+                new_tokens_gathered = jax.device_put(
+                    new_tokens, self.engine.detokenize_mesh
                 )
 
                 # Process each active slot
