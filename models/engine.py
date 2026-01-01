@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jax.experimental import multihost_utils
 from flax.core import FrozenDict
 from jax.sharding import Mesh, PartitionSpec as PS
+from jaxlib.xla_client import NamedSharding
 import numpy as np
 from jax import jit
 
@@ -122,7 +123,8 @@ class InferenceEngine:
         self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
         self.prefill_mesh = prefill_mesh
         self.generate_mesh = generate_mesh or prefill_mesh
-        self.detokenize_mesh = Mesh(np.array(jax.devices()), axis_names=("i"))
+        detokenize_mesh = Mesh(np.array(jax.devices()), axis_names=("i"))
+        self.detokenize_sharding = NamedSharding(detokenize_mesh, PS())
 
         # Place params on both meshes for disaggregated inference
         self.prefill_params = jax.block_until_ready(
@@ -649,8 +651,9 @@ class InferenceOrchestrator:
 
         # Gather sharded arrays before extracting scalars
         seq_length_gathered = jax.device_put(
-            batched_result["seq_lengths"][idx], self.engine.detokenize_mesh
+            batched_result["seq_lengths"][idx], self.engine.detokenize_sharding
         )
+        jax.block_until_ready(seq_length_gathered)
 
         return {
             "cache": single_cache,
@@ -767,8 +770,9 @@ class InferenceOrchestrator:
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
                     first_token_gathered = jax.device_put(
-                        prefill_result["next_token"], self.engine.detokenize_mesh
+                        prefill_result["next_token"], self.engine.detokenize_sharding
                     )
+                    jax.block_until_ready(first_token_gathered)
                     first_token = first_token_gathered.item()  # Extract scalar
 
                     # Insert into decode state
@@ -844,8 +848,9 @@ class InferenceOrchestrator:
 
                 # Gather sharded tokens before extracting scalars
                 new_tokens_gathered = jax.device_put(
-                    new_tokens, self.engine.detokenize_mesh
+                    new_tokens, self.engine.detokenize_sharding
                 )
+                jax.block_until_ready(new_tokens_gathered)
 
                 # Process each active slot
                 finished_slots = []
