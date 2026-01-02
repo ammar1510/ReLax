@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
