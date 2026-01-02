@@ -15,8 +15,7 @@ from typing import List, Optional
 # Initialize JAX distributed for multi-TPU inference
 import jax
 
-# TODO: Uncomment for multi-process testing
-# jax.distributed.initialize()
+jax.distributed.initialize()
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
