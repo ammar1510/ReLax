@@ -100,6 +100,8 @@ class InferenceEngine:
         self,
         model: LLaMa,
         params: FrozenDict,
+        prefill_procs: List[int],
+        generate_procs: List[int],
         prefill_mesh: Mesh,
         generate_mesh: Mesh,
         max_concurrent_slots: int = 8,
@@ -121,6 +123,8 @@ class InferenceEngine:
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
         self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
+        self.prefill_procs = prefill_procs
+        self.generate_procs = generate_procs
         self.prefill_mesh = prefill_mesh
         self.generate_mesh = generate_mesh or prefill_mesh
         detokenize_mesh = Mesh(np.array(jax.devices()), axis_names=("i"))
@@ -628,6 +632,23 @@ class InferenceOrchestrator:
 
         return response_queue
 
+    def _copy_to_host(self, array: jax.Array, source_procs: List[int]):
+        arr_shape = array.shape
+        arr_dtype = array.dtype
+        local_host_array = None
+        if jax.process_index() in source_procs:
+            local_host_array = multihost_utils.process_allgather(array)
+
+        if jax.process_index() == source_procs[0]:
+            data_to_send = local_host_array
+        else:
+            data_to_send = np.empty(arr_shape, dtype=arr_dtype)
+
+        host_array = multihost_utils.broadcast_one_to_all(
+            data_to_send, is_source=(jax.process_index() == source_procs)
+        )
+        return host_array
+
     def _extract_individual_result(self, batched_result: Dict, idx: int) -> Dict:
         """Extract single-sequence result from batched prefill output.
 
@@ -649,16 +670,16 @@ class InferenceOrchestrator:
             seq_positions=cache.seq_positions[idx : idx + 1],
         )
 
-        # Gather sharded arrays before extracting scalars
-        seq_length_gathered = jax.device_put(
-            batched_result["seq_lengths"][idx], self.engine.detokenize_sharding
+        # moving seq len to host.
+        # is it even needed?
+        seq_lengths_on_host = self._copy_to_host(
+            batched_result["seq_lengths"], self.engine.prefill_procs
         )
-        jax.block_until_ready(seq_length_gathered)
 
         return {
             "cache": single_cache,
             "next_token": batched_result["next_tokens"][idx],
-            "seq_length": seq_length_gathered.item(),
+            "seq_length": seq_lengths_on_host.item(),
         }
 
     def _process_batch(self, requests: List[InferenceRequest]):
@@ -769,11 +790,11 @@ class InferenceOrchestrator:
 
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
-                    first_token_gathered = jax.device_put(
-                        prefill_result["next_token"], self.engine.detokenize_sharding
+                    first_token_on_host = self._copy_to_host(
+                        prefill_result["next_token"], self.engine.prefill_procs
                     )
-                    jax.block_until_ready(first_token_gathered)
-                    first_token = first_token_gathered.item()  # Extract scalar
+                    jax.block_until_ready(first_token_on_host)
+                    first_token = first_token_on_host.item()  # Extract scalar
 
                     # Insert into decode state
                     decode_state = self.engine.insert_into_slot(
@@ -847,16 +868,16 @@ class InferenceOrchestrator:
                 generate_timestep, new_tokens = data
 
                 # Gather sharded tokens before extracting scalars
-                new_tokens_gathered = jax.device_put(
-                    new_tokens, self.engine.detokenize_sharding
+                new_tokens_on_host = self._copy_to_host(
+                    new_tokens, self.engine.generate_procs
                 )
-                jax.block_until_ready(new_tokens_gathered)
+                jax.block_until_ready(new_tokens_on_host)
 
                 # Process each active slot
                 finished_slots = []
 
                 for slot_idx, (request, tokens) in list(active_requests.items()):
-                    token = new_tokens_gathered[slot_idx, 0].item()
+                    token = new_tokens_on_host[slot_idx, 0].item()
                     tokens.append(token)
 
                     # Check for completion
