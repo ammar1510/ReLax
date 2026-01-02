@@ -235,6 +235,8 @@ def main():
     all_devices = np.array(jax.devices())
     prefill_mesh = Mesh(all_devices[: len(all_devices) // 2], "i")
     generate_mesh = Mesh(all_devices[len(all_devices) // 2 :], "i")
+    prefill_procs = [0, 1]
+    generate_procs = [2, 3]
 
     print(f"Created prefill mesh with {len(all_devices)//2} device(s): {prefill_mesh}")
     print(
@@ -247,6 +249,8 @@ def main():
     engine = InferenceEngine(
         model=model,
         params=params,
+        prefill_procs=prefill_procs,
+        generate_procs=generate_procs,
         prefill_mesh=prefill_mesh,
         generate_mesh=generate_mesh,
         max_concurrent_slots=max_concurrent_slots,
