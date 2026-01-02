@@ -15,6 +15,7 @@ Architecture:
                                                     Response Queues
 """
 
+import sys
 import queue
 import threading
 import time
@@ -577,6 +578,7 @@ class InferenceOrchestrator:
         self._detokenize_thread.start()
 
         print(f"[Orchestrator] Started with {self.engine.max_slots} slots")
+        sys.stdout.flush()
 
     def stop(self, timeout: float = 5.0):
         """Stop all threads gracefully.
@@ -588,6 +590,8 @@ class InferenceOrchestrator:
             return
 
         print("[Orchestrator] Stopping...")
+        sys.stdout.flush()
+
         self._running = False
 
         # Send shutdown signal to detokenize thread
@@ -599,6 +603,7 @@ class InferenceOrchestrator:
         self._detokenize_thread.join(timeout=timeout)
 
         print("[Orchestrator] Stopped")
+        sys.stdout.flush()
 
     def submit(self, request: InferenceRequest) -> queue.Queue:
         """Submit a request for inference and get a response queue.
@@ -689,6 +694,7 @@ class InferenceOrchestrator:
             requests: List of InferenceRequests to process together
         """
         print(f"[Prefill] Processing batch of {len(requests)} requests")
+        sys.stdout.flush()
         bsz = len(requests)
 
         # Find max length in batch
@@ -714,6 +720,7 @@ class InferenceOrchestrator:
         # Call batched prefill
         prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
         print("[Prefill] Completed, sending to transfer backlog")
+        sys.stdout.flush()
 
         # Unpack and send to transfer backlog
         for i, req in enumerate(requests):
@@ -724,6 +731,8 @@ class InferenceOrchestrator:
     def _prefill_loop(self):
         """Prefill thread: batch requests, padding to longest sequence."""
         print("[Prefill Thread] Started (batched mode)")
+        sys.stdout.flush()
+        
 
         pending_requests = []
 
@@ -758,10 +767,12 @@ class InferenceOrchestrator:
                 time.sleep(0.0001)
 
         print("[Prefill Thread] Stopped")
+        sys.stdout.flush()
 
     def _generate_loop(self):
         """Generate thread: insert requests and unconditional generation."""
         print("[Generate Thread] Started")
+        sys.stdout.flush()
 
         # Initialize decode state
         decode_state = self.engine.init_decode_state()
@@ -806,6 +817,7 @@ class InferenceOrchestrator:
                     print(
                         f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}"
                     )
+                    sys.stdout.flush()
 
                     # Send slot assignment to detokenize thread
                     # Message format: (slot_idx, request, first_token)
@@ -828,10 +840,12 @@ class InferenceOrchestrator:
             generate_timestep += 1
 
         print("[Generate Thread] Stopped")
+        sys.stdout.flush()
 
     def _detokenize_loop(self):
         """Detokenize thread: Process tokens, send responses, free slots."""
         print("[Detokenize Thread] Started")
+        sys.stdout.flush()
 
         # Track active requests: slot_idx -> (request, generated_tokens_list)
         active_requests = {}
@@ -852,6 +866,7 @@ class InferenceOrchestrator:
                 print(
                     f"[Detokenize] Received first token for '{request.request_id}' in slot {slot_idx}"
                 )
+                sys.stdout.flush()
 
                 # Initialize tracking for this slot
                 active_requests[slot_idx] = (request, [first_token])
@@ -897,6 +912,7 @@ class InferenceOrchestrator:
                         print(
                             f"[Detokenize] Completed '{request.request_id}' ({len(tokens)} tokens, {'EOS' if is_eos else 'max length'})"
                         )
+                        sys.stdout.flush()
                         finished_slots.append(slot_idx)
                     else:
                         # Send streaming update
@@ -909,5 +925,7 @@ class InferenceOrchestrator:
                     del active_requests[slot_idx]
                     self._free_slots.put(slot_idx)
                     print(f"[Detokenize] Freed slot {slot_idx}")
+                    sys.stdout.flush()
 
         print("[Detokenize Thread] Stopped")
+        sys.stdout.flush()

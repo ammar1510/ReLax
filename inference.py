@@ -133,6 +133,7 @@ def generate_batch(
 
     if verbose:
         print(f"\nProcessing {len(prompts)} requests...\n")
+        sys.stdout.flush()
 
     # Collect results
     results = {}
@@ -160,10 +161,12 @@ def generate_batch(
                             f"  Tokens: {len(result['tokens'])}, "
                             f"Reason: {result['finish_reason']}\n"
                         )
+                        sys.stdout.flush()
 
                 elif result["status"] == "error":
                     if verbose:
                         print(f"✗ [{request_id}] error: {result['error']}")
+                        sys.stdout.flush()
                     results[request_id] = result
                     completed += 1
 
@@ -182,6 +185,7 @@ def generate_batch(
         print(f"  Throughput: {total_tokens / total_time:.2f} tokens/s")
         print(f"  Avg latency: {total_time / len(requests):.2f}s/request")
         print(f"{'='*80}\n")
+        sys.stdout.flush()
 
     # Return outputs in order
     outputs = []
@@ -247,6 +251,7 @@ def main():
     # Create engine and orchestrator with 16 slots
     max_concurrent_slots = 8
     print(f"\nInitializing inference engine (max_slots={max_concurrent_slots})...")
+    sys.stdout.flush()
     engine = InferenceEngine(
         model=model,
         params=params,
