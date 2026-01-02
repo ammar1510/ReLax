@@ -637,7 +637,7 @@ class InferenceOrchestrator:
         arr_dtype = array.dtype
         local_host_array = None
         if jax.process_index() in source_procs:
-            local_host_array = multihost_utils.process_allgather(array)
+            local_host_array = multihost_utils.process_allgather(array, tiled=True)
 
         if jax.process_index() == source_procs[0]:
             data_to_send = local_host_array
