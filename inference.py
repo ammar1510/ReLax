@@ -72,6 +72,7 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     print(f"Loading tokenizer from {tokenizer_path}...")
     tokenizer = Tokenizer(str(tokenizer_path))
     print(f"Tokenizer loaded (vocab size: {tokenizer.vocab_size})")
+    sys.stdout.flush()
 
     return model, params, config, tokenizer
 
