@@ -861,10 +861,12 @@ class InferenceOrchestrator:
                 generate_timestep, new_tokens = data
 
                 # Gather sharded tokens before extracting scalars
-                new_tokens_on_all = multihost_utils.process_allgather(
-                    new_tokens, tiled=True
-                )
-                jax.block_until_ready(new_tokens_on_all)
+                new_tokens_on_all = None
+                if jax.process_index() in self.engine.generate_procs:
+                    new_tokens_on_all = multihost_utils.process_allgather(
+                        new_tokens, tiled=True
+                    )
+                    jax.block_until_ready(new_tokens_on_all)
 
                 # Process each active slot
                 finished_slots = []
