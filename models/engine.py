@@ -727,6 +727,8 @@ class InferenceOrchestrator:
             individual_result = self._extract_individual_result(prefill_result, i)
             individual_result["request"] = req
             self._transfer_backlog.put(individual_result)
+        print("[Prefill] sent to transfer backlog.")
+        sys.stdout.flush()
 
     def _prefill_loop(self):
         """Prefill thread: batch requests, padding to longest sequence."""
