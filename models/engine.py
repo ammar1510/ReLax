@@ -810,16 +810,16 @@ class InferenceOrchestrator:
 
             # PHASE 2: ALWAYS generate (no conditional) - ensures device sync
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
-            new_tokens_gathered = None
+            new_tokens_cpu = None
             if jax.process_index() in self.engine.generate_procs:
                 new_tokens_gathered = MeshHelper.allgather(new_tokens, self.engine.generate_mesh)
                 jax.block_until_ready(new_tokens_gathered)
-                new_tokens_gathered = jax.copy_to_host_async(new_tokens_gathered)
+                new_tokens_cpu = jax.device_get(new_tokens_gathered)
 
             # PHASE 3: Send generated tokens to detokenize thread
             # Message format: (generate_timestep, new_tokens)
             self._detokenize_backlog.put(
-                (generate_timestep, new_tokens_gathered), block=True
+                (generate_timestep, new_tokens_cpu), block=True
             )
             generate_timestep += 1
 
