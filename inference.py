@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+import zmq
+
 # Initialize JAX distributed for multi-TPU inference
 import jax
 
@@ -135,6 +137,10 @@ def generate_batch(
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
+    # Only process 3 handles response collection and detokenization
+    if jax.process_index() != 3:
+        return [""] * len(prompts)
+
     # Collect results
     results = {}
     completed = 0
@@ -200,6 +206,43 @@ def generate_batch(
     return outputs
 
 
+def receive_prompts_from_zmq(num_prompts: int = 16) -> List[str]:
+    """Receive prompts from ZMQ SUB socket (multi-host setup).
+    
+    Each JAX worker independently binds to port 5555 on its own host and
+    subscribes to prompts from the PUB socket. All workers receive identical
+    prompts.
+    
+    Args:
+        num_prompts: Number of prompts to receive before returning
+        
+    Returns:
+        List of prompt strings
+    """
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
+    socket.bind("tcp://*:5555")
+    
+    # Subscribe to all messages (empty string = all topics)
+    socket.subscribe("")
+    
+    prompts = []
+    print(f"[Worker {jax.process_index()}] Waiting for {num_prompts} prompts over ZMQ SUB...")
+    sys.stdout.flush()
+    
+    while len(prompts) < num_prompts:
+        message = socket.recv_json()
+        prompt = message.get("prompt", "")
+        prompts.append(prompt)
+        print(f"[Worker {jax.process_index()}] Received prompt {len(prompts)}: {prompt[:40]}...")
+        sys.stdout.flush()
+    
+    socket.close()
+    context.term()
+    print(f"[Worker {jax.process_index()}] Received all {len(prompts)} prompts.")
+    return prompts
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="LLaMA inference with slot-based engine"
@@ -210,27 +253,16 @@ def main():
         required=True,
         help="Path to model directory (containing model.safetensors, config.json, tokenizer.model)",
     )
+    parser.add_argument(
+        "--num_prompts",
+        type=int,
+        default=16,
+        help="Number of prompts to receive from ZMQ (default: 16)",
+    )
     args = parser.parse_args()
 
-    # Hardcoded 16 prompts
-    prompts = [
-        "The capital of France is",
-        "In a galaxy far, far away",
-        "The recipe for chocolate cake requires",
-        "Python is a programming language that",
-        "The meaning of life is",
-        "Once upon a time in a distant land",
-        "The best way to learn coding is",
-        "Artificial intelligence will change",
-        "The most important invention in history was",
-        "If I could travel anywhere, I would go to",
-        "The secret to happiness is",
-        "In the future, technology will",
-        "The greatest challenge facing humanity is",
-        "My favorite thing about science is",
-        "When I think about the universe, I",
-        "The key to success is",
-    ]
+    # Receive prompts from ZMQ
+    prompts = receive_prompts_from_zmq(args.num_prompts)
 
     # Load model
     print("Loading model...")
