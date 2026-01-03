@@ -223,6 +223,9 @@ class InferenceEngine:
         transferred["next_token"] = self.mesh_helper.put_on_mesh(
             prefill_result["next_token"], self.generate_mesh, PS()
         )
+        transferred["seq_length"] = self.mesh_helper.put_on_mesh(
+            prefill_result["seq_length"], self.generate_mesh, PS()
+        )
         return transferred
 
     def prefill(
@@ -381,9 +384,6 @@ class InferenceEngine:
 
         # For KV cache: insert at batch position slot_idx
         # Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
-        layers, max_slots, max_seq_len, kv_heads, head_dim = (
-            decode_state.kv_cache.k.shape
-        )
 
         # Extract the single-sequence cache
         # prefill_cache.k shape: [layers, 1, max_seq_len, kv_heads, head_dim]
@@ -637,23 +637,6 @@ class InferenceOrchestrator:
 
         return response_queue
 
-    def _copy_to_host(self, array: jax.Array, source_procs: List[int]):
-        arr_shape = array.shape
-        arr_dtype = array.dtype
-        local_host_array = None
-        if jax.process_index() in source_procs:
-            local_host_array = multihost_utils.process_allgather(array, tiled=True)
-
-        if jax.process_index() == source_procs[0]:
-            data_to_send = local_host_array
-        else:
-            data_to_send = np.empty(arr_shape, dtype=arr_dtype)
-
-        host_array = multihost_utils.broadcast_one_to_all(
-            data_to_send, is_source=(jax.process_index() == source_procs[0])
-        )
-        return host_array
-
     def _extract_individual_result(self, batched_result: Dict, idx: int) -> Dict:
         """Extract single-sequence result from batched prefill output.
 
@@ -675,18 +658,10 @@ class InferenceOrchestrator:
             seq_positions=cache.seq_positions[idx : idx + 1],
         )
 
-        # moving seq len to host.
-        # is it even needed?
-        print(f"sequence length sharding: {batched_result["seq_lengths"].device}")
-        sys.stdout.flush()
-        seq_lengths_on_host = self._copy_to_host(
-            batched_result["seq_lengths"], self.engine.prefill_procs
-        )
-
         return {
             "cache": single_cache,
             "next_token": batched_result["next_tokens"][idx],
-            "seq_length": seq_lengths_on_host[idx].item(),
+            "seq_length": batched_result["seq_lengths"][idx],
         }
 
     def _process_batch(self, requests: List[InferenceRequest]):
@@ -804,12 +779,8 @@ class InferenceOrchestrator:
                     jax.block_until_ready(prefill_result)
 
                     request = prefill_result["request"]
-                    # Gather sharded array before extracting scalar
-                    first_token_on_host = self._copy_to_host(
-                        prefill_result["next_token"], self.engine.generate_procs
-                    )
-                    jax.block_until_ready(first_token_on_host)
-                    first_token = first_token_on_host.item()  # Extract scalar
+
+                    first_token = prefill_result["next_token"].item()
 
                     # Insert into decode state
                     decode_state = self.engine.insert_into_slot(
@@ -887,16 +858,16 @@ class InferenceOrchestrator:
                 generate_timestep, new_tokens = data
 
                 # Gather sharded tokens before extracting scalars
-                new_tokens_on_host = self._copy_to_host(
-                    new_tokens, self.engine.generate_procs
+                new_tokens_on_all = multihost_utils.process_allgather(
+                    new_tokens, tiled=True
                 )
-                jax.block_until_ready(new_tokens_on_host)
+                jax.block_until_ready(new_tokens_on_all)
 
                 # Process each active slot
                 finished_slots = []
 
                 for slot_idx, (request, tokens) in list(active_requests.items()):
-                    token = new_tokens_on_host[slot_idx, 0].item()
+                    token = new_tokens_on_all[slot_idx, 0].item()
                     tokens.append(token)
 
                     # Check for completion
