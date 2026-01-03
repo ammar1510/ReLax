@@ -780,7 +780,10 @@ class InferenceOrchestrator:
 
                     request = prefill_result["request"]
 
-                    first_token = prefill_result["next_token"].item()
+                    if jax.process_index() in self.engine.generate_procs:
+                        first_token = prefill_result["next_token"].item()
+                    else:
+                        first_token = None
 
                     # Insert into decode state
                     decode_state = self.engine.insert_into_slot(
@@ -867,7 +870,10 @@ class InferenceOrchestrator:
                 finished_slots = []
 
                 for slot_idx, (request, tokens) in list(active_requests.items()):
-                    token = new_tokens_on_all[slot_idx, 0].item()
+                    if jax.process_index() in self.engine.generate_procs:
+                        token = new_tokens_on_all[slot_idx, 0].item()
+                    else:
+                        token = None
                     tokens.append(token)
 
                     # Check for completion
