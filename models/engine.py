@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 import jax
 import jax.numpy as jnp
-from jax.experimental import multihost_utils
 from flax.core import FrozenDict
 from jax.sharding import Mesh, PartitionSpec as PS
 from jaxlib.xla_client import NamedSharding
@@ -31,6 +30,7 @@ import numpy as np
 from jax import jit
 
 from models.llama.model import LLaMa
+from utils import mesh_helpers
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
 from utils.ops import build_attn_mask
@@ -813,10 +813,7 @@ class InferenceOrchestrator:
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
             new_tokens_gathered = None
             if jax.process_index() in self.engine.generate_procs:
-                multihost_utils.sync_global_devices("before_allgather")
-                new_tokens_gathered = multihost_utils.process_allgather(
-                    new_tokens, tiled=True
-                )
+                new_tokens_gathered = mesh_helpers.allgather(new_tokens)
                 jax.block_until_ready(new_tokens_gathered)
 
             # PHASE 3: Send generated tokens to detokenize thread

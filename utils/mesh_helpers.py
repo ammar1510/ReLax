@@ -1,7 +1,9 @@
 """Mesh and sharding helper utilities for distributed inference."""
 
+from math import gamma
 from typing import Optional, Any
 import jax
+import jax.lax as lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
 from numpy import format_float_positional
 
@@ -10,6 +12,18 @@ from utils.kvcache import KVCache
 
 class MeshHelper:
     """Helper class for managing mesh placement and sharding operations."""
+
+    @staticmethod
+    def allgather(array: jax.Array, mesh: Mesh) -> jax.Array:
+        gather_fn = lambda x: jax.lax.all_gather(x, "i", tiled=True)
+        sharded_gather = jax.shard_map(
+            gather_fn,
+            mesh=mesh,
+            in_specs=PS("i"),
+            out_specs=PS(),
+            check_vma=False,
+        )
+        return sharded_gather(array)
 
     @staticmethod
     def get_axis_name(mesh: Optional[Mesh]) -> Optional[str]:
