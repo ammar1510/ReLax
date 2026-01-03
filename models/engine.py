@@ -684,7 +684,7 @@ class InferenceOrchestrator:
         return {
             "cache": single_cache,
             "next_token": batched_result["next_tokens"][idx],
-            "seq_length": seq_lengths_on_host.item(),
+            "seq_length": seq_lengths_on_host[idx].item(),
         }
 
     def _process_batch(self, requests: List[InferenceRequest]):
@@ -732,7 +732,6 @@ class InferenceOrchestrator:
         """Prefill thread: batch requests, padding to longest sequence."""
         print("[Prefill Thread] Started (batched mode)")
         sys.stdout.flush()
-        
 
         pending_requests = []
 
