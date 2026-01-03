@@ -806,7 +806,7 @@ class InferenceOrchestrator:
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
                     first_token_on_host = self._copy_to_host(
-                        prefill_result["next_token"], self.engine.prefill_procs
+                        prefill_result["next_token"], self.engine.generate_procs
                     )
                     jax.block_until_ready(first_token_on_host)
                     first_token = first_token_on_host.item()  # Extract scalar
