@@ -30,7 +30,6 @@ import numpy as np
 from jax import jit
 
 from models.llama.model import LLaMa
-from utils import mesh_helpers
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
 from utils.ops import build_attn_mask
@@ -815,6 +814,7 @@ class InferenceOrchestrator:
             if jax.process_index() in self.engine.generate_procs:
                 new_tokens_gathered = MeshHelper.allgather(new_tokens, self.engine.generate_mesh)
                 jax.block_until_ready(new_tokens_gathered)
+                new_tokens_gathered = jax.copy_to_host_async(new_tokens_gathered)
 
             # PHASE 3: Send generated tokens to detokenize thread
             # Message format: (generate_timestep, new_tokens)
