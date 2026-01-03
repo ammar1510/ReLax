@@ -801,6 +801,7 @@ class InferenceOrchestrator:
                     prefill_result = self.engine.transfer_prefill_to_generate(
                         prefill_result
                     )
+                    jax.block_until_ready(prefill_result)
 
                     request = prefill_result["request"]
                     # Gather sharded array before extracting scalar
