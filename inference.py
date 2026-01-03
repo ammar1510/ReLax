@@ -247,6 +247,7 @@ def main():
     print(
         f"Created generate mesh with {len(all_devices)//2} device(s): {generate_mesh}"
     )
+    print(f"for process-{jax.process_index()}:\n device: {jax.local_devices()} ")
 
     # Create engine and orchestrator with 16 slots
     max_concurrent_slots = 8
