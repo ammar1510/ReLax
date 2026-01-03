@@ -677,6 +677,8 @@ class InferenceOrchestrator:
 
         # moving seq len to host.
         # is it even needed?
+        print(f"sequence length sharding: {batched_result["seq_lengths"].device}")
+        sys.stdout.flush()
         seq_lengths_on_host = self._copy_to_host(
             batched_result["seq_lengths"], self.engine.prefill_procs
         )
