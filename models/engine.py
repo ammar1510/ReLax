@@ -812,9 +812,11 @@ class InferenceOrchestrator:
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
             new_tokens_cpu = None
             if jax.process_index() in self.engine.generate_procs:
-                new_tokens_gathered = MeshHelper.allgather(new_tokens, self.engine.generate_mesh)
-                jax.block_until_ready(new_tokens_gathered)
-                new_tokens_cpu = jax.device_get(new_tokens_gathered)
+                new_tokens_gathered = MeshHelper.allgather(
+                    new_tokens, self.engine.generate_mesh
+                )
+                new_tokens_gathered = jax.block_until_ready(new_tokens_gathered)
+                new_tokens_cpu = np.array(new_tokens_gathered)
 
             # PHASE 3: Send generated tokens to detokenize thread
             # Message format: (generate_timestep, new_tokens)
