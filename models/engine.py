@@ -650,7 +650,7 @@ class InferenceOrchestrator:
             data_to_send = np.empty(arr_shape, dtype=arr_dtype)
 
         host_array = multihost_utils.broadcast_one_to_all(
-            data_to_send, is_source=(jax.process_index() == source_procs)
+            data_to_send, is_source=(jax.process_index() == source_procs[0])
         )
         return host_array
 
