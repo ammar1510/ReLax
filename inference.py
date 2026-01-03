@@ -1,26 +1,27 @@
 """Production inference script for LLaMA models.
 
-This script loads a LLaMA model with weights from disk and performs inference
-using the slot-based engine with prefill and generate steps to handle multiple
-concurrent requests efficiently.
+This script loads a LLaMA model with weights from disk and performs batch inference
+on 16 hardcoded prompts using the slot-based engine with prefill and generate steps.
 
 Usage:
-    # Single request
-    python inference.py --model_path /path/to/model --prompt "Once upon a time"
-
-    # Multiple concurrent requests
-    python inference.py --model_path /path/to/model --concurrent
-
-    # Interactive mode
-    python inference.py --model_path /path/to/model --interactive
+    python inference.py --model_path /path/to/model
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+
+import zmq
+
+# Initialize JAX distributed for multi-TPU inference
 import jax
+
+jax.distributed.initialize()
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
@@ -74,6 +75,7 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     print(f"Loading tokenizer from {tokenizer_path}...")
     tokenizer = Tokenizer(str(tokenizer_path))
     print(f"Tokenizer loaded (vocab size: {tokenizer.vocab_size})")
+    sys.stdout.flush()
 
     return model, params, config, tokenizer
 
@@ -83,105 +85,41 @@ def generic_tokenizer(prompt: str, tokenizer: Tokenizer) -> List[int]:
     return tokenizer.encode(formatted_prompt, bos=False, eos=False)
 
 
-def generate_single(
-    orchestrator: InferenceOrchestrator,
-    tokenizer: Tokenizer,
-    prompt: str,
-    max_new_tokens: int = 512,
-    verbose: bool = True,
-) -> str:
-    """Generate text for a single prompt.
-
-    Args:
-        orchestrator: Running InferenceOrchestrator instance
-        tokenizer: Tokenizer for encoding/decoding
-        prompt: Text prompt
-        max_new_tokens: Maximum tokens to generate
-        verbose: Print streaming tokens
-
-    Returns:
-        Generated text (decoded)
-    """
-    # Encode prompt
-    prompt_tokens = generic_tokenizer(prompt, tokenizer)
-    prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
-
-    if verbose:
-        print(f"\nPrompt: {prompt}")
-        print(f"Prompt tokens: {len(prompt_tokens)}")
-        print("\nGenerating: ", end="", flush=True)
-
-    # Create request
-    request = InferenceRequest(
-        request_id="single-request",
-        prompt_tokens=prompt_array,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eot_id,
-    )
-
-    # Submit and collect results
-    response_queue = orchestrator.submit(request)
-    generated_tokens = []
-    start_time = time.time()
-
-    while True:
-        result = response_queue.get()
-
-        if result["status"] == "generating":
-            token = result["token"]
-            generated_tokens.append(token)
-            if verbose:
-                # Decode and print token
-                token_text = tokenizer.decode([token])
-                print(token_text, end="", flush=True)
-
-        elif result["status"] == "complete":
-            elapsed = time.time() - start_time
-            if verbose:
-                print(f"\n\n✓ Complete!")
-                print(f"  Tokens: {len(result['tokens'])}")
-                print(f"  Time: {elapsed:.2f}s")
-                print(f"  Speed: {len(result['tokens']) / elapsed:.2f} tokens/s")
-                print(f"  Finish: {result['finish_reason']}")
-
-            # Decode full output
-            output_text = tokenizer.decode(result["tokens"])
-            return output_text
-
-        elif result["status"] == "error":
-            print(f"\n✗ Error: {result['error']}")
-            return ""
-
-
-def generate_concurrent(
+def generate_batch(
     orchestrator: InferenceOrchestrator,
     tokenizer: Tokenizer,
     prompts: List[str],
-    max_new_tokens: int = 50,
+    max_new_tokens: int = 512,
+    verbose: bool = True,
 ) -> List[str]:
-    """Generate text for multiple prompts concurrently.
+    """Generate text for a batch of prompts.
 
     Args:
         orchestrator: Running InferenceOrchestrator instance
         tokenizer: Tokenizer for encoding/decoding
-        prompts: List of text prompts
+        prompts: List of text prompts (expecting 16)
         max_new_tokens: Maximum tokens to generate per prompt
+        verbose: Print generation progress
 
     Returns:
         List of generated texts (one per prompt)
     """
-    print(f"\n{'='*80}")
-    print(f"Concurrent Generation: {len(prompts)} requests")
-    print(f"{'='*80}\n")
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"Batch Generation: {len(prompts)} prompts")
+        print(f"{'='*80}\n")
 
-    # Create and submit all requests
+    # Submit all requests
     requests = []
     response_queues = {}
 
     for i, prompt in enumerate(prompts):
-        # Encode prompt
         prompt_tokens = generic_tokenizer(prompt, tokenizer)
         prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
+
+        if verbose:
+            print(f"[request-{i}] Prompt: {prompt[:60]}...")
+            print(f"            Tokens: {len(prompt_tokens)}")
 
         # Create request
         request = InferenceRequest(
@@ -191,15 +129,17 @@ def generate_concurrent(
             eos_token_id=tokenizer.eot_id,
         )
 
-        print(f"[{request.request_id}] Prompt: {prompt[:60]}...")
-        print(f"            Tokens: {len(prompt_tokens)}")
-
-        # Submit
         response_queue = orchestrator.submit(request)
-        response_queues[request.request_id] = response_queue
         requests.append(request)
+        response_queues[request.request_id] = response_queue
 
-    print(f"\nProcessing {len(requests)} requests concurrently...\n")
+    if verbose:
+        print(f"\nProcessing {len(prompts)} requests...\n")
+        sys.stdout.flush()
+
+    # Only process 3 handles response collection and detokenization
+    if jax.process_index() != 3:
+        return [""] * len(prompts)
 
     # Collect results
     results = {}
@@ -219,35 +159,45 @@ def generate_concurrent(
                     completed += 1
                     elapsed = time.time() - start_time
 
-                    output_text = tokenizer.decode(result["tokens"])
-                    print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
-                    print(f"  Output: {output_text}")
-                    print(
-                        f"  Tokens: {len(result['tokens'])}, "
-                        f"Reason: {result['finish_reason']}\n"
-                    )
+                    if verbose:
+                        output_text = tokenizer.decode(result["tokens"])
+                        print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
+                        print(f"  Output: {output_text[:100]}...")
+                        print(
+                            f"  Tokens: {len(result['tokens'])}, "
+                            f"Reason: {result['finish_reason']}\n"
+                        )
+                        sys.stdout.flush()
+
+                elif result["status"] == "error":
+                    if verbose:
+                        print(f"✗ [{request_id}] error: {result['error']}")
+                        sys.stdout.flush()
+                    results[request_id] = result
+                    completed += 1
 
             except:
                 pass  # Queue empty
 
     # Summary
-    total_time = time.time() - start_time
-    total_tokens = sum(len(r["tokens"]) for r in results.values())
-
-    print(f"{'='*80}")
-    print(f"Summary:")
-    print(f"  Total requests: {len(requests)}")
-    print(f"  Total tokens: {total_tokens}")
-    print(f"  Total time: {total_time:.2f}s")
-    print(f"  Throughput: {total_tokens / total_time:.2f} tokens/s")
-    print(f"  Avg latency: {total_time / len(requests):.2f}s/request")
-    print(f"{'='*80}\n")
+    if verbose:
+        total_time = time.time() - start_time
+        total_tokens = sum(len(r["tokens"]) for r in results.values() if "tokens" in r)
+        print(f"{'='*80}")
+        print(f"Summary:")
+        print(f"  Total requests: {len(requests)}")
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Total time: {total_time:.2f}s")
+        print(f"  Throughput: {total_tokens / total_time:.2f} tokens/s")
+        print(f"  Avg latency: {total_time / len(requests):.2f}s/request")
+        print(f"{'='*80}\n")
+        sys.stdout.flush()
 
     # Return outputs in order
     outputs = []
     for i in range(len(prompts)):
         request_id = f"request-{i}"
-        if request_id in results:
+        if request_id in results and "tokens" in results[request_id]:
             output_text = tokenizer.decode(results[request_id]["tokens"])
             outputs.append(output_text)
         else:
@@ -256,46 +206,41 @@ def generate_concurrent(
     return outputs
 
 
-def interactive_mode(
-    orchestrator: InferenceOrchestrator,
-    tokenizer: Tokenizer,
-    max_new_tokens: int = 200,
-):
-    """Run interactive chat mode.
-
+def receive_prompts_from_zmq(num_prompts: int = 16) -> List[str]:
+    """Receive prompts from ZMQ SUB socket (multi-host setup).
+    
+    Each JAX worker independently binds to port 5555 on its own host and
+    subscribes to prompts from the PUB socket. All workers receive identical
+    prompts.
+    
     Args:
-        orchestrator: Running InferenceOrchestrator instance
-        tokenizer: Tokenizer for encoding/decoding
-        max_new_tokens: Maximum tokens to generate per turn
+        num_prompts: Number of prompts to receive before returning
+        
+    Returns:
+        List of prompt strings
     """
-    print(f"\n{'='*80}")
-    print("Interactive Mode")
-    print("Type your prompts (Ctrl+C or 'quit' to exit)")
-    print(f"{'='*80}\n")
-
-    try:
-        while True:
-            # Get user input
-            prompt = input("\n> ").strip()
-
-            if prompt.lower() in ["quit", "exit", "q"]:
-                print("Goodbye!")
-                break
-
-            if not prompt:
-                continue
-
-            # Generate response
-            generate_single(
-                orchestrator,
-                tokenizer,
-                prompt,
-                max_new_tokens=max_new_tokens,
-                verbose=True,
-            )
-
-    except KeyboardInterrupt:
-        print("\n\nGoodbye!")
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
+    socket.bind("tcp://*:5555")
+    
+    # Subscribe to all messages (empty string = all topics)
+    socket.subscribe("")
+    
+    prompts = []
+    print(f"[Worker {jax.process_index()}] Waiting for {num_prompts} prompts over ZMQ SUB...")
+    sys.stdout.flush()
+    
+    while len(prompts) < num_prompts:
+        message = socket.recv_json()
+        prompt = message.get("prompt", "")
+        prompts.append(prompt)
+        print(f"[Worker {jax.process_index()}] Received prompt {len(prompts)}: {prompt[:40]}...")
+        sys.stdout.flush()
+    
+    socket.close()
+    context.term()
+    print(f"[Worker {jax.process_index()}] Received all {len(prompts)} prompts.")
+    return prompts
 
 
 def main():
@@ -309,99 +254,60 @@ def main():
         help="Path to model directory (containing model.safetensors, config.json, tokenizer.model)",
     )
     parser.add_argument(
-        "--config_path",
-        type=str,
-        default=None,
-        help="Optional separate path to config.json directory",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default=None,
-        help="Single prompt for generation",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
+        "--num_prompts",
         type=int,
-        default=100,
-        help="Maximum number of tokens to generate",
+        default=16,
+        help="Number of prompts to receive from ZMQ (default: 16)",
     )
-    parser.add_argument(
-        "--max_concurrent_slots",
-        type=int,
-        default=8,
-        help="Maximum number of concurrent sequences in generate batch",
-    )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Run in interactive mode",
-    )
-    parser.add_argument(
-        "--concurrent",
-        action="store_true",
-        help="Run concurrent generation demo with multiple prompts",
-    )
-
     args = parser.parse_args()
+
+    # Receive prompts from ZMQ
+    prompts = receive_prompts_from_zmq(args.num_prompts)
 
     # Load model
     print("Loading model...")
-    model, params, config, tokenizer = load_model(
-        args.model_path,
-        args.config_path,
-    )
+    model, params, config, tokenizer = load_model(args.model_path)
 
-    # Create engine and orchestrator
-    print(f"\nInitializing inference engine (max_slots={args.max_concurrent_slots})...")
+    # Create mesh for single-device run
+    all_devices = np.array(jax.devices())
+    prefill_mesh = Mesh(all_devices[: len(all_devices) // 2], "i")
+    generate_mesh = Mesh(all_devices[len(all_devices) // 2 :], "i")
+    prefill_procs = [0, 1]
+    generate_procs = [2, 3]
+
+    print(f"Created prefill mesh with {len(all_devices)//2} device(s): {prefill_mesh}")
+    print(
+        f"Created generate mesh with {len(all_devices)//2} device(s): {generate_mesh}"
+    )
+    print(f"for process-{jax.process_index()}:\n device: {jax.local_devices()} ")
+
+    # Create engine and orchestrator with 16 slots
+    max_concurrent_slots = 8
+    print(f"\nInitializing inference engine (max_slots={max_concurrent_slots})...")
+    sys.stdout.flush()
     engine = InferenceEngine(
         model=model,
         params=params,
-        max_concurrent_slots=args.max_concurrent_slots,
+        prefill_procs=prefill_procs,
+        generate_procs=generate_procs,
+        prefill_mesh=prefill_mesh,
+        generate_mesh=generate_mesh,
+        max_concurrent_slots=max_concurrent_slots,
         pad_id=tokenizer.pad_id,
     )
 
-    orchestrator = InferenceOrchestrator(engine)
+    orchestrator = InferenceOrchestrator(engine, max_prefill_batch_size=8)
     orchestrator.start()
 
     try:
-        if args.interactive:
-            # Interactive mode
-            interactive_mode(orchestrator, tokenizer, args.max_new_tokens)
-
-        elif args.concurrent:
-            # Concurrent demo
-            demo_prompts = [
-                "The capital of France is",
-                "In a galaxy far, far away",
-                "The recipe for chocolate cake requires",
-                "Python is a programming language that",
-                "The meaning of life is",
-            ]
-            generate_concurrent(
-                orchestrator,
-                tokenizer,
-                demo_prompts,
-                max_new_tokens=512,
-            )
-
-        elif args.prompt:
-            # Single prompt
-            generate_single(
-                orchestrator,
-                tokenizer,
-                args.prompt,
-                verbose=True,
-            )
-
-        else:
-            print("\nNo mode specified. Use --prompt, --interactive, or --concurrent")
-            print("Examples:")
-            print(
-                '  python inference.py --model_path /path/to/model --prompt "Once upon a time"'
-            )
-            print("  python inference.py --model_path /path/to/model --interactive")
-            print("  python inference.py --model_path /path/to/model --concurrent")
+        # Run batch generation with 16 prompts
+        generate_batch(
+            orchestrator,
+            tokenizer,
+            prompts,
+            max_new_tokens=512,
+            verbose=True,
+        )
 
     finally:
         # Cleanup
