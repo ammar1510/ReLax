@@ -808,7 +808,6 @@ class InferenceOrchestrator:
                     # Fall through to generate even if we timed out
                     # This ensures all devices execute generate_batch() together
 
-            # PHASE 2: ALWAYS generate (no conditional) - ensures device sync
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
             new_tokens_cpu = None
             if jax.process_index() in self.engine.generate_procs:
@@ -818,8 +817,6 @@ class InferenceOrchestrator:
                 new_tokens_gathered = jax.block_until_ready(new_tokens_gathered)
                 new_tokens_cpu = np.array(new_tokens_gathered)
 
-            # PHASE 3: Send generated tokens to detokenize thread
-            # Message format: (generate_timestep, new_tokens)
             self._detokenize_backlog.put(
                 (generate_timestep, new_tokens_cpu), block=True
             )

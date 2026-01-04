@@ -137,10 +137,6 @@ def generate_batch(
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
-    # Only process 3 handles response collection and detokenization
-    if jax.process_index() != 3:
-        return [""] * len(prompts)
-
     # Collect results
     results = {}
     completed = 0
@@ -159,7 +155,7 @@ def generate_batch(
                     completed += 1
                     elapsed = time.time() - start_time
 
-                    if verbose:
+                    if verbose and jax.process_index() == 3:
                         output_text = tokenizer.decode(result["tokens"])
                         print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
                         print(f"  Output: {output_text[:100]}...")
@@ -184,7 +180,7 @@ def generate_batch(
         total_time = time.time() - start_time
         total_tokens = sum(len(r["tokens"]) for r in results.values() if "tokens" in r)
         print(f"{'='*80}")
-        print(f"Summary:")
+        print("Summary:")
         print(f"  Total requests: {len(requests)}")
         print(f"  Total tokens: {total_tokens}")
         print(f"  Total time: {total_time:.2f}s")
@@ -208,35 +204,39 @@ def generate_batch(
 
 def receive_prompts_from_zmq(num_prompts: int = 16) -> List[str]:
     """Receive prompts from ZMQ SUB socket (multi-host setup).
-    
+
     Each JAX worker independently binds to port 5555 on its own host and
     subscribes to prompts from the PUB socket. All workers receive identical
     prompts.
-    
+
     Args:
         num_prompts: Number of prompts to receive before returning
-        
+
     Returns:
         List of prompt strings
     """
     context = zmq.Context()
     socket = context.socket(zmq.SUB)
     socket.bind("tcp://*:5555")
-    
+
     # Subscribe to all messages (empty string = all topics)
     socket.subscribe("")
-    
+
     prompts = []
-    print(f"[Worker {jax.process_index()}] Waiting for {num_prompts} prompts over ZMQ SUB...")
+    print(
+        f"[Worker {jax.process_index()}] Waiting for {num_prompts} prompts over ZMQ SUB..."
+    )
     sys.stdout.flush()
-    
+
     while len(prompts) < num_prompts:
         message = socket.recv_json()
         prompt = message.get("prompt", "")
         prompts.append(prompt)
-        print(f"[Worker {jax.process_index()}] Received prompt {len(prompts)}: {prompt[:40]}...")
+        print(
+            f"[Worker {jax.process_index()}] Received prompt {len(prompts)}: {prompt[:40]}..."
+        )
         sys.stdout.flush()
-    
+
     socket.close()
     context.term()
     print(f"[Worker {jax.process_index()}] Received all {len(prompts)} prompts.")

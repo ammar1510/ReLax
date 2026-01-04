@@ -51,7 +51,8 @@ def main():
     ]
 
     print(f"\nSending {len(prompts)} prompts over ZMQ PUB socket...")
-    time.sleep(1)  # Give subscribers time to connect
+    print("Waiting for subscribers to connect...")
+    time.sleep(3)  # Give subscribers time to connect (slow joiner problem)
 
     for i, prompt in enumerate(prompts):
         message = {"prompt": prompt, "request_id": f"request-{i}"}
