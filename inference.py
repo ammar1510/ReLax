@@ -268,17 +268,16 @@ def main():
     print("Loading model...")
     model, params, config, tokenizer = load_model(args.model_path)
 
-    # Create mesh for single-device run
+    # Create unified mesh for interleaved mode - use all devices for both prefill and generate
     all_devices = np.array(jax.devices())
-    prefill_mesh = Mesh(all_devices[: len(all_devices) // 2], "i")
-    generate_mesh = Mesh(all_devices[len(all_devices) // 2 :], "i")
-    prefill_procs = [0, 1]
-    generate_procs = [2, 3]
+    unified_mesh = Mesh(all_devices, "i")
+    prefill_mesh = unified_mesh
+    generate_mesh = unified_mesh
+    # All processes participate in both prefill and generate
+    prefill_procs = list(range(len(all_devices)))
+    generate_procs = list(range(len(all_devices)))
 
-    print(f"Created prefill mesh with {len(all_devices)//2} device(s): {prefill_mesh}")
-    print(
-        f"Created generate mesh with {len(all_devices)//2} device(s): {generate_mesh}"
-    )
+    print(f"Created unified mesh with {len(all_devices)} device(s): {unified_mesh}")
     print(f"for process-{jax.process_index()}:\n device: {jax.local_devices()} ")
 
     # Create engine and orchestrator with 16 slots
@@ -296,7 +295,8 @@ def main():
         pad_id=tokenizer.pad_id,
     )
 
-    orchestrator = InferenceOrchestrator(engine, max_prefill_batch_size=8)
+    # Create orchestrator in interleaved mode (no max_prefill_batch_size needed)
+    orchestrator = InferenceOrchestrator(engine)
     orchestrator.start()
 
     try:

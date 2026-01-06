@@ -492,46 +492,45 @@ class InferenceEngine:
 
 
 class InferenceOrchestrator:
-    """Orchestrates async prefill and generate threads for interactive serving.
+    """Orchestrates interleaved prefill and generate for interactive serving.
 
-    This class manages the complete inference pipeline:
+    This class manages the complete inference pipeline in interleaved mode:
     1. Receives requests via submit()
-    2. Prefill thread: Processes prompts sequentially
-    3. Generate thread: Batches multiple sequences via slots
+    2. Interleaved thread: Processes prefill batches of 8, then generates tokens
+    3. Detokenize thread: Streams results back to users
     4. Returns results via response queues
 
     Threading Model:
         - Main thread: Accepts requests via submit()
-        - Prefill thread: Processes prompts one at a time
-        - Generate thread: Batches generation across slots
+        - Interleaved thread: Handles both prefill (batches of 8) and generate
+        - Detokenize thread: Processes tokens and frees slots
 
     Communication:
-        - Prefill queue: Main → Prefill thread
-        - Generate queue: Prefill → Generate thread
-        - Response queues: Generate → User (one per request)
+        - Prefill queue: Main → Interleaved thread
+        - Detokenize backlog: Interleaved → Detokenize thread
+        - Response queues: Detokenize → User (one per request)
+
+    Interleaved Flow:
+        - Accumulate 8 requests → Prefill all 8 → Store in backlog
+        - Insert backlog items into slots as they free up
+        - Always run generate (even with 0 active slots for JAX sync)
     """
 
     def __init__(
         self,
         engine: InferenceEngine,
         prefill_queue_size: int = 100,
-        generate_queue_size: int = 100,
-        max_prefill_batch_size: int = 2,
     ):
-        """Initialize the orchestrator.
+        """Initialize the orchestrator for interleaved mode.
 
         Args:
             engine: InferenceEngine instance
             prefill_queue_size: Maximum size of prefill queue
-            generate_queue_size: Maximum size of generate queue
-            max_prefill_batch_size: Maximum number of requests to batch for prefill (fixed batch size)
         """
         self.engine = engine
-        self.max_prefill_batch_size = max_prefill_batch_size
 
         # Request queues
         self._prefill_queue = queue.Queue(prefill_queue_size)
-        self._transfer_backlog = queue.Queue(generate_queue_size)
         self._detokenize_backlog = queue.Queue(100)
 
         # Slot tracking - queue of available slot indices
@@ -541,12 +540,11 @@ class InferenceOrchestrator:
 
         # Thread control
         self._running = False
-        self._prefill_thread = None
-        self._generate_thread = None
+        self._interleaved_thread = None
         self._detokenize_thread = None
 
     def start(self):
-        """Start prefill and generate threads.
+        """Start interleaved and detokenize threads.
 
         This must be called before submitting requests.
         """
@@ -556,14 +554,9 @@ class InferenceOrchestrator:
         self._running = True
 
         # Start threads
-        self._prefill_thread = threading.Thread(
-            target=self._prefill_loop,
-            name="prefill-thread",
-            daemon=True,
-        )
-        self._generate_thread = threading.Thread(
-            target=self._generate_loop,
-            name="generate-thread",
+        self._interleaved_thread = threading.Thread(
+            target=self._interleaved_loop,
+            name="interleaved-thread",
             daemon=True,
         )
         self._detokenize_thread = threading.Thread(
@@ -572,11 +565,10 @@ class InferenceOrchestrator:
             daemon=True,
         )
 
-        self._prefill_thread.start()
-        self._generate_thread.start()
+        self._interleaved_thread.start()
         self._detokenize_thread.start()
 
-        print(f"[Orchestrator] Started with {self.engine.max_slots} slots")
+        print(f"[Orchestrator] Started in interleaved mode with {self.engine.max_slots} slots")
         sys.stdout.flush()
 
     def stop(self, timeout: float = 5.0):
@@ -597,12 +589,19 @@ class InferenceOrchestrator:
         self._detokenize_backlog.put(None)
 
         # Wait for threads to finish
-        self._prefill_thread.join(timeout=timeout)
-        self._generate_thread.join(timeout=timeout)
+        self._interleaved_thread.join(timeout=timeout)
         self._detokenize_thread.join(timeout=timeout)
 
         print("[Orchestrator] Stopped")
         sys.stdout.flush()
+
+    def _count_free_slots(self) -> int:
+        """Count available slots without removing them.
+
+        Returns:
+            Number of free slots currently available
+        """
+        return self._free_slots.qsize()
 
     def submit(self, request: InferenceRequest) -> queue.Queue:
         """Submit a request for inference and get a response queue.
@@ -663,13 +662,16 @@ class InferenceOrchestrator:
             "seq_length": batched_result["seq_lengths"][idx],
         }
 
-    def _process_batch(self, requests: List[InferenceRequest]):
+    def _process_prefill_batch(self, requests: List[InferenceRequest]):
         """Process a batch of requests, padding to longest sequence length.
 
         Args:
             requests: List of InferenceRequests to process together
+
+        Returns:
+            Tuple of (batched prefill result, requests list)
         """
-        print(f"[Prefill] Processing batch of {len(requests)} requests")
+        print(f"[Interleaved] Processing prefill batch of {len(requests)} requests")
         sys.stdout.flush()
         bsz = len(requests)
 
@@ -695,39 +697,91 @@ class InferenceOrchestrator:
 
         # Call batched prefill
         prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
-        print("[Prefill] Completed, sending to transfer backlog")
+        print("[Interleaved] Prefill batch completed")
         sys.stdout.flush()
 
-        # Unpack and send to transfer backlog
-        for i, req in enumerate(requests):
-            individual_result = self._extract_individual_result(prefill_result, i)
-            individual_result["request"] = req
-            self._transfer_backlog.put(individual_result)
-        print("[Prefill] sent to transfer backlog.")
+        return prefill_result, requests
+
+    def _interleaved_loop(self):
+        """Interleaved thread: handles both prefill and generate sequentially.
+
+        This method combines prefill and generate operations in a single thread.
+        It accumulates prefill requests and processes them in batches of 8,
+        then inserts prefilled results into slots as they become available.
+        """
+        print("[Interleaved Thread] Started")
         sys.stdout.flush()
 
-    def _prefill_loop(self):
-        """Prefill thread: batch requests, padding to longest sequence."""
-        print("[Prefill Thread] Started (batched mode)")
-        sys.stdout.flush()
+        # Initialize decode state
+        decode_state = self.engine.init_decode_state()
 
-        pending_requests = []
+        # Track pending prefill requests (not yet prefilled)
+        pending_prefill_requests = []
+
+        # Track prefilled results waiting for slots
+        # Each item: (individual_result, request, first_token)
+        prefilled_backlog = []
+
+        # Track generate timestep for detokenize coordination
+        generate_timestep = 0
 
         while self._running:
-            # Phase 1: Try to get new request (non-blocking)
-            try:
-                request = self._prefill_queue.get(timeout=0.001)
-                pending_requests.append(request)
-            except queue.Empty:
-                pass
-
-            # Phase 2: Process batch when full
-            if len(pending_requests) >= self.max_prefill_batch_size:
+            # PHASE 1: Accumulate prefill requests (non-blocking)
+            # Collect multiple requests in one iteration to build batch faster
+            while len(pending_prefill_requests) < 8:
                 try:
-                    self._process_batch(pending_requests)
+                    request = self._prefill_queue.get(timeout=0.001)
+                    pending_prefill_requests.append(request)
+                    print(
+                        f"[Interleaved] Received request '{request.request_id}', "
+                        f"pending: {len(pending_prefill_requests)}"
+                    )
+                    sys.stdout.flush()
+                except queue.Empty:
+                    break  # No more requests available right now
+
+            # PHASE 2: Prefill batch of 8 requests if available
+            if len(pending_prefill_requests) == 8:
+                print(
+                    f"[Interleaved] Processing prefill batch of 8 requests"
+                )
+                sys.stdout.flush()
+
+                try:
+                    # Process entire batch of 8
+                    prefill_result, requests = self._process_prefill_batch(
+                        pending_prefill_requests
+                    )
+
+                    # Extract all individual results and add to backlog
+                    for i, req in enumerate(requests):
+                        # Extract individual result from batch
+                        individual_result = self._extract_individual_result(
+                            prefill_result, i
+                        )
+
+                        # Get first token
+                        if jax.process_index() in self.engine.generate_procs:
+                            first_token = individual_result["next_token"].item()
+                        else:
+                            first_token = None
+
+                        # Add to prefilled backlog
+                        prefilled_backlog.append((individual_result, req, first_token))
+
+                    print(
+                        f"[Interleaved] Prefill complete, {len(prefilled_backlog)} results in backlog"
+                    )
+                    sys.stdout.flush()
+
+                    # Clear pending requests
+                    pending_prefill_requests = []
+
                 except Exception as e:
                     # Send errors to individual response queues
-                    for req in pending_requests:
+                    print(f"[Interleaved] Error processing prefill batch: {e}")
+                    sys.stdout.flush()
+                    for req in pending_prefill_requests:
                         req.response_queue.put(
                             {
                                 "status": "error",
@@ -735,80 +789,36 @@ class InferenceOrchestrator:
                                 "request_id": req.request_id,
                             }
                         )
+                    # Clear pending requests after error
+                    pending_prefill_requests = []
 
-                # Clear processed batch
-                pending_requests = []
-
-            # Small sleep to prevent busy waiting
-            if len(pending_requests) == 0:
-                time.sleep(0.0001)
-
-        print("[Prefill Thread] Stopped")
-        sys.stdout.flush()
-
-    def _generate_loop(self):
-        """Generate thread: insert requests and unconditional generation."""
-        print("[Generate Thread] Started")
-        sys.stdout.flush()
-
-        # Initialize decode state
-        decode_state = self.engine.init_decode_state()
-
-        # Initialize generate timestep counter
-        generate_timestep = 0
-        while self._running:
-            # PHASE 1: Insert one request from transfer_backlog (if available and slot free)
-            try:
+            # PHASE 3: Insert prefilled results into free slots
+            while len(prefilled_backlog) > 0 and self._count_free_slots() > 0:
+                # Get free slot
                 slot_idx = self._free_slots.get(block=False)
-            except queue.Empty:
-                slot_idx = None
 
-            if slot_idx is not None:
-                # Determine blocking behavior (JetStream pattern)
-                # Block if ALL slots are inactive (ensures at least one request before generate)
-                # Use int() to convert to Python scalar for comparison
+                # Pop next prefilled result
+                individual_result, req, first_token = prefilled_backlog.pop(0)
 
-                try:
-                    prefill_result = self._transfer_backlog.get(block=True, timeout=1.0)
+                # Insert into decode state (no transfer needed - unified mesh!)
+                decode_state = self.engine.insert_into_slot(
+                    individual_result, decode_state, slot_idx, req.request_id
+                )
 
-                    # CRITICAL: Transfer to generate mesh before insertion
-                    prefill_result = self.engine.transfer_prefill_to_generate(
-                        prefill_result
-                    )
-                    jax.block_until_ready(prefill_result)
+                print(
+                    f"[Interleaved] Inserted request '{req.request_id}' into slot {slot_idx}, "
+                    f"{len(prefilled_backlog)} remaining in backlog"
+                )
+                sys.stdout.flush()
 
-                    request = prefill_result["request"]
+                # Send slot assignment to detokenize thread
+                self._detokenize_backlog.put((slot_idx, req, first_token))
 
-                    if jax.process_index() in self.engine.generate_procs:
-                        first_token = prefill_result["next_token"].item()
-                    else:
-                        first_token = None
-
-                    # Insert into decode state
-                    decode_state = self.engine.insert_into_slot(
-                        prefill_result,
-                        decode_state,
-                        slot_idx,
-                        request.request_id,
-                    )
-                    print(
-                        f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}"
-                    )
-                    sys.stdout.flush()
-
-                    # Send slot assignment to detokenize thread
-                    # Message format: (slot_idx, request, first_token)
-                    self._detokenize_backlog.put(
-                        (slot_idx, request, first_token), block=True
-                    )
-
-                except queue.Empty:
-                    # Put slot back if no request available
-                    self._free_slots.put(slot_idx)
-                    # Fall through to generate even if we timed out
-                    # This ensures all devices execute generate_batch() together
-
+            # PHASE 4: Always execute generate step
+            # This maintains JAX collective synchronization across all devices
             decode_state, new_tokens = self.engine.generate_batch(decode_state)
+
+            # Send tokens to detokenize thread
             new_tokens_cpu = None
             if jax.process_index() in self.engine.generate_procs:
                 new_tokens_gathered = MeshHelper.allgather(
@@ -817,12 +827,10 @@ class InferenceOrchestrator:
                 new_tokens_gathered = jax.block_until_ready(new_tokens_gathered)
                 new_tokens_cpu = np.array(new_tokens_gathered)
 
-            self._detokenize_backlog.put(
-                (generate_timestep, new_tokens_cpu), block=True
-            )
+            self._detokenize_backlog.put((generate_timestep, new_tokens_cpu))
             generate_timestep += 1
 
-        print("[Generate Thread] Stopped")
+        print("[Interleaved Thread] Stopped")
         sys.stdout.flush()
 
     def _detokenize_loop(self):
