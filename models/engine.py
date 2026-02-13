@@ -457,7 +457,8 @@ class InferenceEngine:
                 batch_logits = logits[:, 0, :]
                 rng_key, subkey = random.split(rng_key)
                 new_tokens = sample_fn(batch_logits, subkey)
-                new_tokens = jnp.where(new_tokens.ndim == 1, new_tokens[:, None], new_tokens)
+                if new_tokens.ndim == 1:
+                    new_tokens = new_tokens[:, None]
 
                 # Only update tokens for active slots
                 updated_tokens = jnp.where(
