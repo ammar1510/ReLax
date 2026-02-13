@@ -99,8 +99,7 @@ def single_request_example():
         serve_cfg=serve_cfg,
         model=model,
         params=params,
-        prefill_mesh=mesh,
-        decode_mesh=mesh,
+        mesh=mesh,
         is_server=True,  # Single process, so this is the server
     )
 
@@ -166,8 +165,7 @@ def concurrent_requests_example():
         serve_cfg=serve_cfg,
         model=model,
         params=params,
-        prefill_mesh=mesh,
-        decode_mesh=mesh,
+        mesh=mesh,
         is_server=True,
     )
 
@@ -252,8 +250,7 @@ def event_loop_monitoring_example():
         serve_cfg=serve_cfg,
         model=model,
         params=params,
-        prefill_mesh=mesh,
-        decode_mesh=mesh,
+        mesh=mesh,
         is_server=True,
     )
 

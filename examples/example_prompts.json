@@ -1,0 +1,24 @@
+{
+  "prompts": [
+    "Write a function to calculate fibonacci numbers:",
+    "Explain how binary search works:",
+    "Create a class for a binary tree:",
+    "Write a function to reverse a string:",
+    "Implement a stack data structure:",
+    "Explain the concept of recursion:",
+    "Write a sorting algorithm:",
+    "Create a linked list implementation:",
+    "Explain what is dynamic programming:",
+    "Write a function to find prime numbers:",
+    "Implement a queue using two stacks:",
+    "Explain the difference between BFS and DFS:",
+    "Write a function to check if a string is a palindrome:",
+    "Create a hash table implementation:",
+    "Explain how merge sort works:",
+    "Write a function to find the maximum subarray sum:",
+    "Implement a graph data structure:",
+    "Explain what is Big O notation:",
+    "Write a function to detect cycles in a linked list:",
+    "Create a min heap implementation:"
+  ]
+}
