@@ -89,6 +89,7 @@ class ServingConfig:
     eos_tokens: tuple[int, ...] = ()
     token_pad_idx: int = 0
     max_decode_length: int = 64
+    max_cache_seqlen: int = 1024
     sampler: Sampler = dataclasses.field(default_factory=GreedySampler)
     rng_seed: int = 0
 
@@ -194,6 +195,7 @@ class InferenceEngine:
         buckets: Optional[List[int]] = None,
         sampler: Optional[Sampler] = None,
         rng_seed: int = 0,
+        max_cache_seqlen: Optional[int] = None,
     ):
         """Initialize the inference engine.
 
@@ -206,6 +208,7 @@ class InferenceEngine:
             buckets: List of bucket sizes for prompt padding (default: power-of-2)
             sampler: Sampling strategy (default: GreedySampler)
             rng_seed: Seed for PRNG key used in stochastic sampling
+            max_cache_seqlen: Override model's max_seqlen for KV cache allocation
         """
         self.model = model
         self.max_slots = max_concurrent_slots
@@ -214,6 +217,7 @@ class InferenceEngine:
         self.mesh = mesh
         self.sampler = sampler or GreedySampler()
         self.rng_key = random.PRNGKey(rng_seed)
+        self.max_cache_seqlen = max_cache_seqlen or model.args.max_seqlen
 
         # Place params on mesh
         self.params = jax.block_until_ready(
@@ -295,7 +299,7 @@ class InferenceEngine:
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=bsz,
-            max_seqlen=self.config.max_seqlen,
+            max_seqlen=self.max_cache_seqlen,
             kv_heads=self.config.n_kv_heads,
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
@@ -582,7 +586,7 @@ class InferenceEngine:
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=self.max_slots,
-            max_seqlen=self.config.max_seqlen,
+            max_seqlen=self.max_cache_seqlen,
             kv_heads=self.config.n_kv_heads,
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
@@ -676,6 +680,7 @@ class ServingLoop:
             pad_id=serve_cfg.token_pad_idx,
             sampler=serve_cfg.sampler,
             rng_seed=serve_cfg.rng_seed,
+            max_cache_seqlen=serve_cfg.max_cache_seqlen,
         )
 
         # Setup decode work
