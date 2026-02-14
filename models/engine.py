@@ -882,7 +882,7 @@ class ServingLoop:
         """
         # Dispatch tokens to results via output_mapping
         for token, req_id in zip(output_tokens_flat, output_mapping_flat):
-            if req_id > 0 and req_id in self.results:
+            if req_id >= 0 and req_id in self.results:
                 self.results[req_id].token_list.append(token)
                 self.results[req_id].tokens_decoded += 1
 
@@ -915,7 +915,7 @@ class ServingLoop:
                     break
 
                 result: PrefillResult = self.prefill_work.to_decode.pop(0)
-                self.decode_work.active_results[i] = DecodeResult(result.id, result.input.tolist())
+                self.decode_work.active_results[i] = DecodeResult(result.id, [])
                 self.results[result.id] = self.decode_work.active_results[i]
                 batch_updates.append((result.cache_entry, i, result.len, result.next_token))
 
