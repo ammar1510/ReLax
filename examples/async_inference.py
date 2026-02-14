@@ -82,7 +82,7 @@ def single_request_example():
 
     # Create mesh
     all_devices = np.array(jax.devices())
-    mesh = Mesh(all_devices, "i")
+    mesh = Mesh(all_devices, "tp")
 
     # Create serving config
     serve_cfg = ServingConfig(
@@ -148,7 +148,7 @@ def concurrent_requests_example():
 
     # Create mesh
     all_devices = np.array(jax.devices())
-    mesh = Mesh(all_devices, "i")
+    mesh = Mesh(all_devices, "tp")
 
     # Create serving config with more slots
     serve_cfg = ServingConfig(
@@ -233,7 +233,7 @@ def event_loop_monitoring_example():
 
     # Create mesh
     all_devices = np.array(jax.devices())
-    mesh = Mesh(all_devices, "i")
+    mesh = Mesh(all_devices, "tp")
 
     # Create serving config
     serve_cfg = ServingConfig(

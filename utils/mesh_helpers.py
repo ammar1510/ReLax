@@ -15,11 +15,12 @@ class MeshHelper:
 
     @staticmethod
     def allgather(array: jax.Array, mesh: Mesh) -> jax.Array:
-        gather_fn = lambda x: jax.lax.all_gather(x, "i", tiled=True)
+        axis_name = MeshHelper.get_axis_name(mesh)
+        gather_fn = lambda x: jax.lax.all_gather(x, axis_name, tiled=True)
         sharded_gather = jax.shard_map(
             gather_fn,
             mesh=mesh,
-            in_specs=PS("i"),
+            in_specs=PS(axis_name),
             out_specs=PS(),
             check_vma=False,
         )

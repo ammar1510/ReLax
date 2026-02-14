@@ -468,6 +468,11 @@ class InferenceEngine:
                     curr_tokens,
                 )
 
+                # Reshard carry to match input sharding (prevents drift across scan iterations)
+                updated_tokens = jax.sharding.reshard(
+                    updated_tokens, jax.typeof(curr_tokens).sharding.spec
+                )
+
                 return (updated_tokens, updated_cache, rng_key), new_tokens
 
             # Run scan for N steps — (curr_tokens, cache, rng_key) in carry
