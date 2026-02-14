@@ -417,12 +417,13 @@ class InferenceEngine:
         sample_fn = self.sampler.sample
 
         @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
-        def multistep_decode_fn(curr_tokens, active_mask, cache, rng_key, steps: int = 10):
+        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
             """Generate multiple tokens in a single JIT-compiled call.
 
             Args:
                 curr_tokens: Current tokens [batch, 1]
                 active_mask: Boolean mask of active slots [batch]
+                params: Model parameters (passed explicitly to avoid capture as constants)
                 cache: KV cache
                 rng_key: PRNG key for sampling (split each step)
                 steps: Number of tokens to generate
@@ -444,9 +445,9 @@ class InferenceEngine:
                 bsz, seqlen = curr_tokens.shape
                 mask = build_attn_mask(seqlen, cache, true_lengths)
 
-                # Forward pass
+                # Forward pass — params passed from outer scope (JIT arg, not closure capture)
                 logits, updated_cache = engine.model.apply(
-                    {"params": engine.params},
+                    {"params": params},
                     curr_tokens,
                     true_lengths,
                     cache,
@@ -888,6 +889,7 @@ class ServingLoop:
             (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
                 active_mask,
+                self.engine.params,
                 self.decode_work.cache,
                 decode_rng_key,
                 steps=self.serve_cfg.decode_steps,
