@@ -885,6 +885,10 @@ class ServingLoop:
         output_mapping = np.array(output_mapping).T  # [batch, steps]
 
         self.engine.rng_key, decode_rng_key = random.split(self.engine.rng_key)
+        print(f"[ServingLoop] Starting decode step (JIT compiling on first call)...")
+        sys.stdout.flush()
+        import time as _time
+        _t0 = _time.time()
         with set_mesh(self.mesh):
             (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
@@ -898,6 +902,8 @@ class ServingLoop:
             # Update decode work
             self.decode_work.curr_tokens = final_tokens
             self.decode_work.cache = final_cache
+        print(f"[ServingLoop] Decode step completed in {_time.time() - _t0:.1f}s")
+        sys.stdout.flush()
 
         # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
         # Swap current output with stored output (allows decode kernel to run async)
