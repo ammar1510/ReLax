@@ -699,6 +699,7 @@ class ServingLoop:
 
         # Create multistep decode function
         self.multistep_decode_fn = self.engine.make_multistep_decode_fn()
+        self._decode_call_count = 0
 
         # Delayed EOS detection: stores (output_tokens, output_mapping) from previous iteration
         self.decode_output = (None, None)
@@ -936,6 +937,8 @@ class ServingLoop:
         output_mapping = np.array(output_mapping).T  # [batch, steps]
 
         self.engine.rng_key, decode_rng_key = random.split(self.engine.rng_key)
+        import time as _time
+        _t0 = _time.time()
         with set_mesh(self.mesh):
             (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
@@ -945,10 +948,19 @@ class ServingLoop:
                 decode_rng_key,
                 steps=self.serve_cfg.decode_steps,
             )
+            jax.block_until_ready((final_tokens, final_cache, output_tokens))
 
             # Update decode work
             self.decode_work.curr_tokens = final_tokens
             self.decode_work.cache = final_cache
+
+        self._decode_call_count += 1
+        _elapsed = _time.time() - _t0
+        _active = int(active_mask.sum())
+        print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
+              f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
+              f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
+        sys.stdout.flush()
 
         # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
         # Swap current output with stored output (allows decode kernel to run async)
