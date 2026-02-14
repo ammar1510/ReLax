@@ -182,7 +182,7 @@ def main():
     parser.add_argument(
         "--max_decode_length",
         type=int,
-        default=512,
+        default=256,
         help="Maximum number of tokens to generate per request (default: 512)",
     )
     parser.add_argument(
