@@ -719,6 +719,57 @@ class ServingLoop:
         print(f"[ServingLoop] Initialized with roles: {self.roles}")
         sys.stdout.flush()
 
+    def warmup(self):
+        """Trigger JIT compilation of prefill and decode with dummy inputs.
+
+        Call this once before real inference to avoid compilation stalls
+        during the first serving_step.
+        """
+        import time as _time
+        cfg = self.engine.config
+        bsz_prefill = self.serve_cfg.prefill_batch_size
+        bsz_decode = self.serve_cfg.decode_batch_size
+
+        # Warmup prefill
+        print("[ServingLoop] Warming up prefill (JIT compiling)...")
+        sys.stdout.flush()
+        t0 = _time.time()
+
+        dummy_tokens = jnp.ones((bsz_prefill, 64), dtype=jnp.int32)
+        dummy_lengths = jnp.full((bsz_prefill,), 10, dtype=jnp.int32)
+        with set_mesh(self.mesh):
+            prefill_result = self.engine.prefill(dummy_tokens, dummy_lengths)
+        jax.block_until_ready(prefill_result["next_tokens"])
+        print(f"[ServingLoop] Prefill compiled in {_time.time() - t0:.1f}s")
+        sys.stdout.flush()
+
+        # Warmup decode
+        print("[ServingLoop] Warming up decode (JIT compiling)...")
+        sys.stdout.flush()
+        t0 = _time.time()
+
+        dummy_active_mask = jnp.ones(bsz_decode, dtype=bool)
+        dummy_rng_key = random.PRNGKey(0)
+        with set_mesh(self.mesh):
+            self.multistep_decode_fn(
+                self.decode_work.curr_tokens,
+                dummy_active_mask,
+                self.engine.params,
+                self.decode_work.cache,
+                dummy_rng_key,
+                steps=self.serve_cfg.decode_steps,
+            )
+        print(f"[ServingLoop] Decode compiled in {_time.time() - t0:.1f}s")
+        sys.stdout.flush()
+
+        # Re-initialize decode state (discard dummy results)
+        decode_state = self.engine.init_decode_state()
+        self.decode_work.curr_tokens = decode_state.tokens
+        self.decode_work.cache = decode_state.kv_cache
+
+        print("[ServingLoop] Warmup complete")
+        sys.stdout.flush()
+
     def _determine_roles(self, is_server: bool, mesh: Mesh) -> tuple:
         """Determine this process's roles for multi-host coordination.
 
@@ -885,10 +936,6 @@ class ServingLoop:
         output_mapping = np.array(output_mapping).T  # [batch, steps]
 
         self.engine.rng_key, decode_rng_key = random.split(self.engine.rng_key)
-        print(f"[ServingLoop] Starting decode step (JIT compiling on first call)...")
-        sys.stdout.flush()
-        import time as _time
-        _t0 = _time.time()
         with set_mesh(self.mesh):
             (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
@@ -902,8 +949,6 @@ class ServingLoop:
             # Update decode work
             self.decode_work.curr_tokens = final_tokens
             self.decode_work.cache = final_cache
-        print(f"[ServingLoop] Decode step completed in {_time.time() - _t0:.1f}s")
-        sys.stdout.flush()
 
         # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
         # Swap current output with stored output (allows decode kernel to run async)
