@@ -212,8 +212,8 @@ def main():
     # Create serving configuration
     serve_cfg = ServingConfig(
         decode_steps=10,
-        decode_batch_size=16,
-        prefill_batch_size=4,
+        decode_batch_size=len(prompts),
+        prefill_batch_size=len(prompts),
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=args.max_decode_length,

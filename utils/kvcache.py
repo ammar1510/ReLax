@@ -29,9 +29,8 @@ class KVCache:
     def update(self, xk: jax.Array, xv: jax.Array, layer_idx: int):
         """Updates the Key and Value cache for all sequences, each at their own position.
 
-        Each sequence in the batch can be at a different cache position. This method
-        writes each sequence's keys/values at its corresponding position tracked in
-        self.seq_positions.
+        Uses vmap to vectorize across the batch dimension — a single batched
+        scatter replaces bsz sequential dynamic_update_slice calls.
 
         Args:
           xk: The new key tensor to be added to the cache.
@@ -42,51 +41,32 @@ class KVCache:
 
         Returns:
           A new KVCache object with updated keys, values, and incremented positions.
-
-        Note:
-          Padding tokens in the input are written to cache but will be masked
-          during attention based on positions parameter.
         """
-        # xk, xv shapes: [bsz, n_kv_heads, seqlen, head_dim] - already transposed
-        # self.k, self.v shapes: [layers, bsz, kv_heads, max_seqlen, head_dim]
-
-        bsz, n_kv_heads, seqlen, head_dim = xk.shape
-
-        # Ensure xk/xv have the same dtype as cache
         xk = xk.astype(self.k.dtype)
         xv = xv.astype(self.v.dtype)
 
-        # Start with current cache
-        new_k = self.k
-        new_v = self.v
+        def _update_single(cache_slice, new_kv, pos):
+            """Update one sequence's cache at its position.
 
-        # Update each sequence at its own position
-        # Loop over batch dimension - unrolls at compile time (bsz is static)
-        for i in range(bsz):
-            # Get this sequence's current cache position
-            start_pos = self.seq_positions[i]  # Dynamic value, different per sequence
+            Args:
+                cache_slice: [kv_heads, max_seqlen, head_dim]
+                new_kv: [kv_heads, seqlen, head_dim]
+                pos: scalar — this sequence's current cache position
+            """
+            return jax.lax.dynamic_update_slice(cache_slice, new_kv, (0, pos, 0))
 
-            # Extract this sequence's keys/values: [n_kv_heads, seqlen, head_dim]
-            xk_i = xk[i]
-            xv_i = xv[i]
+        # Extract this layer: [bsz, kv_heads, max_seqlen, head_dim]
+        layer_k = self.k[layer_idx]
+        layer_v = self.v[layer_idx]
 
-            # Reshape for dynamic_update_slice: [1, 1, n_kv_heads, seqlen, head_dim]
-            # Leading dims: (layer, batch_idx)
-            xk_update = xk_i[None, None, :, :, :]
-            xv_update = xv_i[None, None, :, :, :]
+        # vmap over batch — all sequences updated in one batched op
+        updated_k = jax.vmap(_update_single)(layer_k, xk, self.seq_positions)
+        updated_v = jax.vmap(_update_single)(layer_v, xv, self.seq_positions)
 
-            # Update cache at this sequence's position
-            # Indices: (layer, batch_idx, kv_head, seq_pos, head_dim)
-            new_k = jax.lax.dynamic_update_slice(
-                new_k,
-                xk_update,
-                (layer_idx, i, 0, start_pos, 0)
-            )
-            new_v = jax.lax.dynamic_update_slice(
-                new_v,
-                xv_update,
-                (layer_idx, i, 0, start_pos, 0)
-            )
+        # Write back to full cache
+        new_k = self.k.at[layer_idx].set(updated_k)
+        new_v = self.v.at[layer_idx].set(updated_v)
+
         return KVCache(k=new_k, v=new_v, seq_positions=self.seq_positions)
 
 
