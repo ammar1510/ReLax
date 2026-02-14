@@ -4,10 +4,6 @@ Loads a LLaMA model with weights from disk and performs batch inference
 using the ServingLoop event loop pattern.
 
 Usage:
-    # Single process
-    python inference.py --model_path /path/to/model
-
-    # Multi-host (initialize JAX distributed first)
     python inference.py --model_path /path/to/model
 """
 
@@ -185,15 +181,7 @@ def main():
         default=256,
         help="Maximum number of tokens to generate per request (default: 512)",
     )
-    parser.add_argument(
-        "--multi_host",
-        action="store_true",
-        help="Initialize JAX distributed for multi-host inference",
-    )
     args = parser.parse_args()
-
-    if args.multi_host:
-        jax.distributed.initialize()
 
     prompts = DEFAULT_PROMPTS
 
@@ -201,9 +189,10 @@ def main():
     print("Loading model...")
     model, params, config, tokenizer = load_model(args.model_path)
 
-    # Create mesh
-    all_devices = np.array(jax.devices())
-    mesh = Mesh(all_devices, "i")
+    # Create mesh — all devices along single TP axis
+    # On multi-chip TPUs (e.g. v4-8), JAX auto-discovers all chips
+    devices = jax.devices()
+    mesh = Mesh(np.array(devices), "tp")
 
     print(f"Created mesh with {len(all_devices)} device(s): {mesh}")
     print(f"Process {jax.process_index()}: devices {jax.local_devices()}")
@@ -212,8 +201,8 @@ def main():
     # Create serving configuration
     serve_cfg = ServingConfig(
         decode_steps=10,
-        decode_batch_size=len(prompts),
-        prefill_batch_size=len(prompts),
+        decode_batch_size=16,
+        prefill_batch_size=4,
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=args.max_decode_length,
