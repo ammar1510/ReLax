@@ -121,8 +121,10 @@ class MeshHelper:
     def param_sharding(x, name: str, mesh: Mesh):
         if "norm" in name or "freqs_cis" in name:
             return PS()
-        if any(k in name for k in ("wq", "wk", "wv")):
-            return MeshHelper.batch_axis_spec(mesh, x.ndim, 0)
+        if "wq" in name:
+            return MeshHelper.batch_axis_spec(mesh, x.ndim, 1)
+        if any(k in name for k in ("wk", "wv")):
+            return PS()
         if any(k in name for k in ("embedding", "gate", "up")):
             return MeshHelper.batch_axis_spec(mesh, x.ndim, 1)
         if any(k in name for k in ("down", "output", "wo")):
