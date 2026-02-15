@@ -226,6 +226,10 @@ def main():
     # Run batch generation
     generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
+    # Ensure all hosts finish before any process exits
+    from models.sync_server import SyncServer
+    SyncServer.barrier("shutdown", 0)
+
     print("\nDone!")
 
 
