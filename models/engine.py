@@ -24,8 +24,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from flax.core import FrozenDict
-from jax.sharding import Mesh, PartitionSpec as PS, set_mesh
-from jaxlib.xla_client import NamedSharding
+from jax.sharding import Mesh, set_mesh
 import numpy as np
 from jax import jit
 
@@ -335,71 +334,6 @@ class InferenceEngine:
             "seq_lengths": true_lengths,  # [bsz]
         }
 
-    def generate_batch(
-        self,
-        decode_state: DecodeState,
-    ) -> Tuple[DecodeState, jax.Array]:
-        """Generate one token for ALL active slots in a batch.
-
-        This is the core batching mechanism - all active sequences generate
-        one token in a single forward pass, maximizing GPU utilization.
-
-        Args:
-            decode_state: Current decode state with active slots
-
-        Returns:
-            Tuple of:
-                - Updated decode state with new tokens and incremented positions
-                - New tokens for each slot [max_slots, 1]
-
-        Note: The model.apply step is JIT-compiled internally for efficiency.
-        """
-        # Forward pass with all slot tokens
-        # tokens shape: [max_slots, 1]
-        # true_lengths represents the actual (non-padded) input length for THIS step
-        # For generation, we're processing 1 token at a time
-        # Only active slots should have true_length=1, inactive slots should be 0
-        true_lengths = decode_state.active_mask.astype(jnp.int32)
-
-        # Build attention mask - pass seqlen directly instead of dummy tensor
-        bsz, seqlen = decode_state.tokens.shape
-        mask = build_attn_mask(seqlen, decode_state.kv_cache, true_lengths)
-
-        # Forward pass (JIT-compiled)
-        logits, updated_cache = self.model.apply(
-            {"params": self.params},
-            decode_state.tokens,
-            true_lengths,
-            decode_state.kv_cache,
-            mask,
-        )
-
-        # Sample next token for each slot
-        # logits shape: [max_slots, 1, vocab_size]
-        # Take first (and only) position: [max_slots, vocab_size]
-        batch_logits = logits[:, 0, :]
-
-        self.rng_key, subkey = random.split(self.rng_key)
-        new_tokens = self.sampler.sample(batch_logits, subkey)
-        new_tokens = new_tokens[:, None] if new_tokens.ndim == 1 else new_tokens  # [max_slots, 1]
-
-        # Only update tokens for active slots (inactive slots keep old tokens)
-        updated_tokens = jnp.where(
-            decode_state.active_mask[:, None],
-            new_tokens,
-            decode_state.tokens,
-        )
-
-        # Create updated decode state
-        updated_state = DecodeState(
-            kv_cache=updated_cache,
-            tokens=updated_tokens,
-            active_mask=decode_state.active_mask,
-            request_ids=decode_state.request_ids,
-        )
-
-        return updated_state, new_tokens
-
     def make_multistep_decode_fn(self):
         """Create a JIT-compiled multistep decode function.
 
@@ -487,101 +421,6 @@ class InferenceEngine:
             return (final_tokens, final_cache), output_tokens
 
         return multistep_decode_fn
-
-    def insert_into_slot(
-        self,
-        prefill_result: Dict[str, any],
-        decode_state: DecodeState,
-        slot_idx: int,
-        request_id: str,
-    ) -> DecodeState:
-        """Insert a prefilled sequence into a specific slot.
-
-        This method takes a prefilled KV cache (from prefill()) and inserts it
-        into the decode batch at the specified slot position.
-
-        Args:
-            prefill_result: Output from prefill() containing cache and first token
-            decode_state: Current decode state
-            slot_idx: Slot index to insert into (0 to max_slots-1)
-            request_id: Request ID to associate with this slot
-
-        Returns:
-            Updated decode state with the new sequence inserted at slot_idx
-        """
-        # Extract from prefill result
-        prefill_cache = prefill_result["cache"]
-        next_token = prefill_result["next_token"]
-        seq_length = prefill_result["seq_length"]
-
-        # Prefill cache has shape [layers, 1, max_seq_len, kv_heads, head_dim]
-        # Need to insert it at position slot_idx in the batch dimension
-
-        # For KV cache: insert at batch position slot_idx
-        # Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
-
-        # Extract the single-sequence cache
-        # prefill_cache.k shape: [layers, 1, max_seq_len, kv_heads, head_dim]
-        new_k = decode_state.kv_cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(
-            prefill_cache.k
-        )
-        new_v = decode_state.kv_cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(
-            prefill_cache.v
-        )
-
-        # Update cache with new K/V and set position for this slot
-        updated_cache = KVCache(
-            k=new_k,
-            v=new_v,
-            seq_positions=decode_state.kv_cache.seq_positions.at[slot_idx].set(
-                seq_length
-            ),
-        )
-
-        # Update token for this slot
-        updated_tokens = decode_state.tokens.at[slot_idx, 0].set(next_token)
-
-        # Mark slot as active
-        updated_active_mask = decode_state.active_mask.at[slot_idx].set(True)
-
-        # Update request IDs
-        updated_request_ids = decode_state.request_ids.copy()
-        updated_request_ids[slot_idx] = request_id
-
-        return DecodeState(
-            kv_cache=updated_cache,
-            tokens=updated_tokens,
-            active_mask=updated_active_mask,
-            request_ids=updated_request_ids,
-        )
-
-    def remove_from_slot(
-        self,
-        decode_state: DecodeState,
-        slot_idx: int,
-    ) -> DecodeState:
-        """Mark a slot as inactive when its sequence finishes.
-
-        Args:
-            decode_state: Current decode state
-            slot_idx: Slot index to deactivate
-
-        Returns:
-            Updated decode state with slot marked as inactive
-        """
-        # Mark slot as inactive
-        updated_active_mask = decode_state.active_mask.at[slot_idx].set(False)
-
-        # Clear request ID
-        updated_request_ids = decode_state.request_ids.copy()
-        updated_request_ids[slot_idx] = None
-
-        return DecodeState(
-            kv_cache=decode_state.kv_cache,  # Cache can stay (will be overwritten)
-            tokens=decode_state.tokens,
-            active_mask=updated_active_mask,
-            request_ids=updated_request_ids,
-        )
 
     def init_decode_state(self) -> DecodeState:
         """Initialize empty decode state with all slots inactive.
@@ -927,6 +766,15 @@ class ServingLoop:
             # Batch update cache and tokens
             if "worker" in self.roles and len(batch_updates) > 0:
                 self._update_cache_and_index(batch_updates)
+                # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
+                self.decode_work.cache = self.engine.mesh_helper.place_kv_cache(
+                    self.decode_work.cache, self.mesh
+                )
+                self.decode_work.curr_tokens = self.engine.mesh_helper.put_on_mesh(
+                    self.decode_work.curr_tokens,
+                    self.mesh,
+                    self.engine.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+                )
 
         # Phase 2: Run multistep decode (skip if all slots empty)
         if all(x is None for x in self.decode_work.active_results):
