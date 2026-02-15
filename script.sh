@@ -22,4 +22,4 @@ git pull origin interleaved
 #   uv pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 # fi
 
-uv run python inference.py --model_path "$MODEL_DIR"
+JAX_LOG_COMPILES=1 uv run python inference.py --model_path "$MODEL_DIR"
