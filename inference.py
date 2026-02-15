@@ -131,7 +131,10 @@ def generate_batch(
     start_time = time.time()
     max_iterations = 10000
 
+    pid = jax.process_index()
     for iteration in range(max_iterations):
+        print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+        sys.stdout.flush()
         serving_loop.serving_step()
 
         newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
@@ -140,9 +143,10 @@ def generate_batch(
         if completed >= len(prompts):
             if verbose:
                 elapsed = time.time() - start_time
-                print(f"\n{'='*80}")
-                print(f"All {len(prompts)} requests completed in {elapsed:.2f}s")
-                print(f"{'='*80}\n")
+                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+                sys.stdout.flush()
+            print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
+            sys.stdout.flush()
             break
 
     # Decode results
@@ -167,6 +171,7 @@ def generate_batch(
 
 
 def main():
+    jax.distributed.initialize()
     parser = argparse.ArgumentParser(
         description="LLaMA inference with slot-based engine"
     )
@@ -227,10 +232,15 @@ def main():
     generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
     # Ensure all hosts finish before any process exits
+    pid = jax.process_index()
+    print(f"[P{pid}] reaching shutdown barrier")
+    sys.stdout.flush()
     from models.sync_server import SyncServer
     SyncServer.barrier("shutdown", 0)
+    print(f"[P{pid}] passed shutdown barrier")
+    sys.stdout.flush()
 
-    print("\nDone!")
+    print(f"\n[P{pid}] Done!")
 
 
 if __name__ == "__main__":

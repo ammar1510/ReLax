@@ -749,6 +749,7 @@ class ServingLoop:
 
     def decode_step(self):
         """One decode iteration: insert pending prefills + run multistep decode."""
+        self._log("decode: phase1 (insert prefills)")
         # Phase 1: Insert pending prefills into free slots
         if len(self.prefill_work.to_decode) > 0:
             batch_updates = []
@@ -777,7 +778,10 @@ class ServingLoop:
                 )
 
         # Phase 2: Run multistep decode (skip if all slots empty)
-        if all(x is None for x in self.decode_work.active_results):
+        active_count = sum(1 for x in self.decode_work.active_results if x is not None)
+        self._log(f"decode: phase2 (active_slots={active_count})")
+        if active_count == 0:
+            self._log("decode: all slots empty, early return (SKIPPING phase3 sync!)")
             return
 
         # Build active_mask for multistep decode
@@ -820,7 +824,9 @@ class ServingLoop:
         self.decode_output, (output_tokens, output_mapping) = \
             (output_tokens, output_mapping), self.decode_output
 
+        self._log(f"decode: phase3 (has_prev_output={output_tokens is not None})")
         if output_tokens is not None:
+            self._log("decode: entering barrier:decode_output")
             SyncServer.barrier("decode_output", self._it)
             if "worker" in self.roles:
                 output_tokens = np.array(output_tokens)  # [B, steps]
@@ -831,6 +837,7 @@ class ServingLoop:
                 output_tokens_flat, output_mapping_flat, done = None, None, None
 
             # Broadcast results to all processes
+            self._log(f"decode: entering broadcast:decode_tokens (done={done})")
             output_tokens_flat, output_mapping_flat, done = SyncServer.broadcast(
                 "decode_tokens",
                 self._it,
@@ -853,8 +860,10 @@ class ServingLoop:
         self.prefill_work.to_prefill = self.prefill_work.to_prefill[len(prefill_batch) :]
 
         if len(prefill_batch) == 0:
+            self._log("prefill: no pending requests")
             return
 
+        self._log(f"prefill: processing {len(prefill_batch)} requests")
         # Prepare batched inputs (pad to max length in batch)
         max_len = max(len(req.text) for req in prefill_batch)
         bucket_size = take_nearest_bucket(self.engine.buckets, max_len)
@@ -876,8 +885,10 @@ class ServingLoop:
         batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [bsz]
 
         # Call prefill
+        self._log(f"prefill: calling engine.prefill (shape={batched_tokens.shape})")
         with set_mesh(self.mesh):
             prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
+        self._log("prefill: engine.prefill done")
 
         # Extract individual results and add to decode queue
         for i, req in enumerate(prefill_batch):
@@ -895,12 +906,18 @@ class ServingLoop:
         print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
         sys.stdout.flush()
 
+    def _log(self, msg):
+        pid = jax.process_index()
+        print(f"[P{pid}|it={self._it}] {msg}")
+        sys.stdout.flush()
+
     def serving_step(self):
         """Main event loop step (call repeatedly).
 
         This method coordinates all processes using SyncServer for multi-host setups.
         """
         # Sync requests from server process
+        self._log("entering barrier:serving_step")
         SyncServer.barrier("serving_step", self._it)
         self._it += 1
 
@@ -911,6 +928,7 @@ class ServingLoop:
         else:
             requests = None
 
+        self._log("entering broadcast:requests")
         requests = SyncServer.broadcast(
             "requests", self._it, requests, is_source="server" in self.roles
         )
@@ -920,8 +938,11 @@ class ServingLoop:
             self.prefill_work.requests.append(UserRequestPrompt(**req))
 
         # Execute decode and prefill
+        self._log("entering decode_step")
         self.decode_step()
+        self._log("entering prefill_step")
         self.prefill_step()
+        self._log("serving_step done")
 
     def add_request(self, request: UserRequestPrompt):
         """Add new request (thread-safe).
