@@ -194,7 +194,7 @@ def main():
     devices = jax.devices()
     mesh = Mesh(np.array(devices), "tp")
 
-    print(f"Created mesh with {len(all_devices)} device(s): {mesh}")
+    print(f"Created mesh with {len(devices)} device(s): {mesh}")
     print(f"Process {jax.process_index()}: devices {jax.local_devices()}")
     sys.stdout.flush()
 

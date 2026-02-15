@@ -137,6 +137,12 @@ def main():
         default="./grpo_output",
         help="Output directory for checkpoints and logs",
     )
+    parser.add_argument(
+        "--checkpoint_freq",
+        type=int,
+        default=100,
+        help="Save checkpoint every N iterations (0 to disable)",
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -216,9 +222,12 @@ def main():
     print(f"{'='*80}\n")
 
     # Train
+    checkpoint_dir = str(output_dir / "checkpoints") if args.checkpoint_freq > 0 else None
     metrics = trainer.train(
         prompt_dataset=prompt_dataset,
         num_iterations=args.num_iterations,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_freq=args.checkpoint_freq,
     )
 
     # Save metrics
@@ -227,7 +236,8 @@ def main():
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved to {metrics_path}")
 
-    # TODO: Save final model checkpoint
+    # Save final checkpoint
+    trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
     print("\nTraining complete!")
     print(f"\nFinal metrics:")
     print(f"  Mean reward: {metrics[-1]['mean_reward']:.4f}")
