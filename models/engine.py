@@ -503,6 +503,7 @@ class ServingLoop:
         params: FrozenDict,
         mesh: Mesh,
         is_server: bool = False,
+        verbose: bool = False,
     ):
         """Initialize the serving loop.
 
@@ -516,6 +517,7 @@ class ServingLoop:
         self.serve_cfg = serve_cfg
         self.model = model
         self.mesh = mesh
+        self.verbose = verbose
 
         # Initialize InferenceEngine for core operations
         self.engine = InferenceEngine(
@@ -908,6 +910,8 @@ class ServingLoop:
         sys.stdout.flush()
 
     def _log(self, msg):
+        if not self.verbose:
+            return
         pid = jax.process_index()
         print(f"[P{pid}|it={self._it}] {msg}")
         sys.stdout.flush()

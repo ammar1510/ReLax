@@ -132,9 +132,11 @@ def generate_batch(
     max_iterations = 10000
 
     pid = jax.process_index()
+    debug = serving_loop.verbose
     for iteration in range(max_iterations):
-        print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
-        sys.stdout.flush()
+        if debug:
+            print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+            sys.stdout.flush()
         serving_loop.serving_step()
 
         newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
@@ -145,8 +147,9 @@ def generate_batch(
                 elapsed = time.time() - start_time
                 print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
                 sys.stdout.flush()
-            print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
-            sys.stdout.flush()
+            if debug:
+                print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
+                sys.stdout.flush()
             break
 
     # Decode results
