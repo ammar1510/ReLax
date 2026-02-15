@@ -829,7 +829,7 @@ class ServingLoop:
             self._log("decode: entering barrier:decode_output")
             SyncServer.barrier("decode_output", self._it)
             if "worker" in self.roles:
-                output_tokens = jax.experimental.multihost_utils.process_allgather(output_tokens)
+                output_tokens = jax.experimental.multihost_utils.process_allgather(output_tokens,tiled=True)
                 output_tokens = np.array(output_tokens)  # [B, steps]
                 done = self._check_done_sequences(output_tokens)
                 output_tokens_flat = output_tokens.reshape(-1).tolist()
