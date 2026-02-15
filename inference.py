@@ -30,7 +30,7 @@ DEFAULT_PROMPTS = [
     "Explain the transformer architecture in simple terms.",
     "Write a Python function that checks if a number is prime.",
     "What are the benefits of tensor parallelism for LLM inference?",
-]
+] * 4  # 16 prompts to match prefill_batch_size
 
 
 def load_model(model_path: str, config_path: Optional[str] = None):
@@ -202,7 +202,7 @@ def main():
     serve_cfg = ServingConfig(
         decode_steps=10,
         decode_batch_size=16,
-        prefill_batch_size=4,
+        prefill_batch_size=16,
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=args.max_decode_length,

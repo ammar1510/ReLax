@@ -84,7 +84,7 @@ class ServingConfig:
 
     decode_steps: int = 10
     decode_batch_size: int = 16
-    prefill_batch_size: int = 4
+    prefill_batch_size: int = 16
     eos_tokens: tuple[int, ...] = ()
     token_pad_idx: int = 0
     max_decode_length: int = 64
