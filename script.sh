@@ -5,7 +5,7 @@ set -e
 
 export PATH="$HOME/.local/bin:$PATH"
 
-MODEL_DIR="$HOME/Llama-3.2-3B-Instruct"
+MODEL_DIR="$HOME/Llama-3.1-8B-Instruct"
 cd "$HOME/ReLax"
 
 # Switch to sharding branch
