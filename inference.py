@@ -10,6 +10,7 @@ Usage:
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
@@ -229,4 +230,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        pid = jax.process_index()
+        print(f"\n[HOST {pid}] FATAL ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(1)
