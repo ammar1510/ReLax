@@ -6,8 +6,8 @@ dependencies = [
   "jax",
   "flax",
   "numpy",
-  "safetensors"
-  "huggingface"
+  "safetensors",
+  "huggingface",
   "datasets"
 ]
 
