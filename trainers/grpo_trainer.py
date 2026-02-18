@@ -135,7 +135,7 @@ class GRPOTrainer(Trainer):
 
         # Setup mesh before sharding
         if mesh is None:
-            mesh = Mesh(np.array(jax.devices()), axis_names=("batch",))
+            mesh = Mesh(np.array(jax.devices()).reshape(4, 4), ("dp", "tp"))
         self.mesh = mesh
 
         # Shard params once; TrainState and ServingLoop share the same sharded copy
