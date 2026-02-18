@@ -2,24 +2,16 @@
 set -e
 #
 #setting uv path
+
 export PATH="$HOME/.local/bin:$PATH"
 
-MODEL_DIR="$HOME/weights/Llama-3.2-3B-Instruct"
+MODEL_DIR="$HOME/Llama-3.1-8B-Instruct"
 cd "$HOME/ReLax"
 
 # Switch to sharding branch
-git checkout sharding
-git pull origin sharding
+git switch interleaved
+git pull origin interleaved
 
-# if [ ! -d ".venv" ]; then
-#   echo "Creating virtual environment..."
-#   uv venv .venv --python=3.12
-# fi
-#
-
-source .venv/bin/activate
-uv pip install -e '.[dev]'
-echo "ReLax initialized successfully"
 
 # Check if TPU library is accessible
 # TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=1 \
@@ -30,4 +22,4 @@ echo "ReLax initialized successfully"
 #   uv pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 # fi
 
-python inference.py --model_path "$MODEL_DIR"
+uv run python inference.py --model_path "$MODEL_DIR"

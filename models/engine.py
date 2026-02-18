@@ -16,47 +16,27 @@ Architecture:
 """
 
 import sys
-import queue
 import threading
-import time
+import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
+from functools import partial
 import jax
 import jax.numpy as jnp
 from flax.core import FrozenDict
-from jax.sharding import Mesh, PartitionSpec as PS
-from jaxlib.xla_client import NamedSharding
+from jax.sharding import Mesh, set_mesh
 import numpy as np
 from jax import jit
+
+from jax import random
 
 from models.llama.model import LLaMa
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
-
-
-@dataclass
-class InferenceRequest:
-    """A single inference request from a user.
-
-    Attributes:
-        request_id: Unique identifier for this request
-        prompt_tokens: Input token IDs (1D array, unpadded)
-        max_new_tokens: Maximum number of tokens to generate
-        temperature: Sampling temperature (1.0 = no change, <1.0 = sharper, >1.0 = more random)
-        top_k: Top-k sampling parameter
-        eos_token_id: Token ID that signals end of sequence
-        response_queue: Queue where responses will be sent (set by orchestrator)
-    """
-
-    request_id: str
-    prompt_tokens: jax.Array  # [seqlen]
-    max_new_tokens: int = 100
-    temperature: float = 1.0
-    top_k: int = 50
-    eos_token_id: int = 2
-    response_queue: Optional[queue.Queue] = None
+from models.sync_server import SyncServer
+from sampling import Sampler, GreedySampler
 
 
 @dataclass
@@ -84,6 +64,114 @@ class DecodeState:
     request_ids: List[Optional[str]]  # [max_slots]
 
 
+########################################################################################################################
+# Serving Loop Data Structures (New API) ##############################################################################
+########################################################################################################################
+
+
+@dataclasses.dataclass
+class ServingConfig:
+    """Configuration for the serving loop.
+
+    Attributes:
+        decode_steps: Number of tokens to generate per decode step
+        decode_batch_size: Maximum number of concurrent decode sequences
+        prefill_batch_size: Maximum number of concurrent prefill sequences
+        eos_tokens: Tuple of end-of-sequence token IDs
+        token_pad_idx: Token ID used for padding
+        max_decode_length: Maximum number of tokens to generate per request
+    """
+
+    decode_steps: int = 10
+    decode_batch_size: int = 16
+    prefill_batch_size: int = 16
+    eos_tokens: tuple[int, ...] = ()
+    token_pad_idx: int = 0
+    max_decode_length: int = 64
+    max_cache_seqlen: int = 1024
+    sampler: Sampler = dataclasses.field(default_factory=GreedySampler)
+    rng_seed: int = 0
+
+
+@dataclasses.dataclass
+class UserRequestPrompt:
+    """A user request for inference (serving loop API).
+
+    Attributes:
+        id: Unique request identifier
+        text: Token IDs as a list (NOT jax.Array)
+    """
+
+    id: int
+    text: list[int]
+
+
+@dataclasses.dataclass
+class DecodeResult:
+    """Result for a single decode sequence.
+
+    Attributes:
+        id: Request ID
+        token_list: Generated tokens
+        tokens_decoded: Number of tokens decoded so far
+        done: Whether generation is complete
+    """
+
+    id: int
+    token_list: list[int]
+    tokens_decoded: int = 0
+    done: bool = False
+
+
+@dataclasses.dataclass
+class PrefillResult:
+    """Result from prefill step, ready to be inserted into decode.
+
+    Attributes:
+        id: Request ID
+        input: Input tokens as numpy array
+        next_token: First generated token (from prefill)
+        cache_entry: KV cache for this sequence
+        len: Sequence length
+    """
+
+    id: int
+    input: np.ndarray
+    next_token: jax.Array
+    cache_entry: Any
+    len: int
+
+
+@dataclasses.dataclass
+class DecodeWork:
+    """State for batched decode generation.
+
+    Attributes:
+        curr_tokens: Current tokens for each slot [B, 1]
+        cache: Batch KV cache
+        active_results: List of active decode results (None for inactive slots)
+    """
+
+    curr_tokens: jax.Array
+    cache: KVCache
+    active_results: list[Optional[DecodeResult]]
+
+
+@dataclasses.dataclass
+class PrefillWork:
+    """State for prefill queue management.
+
+    Attributes:
+        requests: New requests waiting to be triaged
+        to_prefill: Requests queued for prefill
+        to_decode: Prefilled results waiting for decode slots
+    """
+
+    requests: list[UserRequestPrompt]
+    to_prefill: list[UserRequestPrompt]
+    to_decode: list[PrefillResult]
+
+
 class InferenceEngine:
     """Core inference engine managing prefill and slot-based generation.
 
@@ -100,43 +188,39 @@ class InferenceEngine:
         self,
         model: LLaMa,
         params: FrozenDict,
-        prefill_procs: List[int],
-        generate_procs: List[int],
-        prefill_mesh: Mesh,
-        generate_mesh: Mesh,
+        mesh: Mesh,
         max_concurrent_slots: int = 8,
         pad_id: int = 0,
         buckets: Optional[List[int]] = None,
+        sampler: Optional[Sampler] = None,
+        rng_seed: int = 0,
+        max_cache_seqlen: Optional[int] = None,
     ):
         """Initialize the inference engine.
 
         Args:
             model: LLaMa model instance
-            params: Model parameters (Flax FrozenDict) - will be placed on both meshes
-            prefill_mesh: Optional mesh for prefill operations
-            generate_mesh: Optional mesh for generate operations (defaults to prefill_mesh)
+            params: Model parameters (Flax FrozenDict)
+            mesh: JAX mesh for sharded computation
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
             buckets: List of bucket sizes for prompt padding (default: power-of-2)
+            sampler: Sampling strategy (default: GreedySampler)
+            rng_seed: Seed for PRNG key used in stochastic sampling
+            max_cache_seqlen: Override model's max_seqlen for KV cache allocation
         """
         self.model = model
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
         self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
-        self.prefill_procs = prefill_procs
-        self.generate_procs = generate_procs
-        self.prefill_mesh = prefill_mesh
-        self.generate_mesh = generate_mesh or prefill_mesh
-        detokenize_mesh = Mesh(np.array(jax.devices()), axis_names=("i"))
-        self.detokenize_sharding = NamedSharding(detokenize_mesh, PS())
+        self.mesh = mesh
+        self.sampler = sampler or GreedySampler()
+        self.rng_key = random.PRNGKey(rng_seed)
+        self.max_cache_seqlen = max_cache_seqlen or model.args.max_seqlen
 
-        # Place params on both meshes for disaggregated inference
-        self.prefill_params = jax.block_until_ready(
-            MeshHelper.shard_params(params, self.prefill_mesh)
-        )
-
-        self.generate_params = jax.block_until_ready(
-            MeshHelper.shard_params(params, self.generate_mesh)
+        # Place params on mesh
+        self.params = jax.block_until_ready(
+            MeshHelper.shard_params(params, self.mesh)
         )
 
         # Cache model config for convenience
@@ -145,33 +229,12 @@ class InferenceEngine:
         # Mesh helper for sharding operations
         self.mesh_helper = MeshHelper()
 
-        # Create separate JIT-compiled functions for prefill and generate
-        @jit
-        def _jitted_prefill_apply(params, tokens, true_lengths, kv_cache, mask):
-            return self.model.apply(
-                {"params": params},
-                tokens,
-                true_lengths=true_lengths,
-                kv_cache=kv_cache,
-                mask=mask,
-            )
-
-        @jit
-        def _jitted_generate_apply(params, tokens, true_lengths, kv_cache, mask):
-            return self.model.apply(
-                {"params": params},
-                tokens,
-                true_lengths=true_lengths,
-                kv_cache=kv_cache,
-                mask=mask,
-            )
-
-        self._jitted_prefill_apply = _jitted_prefill_apply
-        self._jitted_generate_apply = _jitted_generate_apply
+        # Create a JIT-compatible sample function from the sampler
+        sample_fn = self.sampler.sample
 
         # Create jitted core function for batched prefill logic
         @jit
-        def _jitted_prefill_core(params, tokens, true_lengths, kv_cache, mask):
+        def _jitted_prefill_core(params, tokens, true_lengths, kv_cache, mask, rng_key):
             """Jitable core logic for batched prefill.
 
             Args:
@@ -180,6 +243,7 @@ class InferenceEngine:
                 true_lengths: True lengths for each sequence [bsz]
                 kv_cache: KV cache for batch
                 mask: Attention mask
+                rng_key: PRNG key for sampling
 
             Returns:
                 Tuple of (updated_cache, next_tokens)
@@ -201,31 +265,11 @@ class InferenceEngine:
                 1
             )  # [bsz, vocab_size]
 
-            # Greedy sampling (batched)
-            next_tokens = jnp.argmax(last_logits, axis=-1)  # [bsz]
+            next_tokens = sample_fn(last_logits, rng_key)  # [bsz]
 
             return updated_cache, next_tokens
 
         self._jitted_prefill_core = _jitted_prefill_core
-
-    def transfer_prefill_to_generate(
-        self, prefill_result: Dict[str, any]
-    ) -> Dict[str, any]:
-        if self.prefill_mesh is None or self.generate_mesh is None:
-            return prefill_result
-        if self.prefill_mesh is self.generate_mesh:
-            return prefill_result
-        transferred = dict(prefill_result)
-        transferred["cache"] = self.mesh_helper.place_kv_cache(
-            prefill_result["cache"], self.generate_mesh, PS()
-        )
-        transferred["next_token"] = self.mesh_helper.put_on_mesh(
-            prefill_result["next_token"], self.generate_mesh, PS()
-        )
-        transferred["seq_length"] = self.mesh_helper.put_on_mesh(
-            prefill_result["seq_length"], self.generate_mesh, PS()
-        )
-        return transferred
 
     def prefill(
         self,
@@ -254,32 +298,34 @@ class InferenceEngine:
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=bsz,
-            max_seqlen=self.config.max_seqlen,
+            max_seqlen=self.max_cache_seqlen,
             kv_heads=self.config.n_kv_heads,
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.prefill_mesh)
+        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
 
         tokens = self.mesh_helper.put_on_mesh(
             tokens,
-            self.prefill_mesh,
-            self.mesh_helper.batch_axis_spec(self.prefill_mesh, rank=2, batch_axis=0),
+            self.mesh,
+            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
         true_lengths = self.mesh_helper.put_on_mesh(
             true_lengths,
-            self.prefill_mesh,
-            self.mesh_helper.batch_axis_spec(self.prefill_mesh, rank=1, batch_axis=0),
+            self.mesh,
+            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
         mask = build_attn_mask(bucket_size, kv_cache, true_lengths)
 
+        self.rng_key, subkey = random.split(self.rng_key)
         updated_cache, next_tokens = self._jitted_prefill_core(
-            self.prefill_params,
+            self.params,
             tokens,
             true_lengths,
             kv_cache,
             mask,
+            subkey,
         )
 
         return {
@@ -288,164 +334,93 @@ class InferenceEngine:
             "seq_lengths": true_lengths,  # [bsz]
         }
 
-    def generate_batch(
-        self,
-        decode_state: DecodeState,
-    ) -> Tuple[DecodeState, jax.Array]:
-        """Generate one token for ALL active slots in a batch.
+    def make_multistep_decode_fn(self):
+        """Create a JIT-compiled multistep decode function.
 
-        This is the core batching mechanism - all active sequences generate
-        one token in a single forward pass, maximizing GPU utilization.
-
-        Args:
-            decode_state: Current decode state with active slots
+        This creates a function that generates N tokens per call using jax.lax.scan,
+        which is more efficient than calling generate_batch N times separately.
 
         Returns:
-            Tuple of:
-                - Updated decode state with new tokens and incremented positions
-                - New tokens for each slot [max_slots, 1]
-
-        Note: The model.apply step is JIT-compiled internally for efficiency.
+            A JIT-compiled function with signature:
+                (curr_tokens, active_mask, cache, steps) -> ((curr_tokens, cache), output_tokens)
+            where output_tokens has shape [batch, steps]
         """
-        # Forward pass with all slot tokens
-        # tokens shape: [max_slots, 1]
-        # true_lengths represents the actual (non-padded) input length for THIS step
-        # For generation, we're processing 1 token at a time
-        # Only active slots should have true_length=1, inactive slots should be 0
-        true_lengths = decode_state.active_mask.astype(jnp.int32)
+        engine = self
 
-        # Build attention mask - pass seqlen directly instead of dummy tensor
-        bsz, seqlen = decode_state.tokens.shape
-        mask = build_attn_mask(seqlen, decode_state.kv_cache, true_lengths)
+        # Capture sample_fn for use inside JIT
+        sample_fn = self.sampler.sample
 
-        # Forward pass (JIT-compiled)
-        logits, updated_cache = self._jitted_generate_apply(
-            self.generate_params,
-            decode_state.tokens,
-            true_lengths,
-            decode_state.kv_cache,
-            mask,
-        )
+        @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
+        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
+            """Generate multiple tokens in a single JIT-compiled call.
 
-        # Sample next token for each slot
-        # logits shape: [max_slots, 1, vocab_size]
-        # Take first (and only) position: [max_slots, vocab_size]
-        batch_logits = logits[:, 0, :]
+            Args:
+                curr_tokens: Current tokens [batch, 1]
+                active_mask: Boolean mask of active slots [batch]
+                params: Model parameters (passed explicitly to avoid capture as constants)
+                cache: KV cache
+                rng_key: PRNG key for sampling (split each step)
+                steps: Number of tokens to generate
 
-        # Greedy sampling (TODO: support temperature, top-k, etc.)
-        new_tokens = jnp.argmax(batch_logits, axis=-1, keepdims=True)  # [max_slots, 1]
+            Returns:
+                Tuple of ((curr_tokens, cache), output_tokens) where:
+                    - curr_tokens: Updated current tokens [batch, 1]
+                    - cache: Updated KV cache
+                    - output_tokens: Generated tokens [batch, steps]
+            """
 
-        # Only update tokens for active slots (inactive slots keep old tokens)
-        updated_tokens = jnp.where(
-            decode_state.active_mask[:, None],
-            new_tokens,
-            decode_state.tokens,
-        )
+            def body(carry, _):
+                curr_tokens, cache, rng_key = carry
 
-        # Create updated decode state
-        updated_state = DecodeState(
-            kv_cache=updated_cache,
-            tokens=updated_tokens,
-            active_mask=decode_state.active_mask,
-            request_ids=decode_state.request_ids,
-        )
+                # Compute true_lengths from active_mask (captured from closure)
+                true_lengths = active_mask.astype(jnp.int32)
 
-        return updated_state, new_tokens
+                # Build attention mask
+                bsz, seqlen = curr_tokens.shape
+                mask = build_attn_mask(seqlen, cache, true_lengths)
 
-    def insert_into_slot(
-        self,
-        prefill_result: Dict[str, any],
-        decode_state: DecodeState,
-        slot_idx: int,
-        request_id: str,
-    ) -> DecodeState:
-        """Insert a prefilled sequence into a specific slot.
+                # Forward pass — params passed from outer scope (JIT arg, not closure capture)
+                logits, updated_cache = engine.model.apply(
+                    {"params": params},
+                    curr_tokens,
+                    true_lengths,
+                    cache,
+                    mask,
+                )
 
-        This method takes a prefilled KV cache (from prefill()) and inserts it
-        into the decode batch at the specified slot position.
+                # Sample next tokens
+                batch_logits = logits[:, 0, :]
+                rng_key, subkey = random.split(rng_key)
+                new_tokens = sample_fn(batch_logits, subkey)
+                if new_tokens.ndim == 1:
+                    new_tokens = new_tokens[:, None]
 
-        Args:
-            prefill_result: Output from prefill() containing cache and first token
-            decode_state: Current decode state
-            slot_idx: Slot index to insert into (0 to max_slots-1)
-            request_id: Request ID to associate with this slot
+                # Only update tokens for active slots
+                updated_tokens = jnp.where(
+                    active_mask[:, None],
+                    new_tokens,
+                    curr_tokens,
+                )
 
-        Returns:
-            Updated decode state with the new sequence inserted at slot_idx
-        """
-        # Extract from prefill result
-        prefill_cache = prefill_result["cache"]
-        next_token = prefill_result["next_token"]
-        seq_length = prefill_result["seq_length"]
+                # Reshard carry to match input sharding (prevents drift across scan iterations)
+                updated_tokens = jax.sharding.reshard(
+                    updated_tokens, jax.typeof(curr_tokens).sharding.spec
+                )
 
-        # Prefill cache has shape [layers, 1, max_seq_len, kv_heads, head_dim]
-        # Need to insert it at position slot_idx in the batch dimension
+                return (updated_tokens, updated_cache, rng_key), new_tokens
 
-        # For KV cache: insert at batch position slot_idx
-        # Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
+            # Run scan for N steps — (curr_tokens, cache, rng_key) in carry
+            (final_tokens, final_cache, final_rng_key), output_tokens = jax.lax.scan(
+                body, (curr_tokens, cache, rng_key), length=steps
+            )
 
-        # Extract the single-sequence cache
-        # prefill_cache.k shape: [layers, 1, max_seq_len, kv_heads, head_dim]
-        new_k = decode_state.kv_cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(
-            prefill_cache.k
-        )
-        new_v = decode_state.kv_cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(
-            prefill_cache.v
-        )
+            # output_tokens shape: [steps, batch, 1]
+            # Transpose to [batch, steps] and squeeze last dim
+            output_tokens = output_tokens[:, :, 0].T  # [batch, steps]
 
-        # Update cache with new K/V and set position for this slot
-        updated_cache = KVCache(
-            k=new_k,
-            v=new_v,
-            seq_positions=decode_state.kv_cache.seq_positions.at[slot_idx].set(
-                seq_length
-            ),
-        )
+            return (final_tokens, final_cache), output_tokens
 
-        # Update token for this slot
-        updated_tokens = decode_state.tokens.at[slot_idx, 0].set(next_token)
-
-        # Mark slot as active
-        updated_active_mask = decode_state.active_mask.at[slot_idx].set(True)
-
-        # Update request IDs
-        updated_request_ids = decode_state.request_ids.copy()
-        updated_request_ids[slot_idx] = request_id
-
-        return DecodeState(
-            kv_cache=updated_cache,
-            tokens=updated_tokens,
-            active_mask=updated_active_mask,
-            request_ids=updated_request_ids,
-        )
-
-    def remove_from_slot(
-        self,
-        decode_state: DecodeState,
-        slot_idx: int,
-    ) -> DecodeState:
-        """Mark a slot as inactive when its sequence finishes.
-
-        Args:
-            decode_state: Current decode state
-            slot_idx: Slot index to deactivate
-
-        Returns:
-            Updated decode state with slot marked as inactive
-        """
-        # Mark slot as inactive
-        updated_active_mask = decode_state.active_mask.at[slot_idx].set(False)
-
-        # Clear request ID
-        updated_request_ids = decode_state.request_ids.copy()
-        updated_request_ids[slot_idx] = None
-
-        return DecodeState(
-            kv_cache=decode_state.kv_cache,  # Cache can stay (will be overwritten)
-            tokens=decode_state.tokens,
-            active_mask=updated_active_mask,
-            request_ids=updated_request_ids,
-        )
+        return multistep_decode_fn
 
     def init_decode_state(self) -> DecodeState:
         """Initialize empty decode state with all slots inactive.
@@ -457,27 +432,27 @@ class InferenceEngine:
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=self.max_slots,
-            max_seqlen=self.config.max_seqlen,
+            max_seqlen=self.max_cache_seqlen,
             kv_heads=self.config.n_kv_heads,
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.generate_mesh)
+        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
 
         # Initialize tokens (doesn't matter what they are since slots are inactive)
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = self.mesh_helper.put_on_mesh(
             tokens,
-            self.generate_mesh,
-            self.mesh_helper.batch_axis_spec(self.generate_mesh, rank=2, batch_axis=0),
+            self.mesh,
+            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
 
         # All slots start inactive
         active_mask = jnp.zeros(self.max_slots, dtype=bool)
         active_mask = self.mesh_helper.put_on_mesh(
             active_mask,
-            self.generate_mesh,
-            self.mesh_helper.batch_axis_spec(self.generate_mesh, rank=1, batch_axis=0),
+            self.mesh,
+            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
         # No requests assigned
@@ -491,150 +466,187 @@ class InferenceEngine:
         )
 
 
-class InferenceOrchestrator:
-    """Orchestrates async prefill and generate threads for interactive serving.
+########################################################################################################################
+# ServingLoop (New Event Loop-Based Serving) ##########################################################################
+########################################################################################################################
 
-    This class manages the complete inference pipeline:
-    1. Receives requests via submit()
-    2. Prefill thread: Processes prompts sequentially
-    3. Generate thread: Batches multiple sequences via slots
-    4. Returns results via response queues
 
-    Threading Model:
-        - Main thread: Accepts requests via submit()
-        - Prefill thread: Processes prompts one at a time
-        - Generate thread: Batches generation across slots
+class ServingLoop:
+    """Event loop-based serving for multi-host inference.
 
-    Communication:
-        - Prefill queue: Main → Prefill thread
-        - Generate queue: Prefill → Generate thread
-        - Response queues: Generate → User (one per request)
+    This class uses a pure event loop pattern that:
+    - Eliminates threading complexity
+    - Adds multi-host coordination via SyncServer
+    - Provides flexible batching
+    - Uses multistep decode for efficiency
+
+    Usage:
+        serving_loop = ServingLoop(serve_cfg, model, params, mesh, is_server=True)
+
+        # Add requests (server process only)
+        serving_loop.add_request(UserRequestPrompt(id=1, text=[1, 2, 3]))
+
+        # Event loop (all processes)
+        for _ in range(max_iterations):
+            serving_loop.serving_step()
+
+            # Check results (server process)
+            for id, result in serving_loop.results.items():
+                if result.done:
+                    print(f"Completed: {result.token_list}")
     """
 
     def __init__(
         self,
-        engine: InferenceEngine,
-        prefill_queue_size: int = 100,
-        generate_queue_size: int = 100,
-        max_prefill_batch_size: int = 2,
+        serve_cfg: ServingConfig,
+        model: LLaMa,
+        params: FrozenDict,
+        mesh: Mesh,
+        is_server: bool = False,
+        verbose: bool = False,
     ):
-        """Initialize the orchestrator.
+        """Initialize the serving loop.
 
         Args:
-            engine: InferenceEngine instance
-            prefill_queue_size: Maximum size of prefill queue
-            generate_queue_size: Maximum size of generate queue
-            max_prefill_batch_size: Maximum number of requests to batch for prefill (fixed batch size)
+            serve_cfg: Serving configuration
+            model: LLaMa model instance
+            params: Model parameters
+            mesh: JAX mesh for sharded computation
+            is_server: Whether this process is the server (receives requests)
         """
-        self.engine = engine
-        self.max_prefill_batch_size = max_prefill_batch_size
+        self.serve_cfg = serve_cfg
+        self.model = model
+        self.mesh = mesh
+        self.verbose = verbose
 
-        # Request queues
-        self._prefill_queue = queue.Queue(prefill_queue_size)
-        self._transfer_backlog = queue.Queue(generate_queue_size)
-        self._detokenize_backlog = queue.Queue(100)
-
-        # Slot tracking - queue of available slot indices
-        self._free_slots = queue.Queue(engine.max_slots)
-        for i in range(engine.max_slots):
-            self._free_slots.put(i)
-
-        # Thread control
-        self._running = False
-        self._prefill_thread = None
-        self._generate_thread = None
-        self._detokenize_thread = None
-
-    def start(self):
-        """Start prefill and generate threads.
-
-        This must be called before submitting requests.
-        """
-        if self._running:
-            raise RuntimeError("Orchestrator is already running")
-
-        self._running = True
-
-        # Start threads
-        self._prefill_thread = threading.Thread(
-            target=self._prefill_loop,
-            name="prefill-thread",
-            daemon=True,
-        )
-        self._generate_thread = threading.Thread(
-            target=self._generate_loop,
-            name="generate-thread",
-            daemon=True,
-        )
-        self._detokenize_thread = threading.Thread(
-            target=self._detokenize_loop,
-            name="detokenize-thread",
-            daemon=True,
+        # Initialize InferenceEngine for core operations
+        self.engine = InferenceEngine(
+            model=model,
+            params=params,
+            mesh=mesh,
+            max_concurrent_slots=serve_cfg.decode_batch_size,
+            pad_id=serve_cfg.token_pad_idx,
+            sampler=serve_cfg.sampler,
+            rng_seed=serve_cfg.rng_seed,
+            max_cache_seqlen=serve_cfg.max_cache_seqlen,
         )
 
-        self._prefill_thread.start()
-        self._generate_thread.start()
-        self._detokenize_thread.start()
+        # Setup decode work
+        self.decode_work = DecodeWork(
+            curr_tokens=None,
+            cache=None,
+            active_results=[None for _ in range(serve_cfg.decode_batch_size)],
+        )
 
-        print(f"[Orchestrator] Started with {self.engine.max_slots} slots")
+        # Initialize decode state
+        decode_state = self.engine.init_decode_state()
+        self.decode_work.curr_tokens = decode_state.tokens
+        self.decode_work.cache = decode_state.kv_cache
+
+        # Create multistep decode function
+        self.multistep_decode_fn = self.engine.make_multistep_decode_fn()
+        self._decode_call_count = 0
+
+        # Delayed EOS detection: stores (output_tokens, output_mapping) from previous iteration
+        self.decode_output = (None, None)
+
+        # Setup prefill work
+        self.prefill_work = PrefillWork([], [], [])
+
+        # Results tracking
+        self.results = {}  # request_id -> DecodeResult
+        self.pending_requests = []
+        self.state_lock = threading.Lock()
+
+        # Multi-host coordination
+        self._it = 0
+        self.roles = self._determine_roles(is_server, mesh)
+        self.eos_tokens = np.array(serve_cfg.eos_tokens)
+
+        print(f"[ServingLoop] Initialized with roles: {self.roles}")
         sys.stdout.flush()
 
-    def stop(self, timeout: float = 5.0):
-        """Stop all threads gracefully.
+    def warmup(self):
+        """Trigger JIT compilation of prefill and decode with dummy inputs.
+
+        Call this once before real inference to avoid compilation stalls
+        during the first serving_step.
+        """
+        import time as _time
+        cfg = self.engine.config
+        bsz_prefill = self.serve_cfg.prefill_batch_size
+        bsz_decode = self.serve_cfg.decode_batch_size
+
+        # Warmup prefill
+        print("[ServingLoop] Warming up prefill (JIT compiling)...")
+        sys.stdout.flush()
+        t0 = _time.time()
+
+        dummy_tokens = jnp.ones((bsz_prefill, 64), dtype=jnp.int32)
+        dummy_lengths = jnp.full((bsz_prefill,), 10, dtype=jnp.int32)
+        with set_mesh(self.mesh):
+            prefill_result = self.engine.prefill(dummy_tokens, dummy_lengths)
+        jax.block_until_ready(prefill_result["next_tokens"])
+        print(f"[ServingLoop] Prefill compiled in {_time.time() - t0:.1f}s")
+        sys.stdout.flush()
+
+        # Warmup decode
+        print("[ServingLoop] Warming up decode (JIT compiling)...")
+        sys.stdout.flush()
+        t0 = _time.time()
+
+        dummy_active_mask = jnp.ones(bsz_decode, dtype=bool)
+        dummy_rng_key = random.PRNGKey(0)
+        with set_mesh(self.mesh):
+            self.multistep_decode_fn(
+                self.decode_work.curr_tokens,
+                dummy_active_mask,
+                self.engine.params,
+                self.decode_work.cache,
+                dummy_rng_key,
+                steps=self.serve_cfg.decode_steps,
+            )
+        print(f"[ServingLoop] Decode compiled in {_time.time() - t0:.1f}s")
+        sys.stdout.flush()
+
+        # Re-initialize decode state (discard dummy results)
+        decode_state = self.engine.init_decode_state()
+        self.decode_work.curr_tokens = decode_state.tokens
+        self.decode_work.cache = decode_state.kv_cache
+
+        print("[ServingLoop] Warmup complete")
+        sys.stdout.flush()
+
+    def _determine_roles(self, is_server: bool, mesh: Mesh) -> tuple:
+        """Determine this process's roles for multi-host coordination.
+
+        Roles:
+            - server: Process that receives user requests
+            - worker: Process has devices in the mesh
+            - coordinator: Process with smallest mesh device (for broadcasts)
 
         Args:
-            timeout: Maximum time to wait for threads to finish (seconds)
-        """
-        if not self._running:
-            return
-
-        print("[Orchestrator] Stopping...")
-        sys.stdout.flush()
-
-        self._running = False
-
-        # Send shutdown signal to detokenize thread
-        self._detokenize_backlog.put(None)
-
-        # Wait for threads to finish
-        self._prefill_thread.join(timeout=timeout)
-        self._generate_thread.join(timeout=timeout)
-        self._detokenize_thread.join(timeout=timeout)
-
-        print("[Orchestrator] Stopped")
-        sys.stdout.flush()
-
-    def submit(self, request: InferenceRequest) -> queue.Queue:
-        """Submit a request for inference and get a response queue.
-
-        Args:
-            request: InferenceRequest to process
+            is_server: Whether this is the server process
+            mesh: Computation mesh
 
         Returns:
-            Queue that will receive response messages:
-                - {"status": "generating", "token": <int>} for each token
-                - {"status": "complete", "tokens": <list>, "request_id": <str>} when done
-
-        Example:
-            >>> request = InferenceRequest("req1", prompt_tokens, max_new_tokens=50)
-            >>> response_queue = orchestrator.submit(request)
-            >>> while True:
-            ...     result = response_queue.get()
-            ...     if result["status"] == "complete":
-            ...         print(f"Generated: {result['tokens']}")
-            ...         break
+            Tuple of role strings
         """
-        if not self._running:
-            raise RuntimeError("Orchestrator is not running. Call start() first.")
+        roles = ()
+        if is_server:
+            roles += ("server",)
 
-        # Create response queue for this request
-        response_queue = queue.Queue()
-        request.response_queue = response_queue
+        local_devices = set(d.id for d in jax.local_devices())
+        mesh_devices = set(d.id for d in mesh.devices.flat)
 
-        # Submit to prefill queue
-        self._prefill_queue.put(request)
+        if local_devices & mesh_devices:
+            roles += ("worker",)
 
-        return response_queue
+        # Coordinator = process with smallest device ID in mesh
+        if any(d.id == min(mesh_devices) for d in jax.local_devices()):
+            roles += ("coordinator",)
+
+        return roles
 
     def _extract_individual_result(self, batched_result: Dict, idx: int) -> Dict:
         """Extract single-sequence result from batched prefill output.
@@ -644,13 +656,11 @@ class InferenceOrchestrator:
             idx: Index of sequence to extract
 
         Returns:
-            Dict with single-sequence cache matching original prefill() output format
+            Dict with single-sequence cache matching prefill() output format
         """
         cache = batched_result["cache"]
 
-        # Slice KV cache at batch dimension (axis 1)
-        # cache.k: [layers, bsz, kv_heads, max_seqlen, head_dim]
-        # Extract: [layers, 1, kv_heads, max_seqlen, head_dim]
+        # Slice KV cache at batch dimension
         single_cache = KVCache(
             k=cache.k[:, idx : idx + 1, :, :, :],
             v=cache.v[:, idx : idx + 1, :, :, :],
@@ -663,249 +673,311 @@ class InferenceOrchestrator:
             "seq_length": batched_result["seq_lengths"][idx],
         }
 
-    def _process_batch(self, requests: List[InferenceRequest]):
-        """Process a batch of requests, padding to longest sequence length.
+    def _update_cache_and_index(self, batch_updates: list):
+        """Batch update cache and tokens for multiple slot insertions.
 
         Args:
-            requests: List of InferenceRequests to process together
+            batch_updates: List of (cache_entry, slot_idx, length, next_token) tuples
         """
-        print(f"[Prefill] Processing batch of {len(requests)} requests")
+        entries, batch_idxs, lens, next_tokens = map(list, zip(*batch_updates))
+
+        # Insert all cache entries into decode cache
+        for entry, slot_idx, length, next_token in zip(entries, batch_idxs, lens, next_tokens):
+            new_k = self.decode_work.cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.k)
+            new_v = self.decode_work.cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.v)
+
+            self.decode_work.cache = KVCache(
+                k=new_k,
+                v=new_v,
+                seq_positions=self.decode_work.cache.seq_positions.at[slot_idx].set(length),
+            )
+
+            self.decode_work.curr_tokens = self.decode_work.curr_tokens.at[slot_idx, 0].set(next_token)
+
+    def _check_done_sequences(self, output_tokens: np.ndarray) -> list[bool]:
+        """Check which sequences are done (EOS or max length).
+
+        Args:
+            output_tokens: Generated tokens [batch, steps]
+
+        Returns:
+            List of booleans indicating done status for each slot
+        """
+        # Check for EOS tokens
+        done = []
+        for i, result in enumerate(self.decode_work.active_results):
+            if result is None:
+                done.append(False)
+                continue
+
+            # Check if any token in this row matches EOS
+            has_eos = np.any(output_tokens[i, :, None] == self.eos_tokens) if len(self.eos_tokens) > 0 else False
+            is_max_length = result.tokens_decoded >= self.serve_cfg.max_decode_length
+
+            done.append(has_eos or is_max_length)
+
+        return done
+
+    def _update_results_and_evict(self, output_tokens_flat: list[int], output_mapping_flat: list[int], done: list[bool]):
+        """Update results dict with new tokens and evict completed sequences.
+
+        Args:
+            output_tokens_flat: Flattened tokens [batch * steps]
+            output_mapping_flat: Flattened request ID mapping [batch * steps]
+            done: Done status for each slot
+        """
+        # Dispatch tokens to results via output_mapping
+        for token, req_id in zip(output_tokens_flat, output_mapping_flat):
+            if req_id >= 0 and req_id in self.results:
+                self.results[req_id].token_list.append(token)
+                self.results[req_id].tokens_decoded += 1
+
+        # Evict completed sequences and truncate at EOS
+        eos_set = set(self.eos_tokens.tolist()) if len(self.eos_tokens) > 0 else set()
+        for i, result in enumerate(self.decode_work.active_results):
+            if result is None:
+                continue
+            if done[i]:
+                # Truncate token_list at first EOS token
+                if eos_set:
+                    for j, tok in enumerate(result.token_list):
+                        if tok in eos_set:
+                            result.token_list = result.token_list[:j]
+                            break
+                result.done = True
+                self.decode_work.active_results[i] = None
+                print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
+                sys.stdout.flush()
+
+    def decode_step(self):
+        """One decode iteration: insert pending prefills + run multistep decode."""
+        self._log("decode: phase1 (insert prefills)")
+        # Phase 1: Insert pending prefills into free slots
+        if len(self.prefill_work.to_decode) > 0:
+            batch_updates = []
+            for i, active_result in enumerate(self.decode_work.active_results):
+                if active_result is not None:
+                    continue
+                if len(self.prefill_work.to_decode) == 0:
+                    break
+
+                result: PrefillResult = self.prefill_work.to_decode.pop(0)
+                self.decode_work.active_results[i] = DecodeResult(result.id, [])
+                self.results[result.id] = self.decode_work.active_results[i]
+                batch_updates.append((result.cache_entry, i, result.len, result.next_token))
+
+            # Batch update cache and tokens
+            if "worker" in self.roles and len(batch_updates) > 0:
+                self._update_cache_and_index(batch_updates)
+                # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
+                self.decode_work.cache = self.engine.mesh_helper.place_kv_cache(
+                    self.decode_work.cache, self.mesh
+                )
+                self.decode_work.curr_tokens = self.engine.mesh_helper.put_on_mesh(
+                    self.decode_work.curr_tokens,
+                    self.mesh,
+                    self.engine.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+                )
+
+        # Phase 2: Run multistep decode (skip if all slots empty)
+        active_count = sum(1 for x in self.decode_work.active_results if x is not None)
+        self._log(f"decode: phase2 (active_slots={active_count})")
+        if active_count == 0:
+            self._log("decode: all slots empty, early return (SKIPPING phase3 sync!)")
+            return
+
+        # Build active_mask for multistep decode
+        active_mask = jnp.array([result is not None for result in self.decode_work.active_results])
+
+        # Build output_mapping: maps [batch, steps] -> request IDs for result dispatch
+        output_mapping = [
+            [getattr(result, "id", -1) for result in self.decode_work.active_results]
+        ] * self.serve_cfg.decode_steps
+        output_mapping = np.array(output_mapping).T  # [batch, steps]
+
+        self.engine.rng_key, decode_rng_key = random.split(self.engine.rng_key)
+        import time as _time
+        _t0 = _time.time()
+        with set_mesh(self.mesh):
+            (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
+                self.decode_work.curr_tokens,
+                active_mask,
+                self.engine.params,
+                self.decode_work.cache,
+                decode_rng_key,
+                steps=self.serve_cfg.decode_steps,
+            )
+            jax.block_until_ready((final_tokens, final_cache, output_tokens))
+
+            # Update decode work
+            self.decode_work.curr_tokens = final_tokens
+            self.decode_work.cache = final_cache
+
+        self._decode_call_count += 1
+        _elapsed = _time.time() - _t0
+        _active = int(active_mask.sum())
+        print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
+              f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
+              f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
         sys.stdout.flush()
-        bsz = len(requests)
 
-        # Find max length in batch
-        max_length = max(len(req.prompt_tokens) for req in requests)
+        # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
+        # Swap current output with stored output (allows decode kernel to run async)
+        self.decode_output, (output_tokens, output_mapping) = \
+            (output_tokens, output_mapping), self.decode_output
 
-        # Find appropriate bucket for max length
-        bucket_size = take_nearest_bucket(self.engine.buckets, max_length)
+        self._log(f"decode: phase3 (has_prev_output={output_tokens is not None})")
+        if output_tokens is not None:
+            self._log("decode: entering barrier:decode_output")
+            SyncServer.barrier("decode_output", self._it)
+            if "worker" in self.roles:
+                output_tokens = jax.block_until_ready(jax.experimental.multihost_utils.process_allgather(output_tokens,tiled=True))
+                output_tokens = np.array(output_tokens)  # [B, steps]
+                done = self._check_done_sequences(output_tokens)
+                output_tokens_flat = output_tokens.reshape(-1).tolist()
+                output_mapping_flat = output_mapping.reshape(-1).tolist()
+            else:
+                output_tokens_flat, output_mapping_flat, done = None, None, None
 
-        # Stack tokens and true_lengths
+            # Broadcast results to all processes
+            self._log(f"decode: entering broadcast:decode_tokens (done={done})")
+            output_tokens_flat, output_mapping_flat, done = SyncServer.broadcast(
+                "decode_tokens",
+                self._it,
+                (output_tokens_flat, output_mapping_flat, done),
+                is_source="coordinator" in self.roles,
+            )
+
+            # Phase 4: Update results and evict completed sequences
+            self._update_results_and_evict(output_tokens_flat, output_mapping_flat, done)
+
+    def prefill_step(self):
+        """One prefill iteration: batch prefill pending requests."""
+        # Triage new requests (move from requests to to_prefill)
+        while len(self.prefill_work.requests) > 0:
+            request = self.prefill_work.requests.pop(0)
+            self.prefill_work.to_prefill.append(request)
+
+        # Process up to prefill_batch_size requests
+        prefill_batch = self.prefill_work.to_prefill[: self.serve_cfg.prefill_batch_size]
+        self.prefill_work.to_prefill = self.prefill_work.to_prefill[len(prefill_batch) :]
+
+        if len(prefill_batch) == 0:
+            self._log("prefill: no pending requests")
+            return
+
+        self._log(f"prefill: processing {len(prefill_batch)} requests")
+        # Prepare batched inputs (pad to max length in batch)
+        max_len = max(len(req.text) for req in prefill_batch)
+        bucket_size = take_nearest_bucket(self.engine.buckets, max_len)
+
         tokens_list = []
         true_lengths_list = []
 
-        for req in requests:
-            tokens_with_batch = req.prompt_tokens[None, :]  # [1, seqlen]
+        for req in prefill_batch:
+            # Convert list to numpy array
+            tokens = np.array(req.text)
+            # Add batch dimension and pad
+            tokens_with_batch = tokens[None, :]  # [1, seqlen]
             padded = pad_to_bucket(tokens_with_batch, bucket_size, self.engine.pad_id)
             tokens_list.append(padded)
-            true_lengths_list.append(len(req.prompt_tokens))
+            true_lengths_list.append(len(req.text))
 
         # Create batched inputs
         batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [bsz, bucket_size]
         batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [bsz]
 
-        # Call batched prefill
-        prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
-        print("[Prefill] Completed, sending to transfer backlog")
-        sys.stdout.flush()
+        # Call prefill
+        self._log(f"prefill: calling engine.prefill (shape={batched_tokens.shape})")
+        with set_mesh(self.mesh):
+            prefill_result = self.engine.prefill(batched_tokens, batched_true_lengths)
+        self._log("prefill: engine.prefill done")
 
-        # Unpack and send to transfer backlog
-        for i, req in enumerate(requests):
+        # Extract individual results and add to decode queue
+        for i, req in enumerate(prefill_batch):
             individual_result = self._extract_individual_result(prefill_result, i)
-            individual_result["request"] = req
-            self._transfer_backlog.put(individual_result)
-        print("[Prefill] sent to transfer backlog.")
-        sys.stdout.flush()
 
-    def _prefill_loop(self):
-        """Prefill thread: batch requests, padding to longest sequence."""
-        print("[Prefill Thread] Started (batched mode)")
-        sys.stdout.flush()
-
-        pending_requests = []
-
-        while self._running:
-            # Phase 1: Try to get new request (non-blocking)
-            try:
-                request = self._prefill_queue.get(timeout=0.001)
-                pending_requests.append(request)
-            except queue.Empty:
-                pass
-
-            # Phase 2: Process batch when full
-            if len(pending_requests) >= self.max_prefill_batch_size:
-                try:
-                    self._process_batch(pending_requests)
-                except Exception as e:
-                    # Send errors to individual response queues
-                    for req in pending_requests:
-                        req.response_queue.put(
-                            {
-                                "status": "error",
-                                "error": str(e),
-                                "request_id": req.request_id,
-                            }
-                        )
-
-                # Clear processed batch
-                pending_requests = []
-
-            # Small sleep to prevent busy waiting
-            if len(pending_requests) == 0:
-                time.sleep(0.0001)
-
-        print("[Prefill Thread] Stopped")
-        sys.stdout.flush()
-
-    def _generate_loop(self):
-        """Generate thread: insert requests and unconditional generation."""
-        print("[Generate Thread] Started")
-        sys.stdout.flush()
-
-        # Initialize decode state
-        decode_state = self.engine.init_decode_state()
-
-        # Initialize generate timestep counter
-        generate_timestep = 0
-        while self._running:
-            # PHASE 1: Insert one request from transfer_backlog (if available and slot free)
-            try:
-                slot_idx = self._free_slots.get(block=False)
-            except queue.Empty:
-                slot_idx = None
-
-            if slot_idx is not None:
-                # Determine blocking behavior (JetStream pattern)
-                # Block if ALL slots are inactive (ensures at least one request before generate)
-                # Use int() to convert to Python scalar for comparison
-
-                try:
-                    prefill_result = self._transfer_backlog.get(block=True, timeout=1.0)
-
-                    # CRITICAL: Transfer to generate mesh before insertion
-                    prefill_result = self.engine.transfer_prefill_to_generate(
-                        prefill_result
-                    )
-                    jax.block_until_ready(prefill_result)
-
-                    request = prefill_result["request"]
-
-                    if jax.process_index() in self.engine.generate_procs:
-                        first_token = prefill_result["next_token"].item()
-                    else:
-                        first_token = None
-
-                    # Insert into decode state
-                    decode_state = self.engine.insert_into_slot(
-                        prefill_result,
-                        decode_state,
-                        slot_idx,
-                        request.request_id,
-                    )
-                    print(
-                        f"[Generate] Inserted request '{request.request_id}' into slot {slot_idx}"
-                    )
-                    sys.stdout.flush()
-
-                    # Send slot assignment to detokenize thread
-                    # Message format: (slot_idx, request, first_token)
-                    self._detokenize_backlog.put(
-                        (slot_idx, request, first_token), block=True
-                    )
-
-                except queue.Empty:
-                    # Put slot back if no request available
-                    self._free_slots.put(slot_idx)
-                    # Fall through to generate even if we timed out
-                    # This ensures all devices execute generate_batch() together
-
-            decode_state, new_tokens = self.engine.generate_batch(decode_state)
-            new_tokens_cpu = None
-            if jax.process_index() in self.engine.generate_procs:
-                new_tokens_gathered = MeshHelper.allgather(
-                    new_tokens, self.engine.generate_mesh
-                )
-                new_tokens_gathered = jax.block_until_ready(new_tokens_gathered)
-                new_tokens_cpu = np.array(new_tokens_gathered)
-
-            self._detokenize_backlog.put(
-                (generate_timestep, new_tokens_cpu), block=True
+            new_decode = PrefillResult(
+                req.id,
+                np.array(req.text),
+                individual_result["next_token"],
+                individual_result["cache"],
+                len(req.text) - 1,
             )
-            generate_timestep += 1
+            self.prefill_work.to_decode.append(new_decode)
 
-        print("[Generate Thread] Stopped")
+        print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
         sys.stdout.flush()
 
-    def _detokenize_loop(self):
-        """Detokenize thread: Process tokens, send responses, free slots."""
-        print("[Detokenize Thread] Started")
+    def _log(self, msg):
+        if not self.verbose:
+            return
+        pid = jax.process_index()
+        print(f"[P{pid}|it={self._it}] {msg}")
         sys.stdout.flush()
 
-        # Track active requests: slot_idx -> (request, generated_tokens_list)
-        active_requests = {}
+    def serving_step(self):
+        """Main event loop step (call repeatedly).
 
-        while self._running:
+        This method coordinates all processes using SyncServer for multi-host setups.
+        """
+        # Sync requests from server process
+        self._log("entering barrier:serving_step")
+        SyncServer.barrier("serving_step", self._it)
+        self._it += 1
+
+        if "server" in self.roles:
+            with self.state_lock:
+                requests = list(self.pending_requests)
+                self.pending_requests = []
+        else:
+            requests = None
+
+        self._log("entering broadcast:requests")
+        requests = SyncServer.broadcast(
+            "requests", self._it, requests, is_source="server" in self.roles
+        )
+
+        # Add new requests to prefill queue
+        for req in requests or []:
+            self.prefill_work.requests.append(UserRequestPrompt(**req))
+
+        # Execute decode and prefill
+        self._log("entering decode_step")
+        self.decode_step()
+        self._log("entering prefill_step")
+        self.prefill_step()
+        self._log("serving_step done")
+
+    def add_request(self, request: UserRequestPrompt):
+        """Add new request (thread-safe).
+
+        Args:
+            request: User request to add
+        """
+        with self.state_lock:
+            self.pending_requests.append(dataclasses.asdict(request))
+
+    def serve_forever(self, shutdown_signal: threading.Event):
+        """Optional: wrap serving_step in background thread.
+
+        Args:
+            shutdown_signal: Event to signal shutdown
+        """
+
+        def serve_thread():
             try:
-                data = self._detokenize_backlog.get(block=True, timeout=1.0)
-            except queue.Empty:
-                continue
-
-            if data is None:  # Shutdown signal
-                break
-
-            # Case 1: Slot assignment - (slot_idx, request, first_token)
-            # Detect by checking if data[0] is an integer (slot index)
-            if isinstance(data[0], int) and len(data) == 3:
-                slot_idx, request, first_token = data
-                print(
-                    f"[Detokenize] Received first token for '{request.request_id}' in slot {slot_idx}"
-                )
+                while not shutdown_signal.is_set():
+                    self.serving_step()
+            except Exception as e:
+                print(f"[ServingLoop] Error: {e}")
+                sys.stdout.flush()
+            finally:
+                shutdown_signal.set()
+                print("[ServingLoop] Stopped")
                 sys.stdout.flush()
 
-                # Initialize tracking for this slot
-                active_requests[slot_idx] = (request, [first_token])
-
-                # Send first token to user
-                request.response_queue.put(
-                    {"status": "generating", "token": first_token}
-                )
-                continue
-
-            # Case 2: Generate step - (generate_timestep, new_tokens)
-            # Detect by checking if data[0] is int and data[1] is jax.Array
-            if isinstance(data[0], int) and len(data) == 2:
-                generate_timestep, new_tokens = data
-
-                # Process each active slot
-                finished_slots = []
-
-                for slot_idx, (request, tokens) in list(active_requests.items()):
-                    if jax.process_index() in self.engine.generate_procs:
-                        token = new_tokens[slot_idx, 0].item()
-                    else:
-                        token = None
-                    tokens.append(token)
-
-                    # Check for completion
-                    is_eos = token == request.eos_token_id
-                    is_max_length = len(tokens) >= request.max_new_tokens
-
-                    if is_eos or is_max_length:
-                        # Send final response
-                        request.response_queue.put(
-                            {
-                                "status": "complete",
-                                "tokens": tokens,
-                                "request_id": request.request_id,
-                                "finish_reason": "eos" if is_eos else "length",
-                            }
-                        )
-                        print(
-                            f"[Detokenize] Completed '{request.request_id}' ({len(tokens)} tokens, {'EOS' if is_eos else 'max length'})"
-                        )
-                        sys.stdout.flush()
-                        finished_slots.append(slot_idx)
-                    else:
-                        # Send streaming update
-                        request.response_queue.put(
-                            {"status": "generating", "token": token}
-                        )
-
-                # Free finished slots
-                for slot_idx in finished_slots:
-                    del active_requests[slot_idx]
-                    self._free_slots.put(slot_idx)
-                    print(f"[Detokenize] Freed slot {slot_idx}")
-                    sys.stdout.flush()
-
-        print("[Detokenize Thread] Stopped")
+        thread = threading.Thread(target=serve_thread, daemon=True)
+        thread.start()
+        print("[ServingLoop] Started in background thread")
         sys.stdout.flush()

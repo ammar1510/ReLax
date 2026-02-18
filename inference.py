@@ -1,7 +1,7 @@
-"""Production inference script for LLaMA models.
+"""Inference script for LLaMA models.
 
-This script loads a LLaMA model with weights from disk and performs batch inference
-on 16 hardcoded prompts using the slot-based engine with prefill and generate steps.
+Loads a LLaMA model with weights from disk and performs batch inference
+using the ServingLoop event loop pattern.
 
 Usage:
     python inference.py --model_path /path/to/model
@@ -10,15 +10,11 @@ Usage:
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
-import zmq
-
-# Initialize JAX distributed for multi-TPU inference
 import jax
-
-jax.distributed.initialize()
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
@@ -27,7 +23,15 @@ from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
-from models.engine import InferenceEngine, InferenceOrchestrator, InferenceRequest
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+
+
+DEFAULT_PROMPTS = [
+    "What is JAX and how does it differ from PyTorch?",
+    "Explain the transformer architecture in simple terms.",
+    "Write a Python function that checks if a number is prime.",
+    "What are the benefits of tensor parallelism for LLM inference?",
+]
 
 
 def load_model(model_path: str, config_path: Optional[str] = None):
@@ -80,25 +84,23 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     return model, params, config, tokenizer
 
 
-def generic_tokenizer(prompt: str, tokenizer: Tokenizer) -> List[int]:
+def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     return tokenizer.encode(formatted_prompt, bos=False, eos=False)
 
 
 def generate_batch(
-    orchestrator: InferenceOrchestrator,
+    serving_loop: ServingLoop,
     tokenizer: Tokenizer,
     prompts: List[str],
-    max_new_tokens: int = 512,
     verbose: bool = True,
 ) -> List[str]:
-    """Generate text for a batch of prompts.
+    """Generate text for a batch of prompts using event loop.
 
     Args:
-        orchestrator: Running InferenceOrchestrator instance
+        serving_loop: ServingLoop instance
         tokenizer: Tokenizer for encoding/decoding
-        prompts: List of text prompts (expecting 16)
-        max_new_tokens: Maximum tokens to generate per prompt
+        prompts: List of text prompts
         verbose: Print generation progress
 
     Returns:
@@ -110,140 +112,69 @@ def generate_batch(
         print(f"{'='*80}\n")
 
     # Submit all requests
-    requests = []
-    response_queues = {}
-
     for i, prompt in enumerate(prompts):
-        prompt_tokens = generic_tokenizer(prompt, tokenizer)
-        prompt_array = jnp.array(prompt_tokens, dtype=jnp.int32)
+        prompt_tokens = format_prompt(prompt, tokenizer)
 
         if verbose:
             print(f"[request-{i}] Prompt: {prompt[:60]}...")
             print(f"            Tokens: {len(prompt_tokens)}")
 
-        # Create request
-        request = InferenceRequest(
-            request_id=f"request-{i}",
-            prompt_tokens=prompt_array,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eot_id,
-        )
-
-        response_queue = orchestrator.submit(request)
-        requests.append(request)
-        response_queues[request.request_id] = response_queue
+        request = UserRequestPrompt(id=i, text=prompt_tokens)
+        serving_loop.add_request(request)
 
     if verbose:
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
-    # Collect results
-    results = {}
+    # Event loop
     completed = 0
     start_time = time.time()
+    max_iterations = 10000
 
-    while completed < len(requests):
-        for request_id, response_queue in response_queues.items():
-            if request_id in results:
-                continue  # Already completed
+    pid = jax.process_index()
+    debug = serving_loop.verbose
+    for iteration in range(max_iterations):
+        if debug:
+            print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+            sys.stdout.flush()
+        serving_loop.serving_step()
 
-            try:
-                result = response_queue.get(timeout=0.01)
+        newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
+        completed += newly_completed
 
-                if result["status"] == "complete":
-                    results[request_id] = result
-                    completed += 1
-                    elapsed = time.time() - start_time
+        if completed >= len(prompts):
+            if verbose:
+                elapsed = time.time() - start_time
+                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+                sys.stdout.flush()
+            if debug:
+                print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
+                sys.stdout.flush()
+            break
 
-                    if verbose and jax.process_index() == 3:
-                        output_text = tokenizer.decode(result["tokens"])
-                        print(f"✓ [{request_id}] completed in {elapsed:.2f}s")
-                        print(f"  Output: {output_text[:100]}...")
-                        print(
-                            f"  Tokens: {len(result['tokens'])}, "
-                            f"Reason: {result['finish_reason']}\n"
-                        )
-                        sys.stdout.flush()
-
-                elif result["status"] == "error":
-                    if verbose:
-                        print(f"✗ [{request_id}] error: {result['error']}")
-                        sys.stdout.flush()
-                    results[request_id] = result
-                    completed += 1
-
-            except:
-                pass  # Queue empty
-
-    # Summary
-    if verbose:
-        total_time = time.time() - start_time
-        total_tokens = sum(len(r["tokens"]) for r in results.values() if "tokens" in r)
-        print(f"{'='*80}")
-        print("Summary:")
-        print(f"  Total requests: {len(requests)}")
-        print(f"  Total tokens: {total_tokens}")
-        print(f"  Total time: {total_time:.2f}s")
-        print(f"  Throughput: {total_tokens / total_time:.2f} tokens/s")
-        print(f"  Avg latency: {total_time / len(requests):.2f}s/request")
-        print(f"{'='*80}\n")
-        sys.stdout.flush()
-
-    # Return outputs in order
-    outputs = []
+    # Decode results
+    decoded_results = []
     for i in range(len(prompts)):
-        request_id = f"request-{i}"
-        if request_id in results and "tokens" in results[request_id]:
-            output_text = tokenizer.decode(results[request_id]["tokens"])
-            outputs.append(output_text)
+        if i in serving_loop.results and serving_loop.results[i].done:
+            result = serving_loop.results[i]
+            generated_tokens = result.token_list
+            if generated_tokens and hasattr(generated_tokens[0], 'item'):
+                generated_tokens = [t.item() if hasattr(t, 'item') else t for t in generated_tokens]
+            decoded_text = tokenizer.decode(generated_tokens)
+            decoded_results.append(decoded_text)
+
+            if verbose:
+                print(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
+                print(f"            {decoded_text[:200]}")
+                print()
         else:
-            outputs.append("")
+            decoded_results.append("")
 
-    return outputs
-
-
-def receive_prompts_from_zmq(num_prompts: int = 16) -> List[str]:
-    """Receive prompts from ZMQ SUB socket (multi-host setup).
-
-    Each JAX worker independently binds to port 5555 on its own host and
-    subscribes to prompts from the PUB socket. All workers receive identical
-    prompts.
-
-    Args:
-        num_prompts: Number of prompts to receive before returning
-
-    Returns:
-        List of prompt strings
-    """
-    context = zmq.Context()
-    socket = context.socket(zmq.SUB)
-    socket.bind("tcp://*:5555")
-
-    # Subscribe to all messages (empty string = all topics)
-    socket.subscribe("")
-
-    prompts = []
-    print(
-        f"[Worker {jax.process_index()}] Waiting for {num_prompts} prompts over ZMQ SUB..."
-    )
-    sys.stdout.flush()
-
-    while len(prompts) < num_prompts:
-        message = socket.recv_json()
-        prompt = message.get("prompt", "")
-        prompts.append(prompt)
-        print(
-            f"[Worker {jax.process_index()}] Received prompt {len(prompts)}: {prompt[:40]}..."
-        )
-        sys.stdout.flush()
-
-    socket.close()
-    context.term()
-    print(f"[Worker {jax.process_index()}] Received all {len(prompts)} prompts.")
-    return prompts
+    return decoded_results
 
 
 def main():
+    jax.distributed.initialize()
     parser = argparse.ArgumentParser(
         description="LLaMA inference with slot-based engine"
     )
@@ -254,67 +185,73 @@ def main():
         help="Path to model directory (containing model.safetensors, config.json, tokenizer.model)",
     )
     parser.add_argument(
-        "--num_prompts",
+        "--max_decode_length",
         type=int,
-        default=16,
-        help="Number of prompts to receive from ZMQ (default: 16)",
+        default=256,
+        help="Maximum number of tokens to generate per request (default: 512)",
     )
     args = parser.parse_args()
 
-    # Receive prompts from ZMQ
-    prompts = receive_prompts_from_zmq(args.num_prompts)
+    prompts = DEFAULT_PROMPTS
 
     # Load model
     print("Loading model...")
     model, params, config, tokenizer = load_model(args.model_path)
 
-    # Create mesh for single-device run
-    all_devices = np.array(jax.devices())
-    prefill_mesh = Mesh(all_devices[: len(all_devices) // 2], "i")
-    generate_mesh = Mesh(all_devices[len(all_devices) // 2 :], "i")
-    prefill_procs = [0, 1]
-    generate_procs = [2, 3]
+    # Create mesh — all devices along single TP axis
+    # On multi-chip TPUs (e.g. v4-8), JAX auto-discovers all chips
+    devices = jax.devices()
+    mesh = Mesh(np.array(devices).reshape(4, 4), ("dp", "tp"))
 
-    print(f"Created prefill mesh with {len(all_devices)//2} device(s): {prefill_mesh}")
-    print(
-        f"Created generate mesh with {len(all_devices)//2} device(s): {generate_mesh}"
-    )
-    print(f"for process-{jax.process_index()}:\n device: {jax.local_devices()} ")
-
-    # Create engine and orchestrator with 16 slots
-    max_concurrent_slots = 8
-    print(f"\nInitializing inference engine (max_slots={max_concurrent_slots})...")
+    print(f"Created mesh with {len(devices)} device(s): {mesh}")
+    print(f"Process {jax.process_index()}: devices {jax.local_devices()}")
     sys.stdout.flush()
-    engine = InferenceEngine(
+
+    # Create serving configuration
+    serve_cfg = ServingConfig(
+        decode_steps=10,
+        decode_batch_size=16,
+        prefill_batch_size=4,
+        eos_tokens=(tokenizer.eot_id,),
+        token_pad_idx=tokenizer.pad_id,
+        max_decode_length=args.max_decode_length,
+    )
+
+    # Create serving loop
+    print(f"\nInitializing serving loop...")
+    sys.stdout.flush()
+    serving_loop = ServingLoop(
+        serve_cfg=serve_cfg,
         model=model,
         params=params,
-        prefill_procs=prefill_procs,
-        generate_procs=generate_procs,
-        prefill_mesh=prefill_mesh,
-        generate_mesh=generate_mesh,
-        max_concurrent_slots=max_concurrent_slots,
-        pad_id=tokenizer.pad_id,
+        mesh=mesh,
+        is_server=(jax.process_index() == 0),
     )
 
-    orchestrator = InferenceOrchestrator(engine, max_prefill_batch_size=8)
-    orchestrator.start()
+    # Warmup: compile prefill and decode before real inference
+    serving_loop.warmup()
 
-    try:
-        # Run batch generation with 16 prompts
-        generate_batch(
-            orchestrator,
-            tokenizer,
-            prompts,
-            max_new_tokens=512,
-            verbose=True,
-        )
+    # Run batch generation
+    generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
-    finally:
-        # Cleanup
-        print("\nShutting down...")
-        orchestrator.stop()
-        print("Done!")
+    # Ensure all hosts finish before any process exits
+    pid = jax.process_index()
+    print(f"[P{pid}] reaching shutdown barrier")
+    sys.stdout.flush()
+    from models.sync_server import SyncServer
+    SyncServer.barrier("shutdown", 0)
+    print(f"[P{pid}] passed shutdown barrier")
+    sys.stdout.flush()
+
+    print(f"\n[P{pid}] Done!")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        pid = jax.process_index()
+        print(f"\n[HOST {pid}] FATAL ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(1)

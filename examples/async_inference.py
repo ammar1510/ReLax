@@ -1,7 +1,13 @@
-"""Example usage of async slot-based inference engine.
+"""Example usage of ServingLoop event loop-based inference.
 
-This script demonstrates how to use the InferenceOrchestrator for efficient
-concurrent text generation with multiple requests.
+This script demonstrates how to use the ServingLoop for efficient
+concurrent text generation with multiple requests using an event loop pattern.
+
+Features:
+- Event loop-based serving (no threading complexity)
+- Multi-host coordination support
+- Flexible batching
+- Multistep decode for efficiency
 
 Usage:
     python examples/async_inference.py
@@ -11,6 +17,8 @@ import time
 from pathlib import Path
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
 
 # Add parent directory to path for imports
 import sys
@@ -18,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.engine import InferenceEngine, InferenceOrchestrator, InferenceRequest
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 
 
 def load_model_and_params():
@@ -63,214 +71,223 @@ def load_model_and_params():
 
 
 def single_request_example():
-    """Example 1: Single request inference."""
+    """Example 1: Single request inference with event loop."""
     print("=" * 80)
-    print("Example 1: Single Request Inference")
+    print("Example 1: Single Request Inference (Event Loop)")
     print("=" * 80)
 
     # Load model
     print("Loading model...")
     model, params, config = load_model_and_params()
 
-    # Create engine and orchestrator
-    engine = InferenceEngine(
+    # Create mesh
+    all_devices = np.array(jax.devices())
+    mesh = Mesh(all_devices, "tp")
+
+    # Create serving config
+    serve_cfg = ServingConfig(
+        decode_steps=10,  # Generate 10 tokens per decode step
+        decode_batch_size=4,  # Max concurrent sequences
+        prefill_batch_size=2,  # Max concurrent prefill
+        eos_tokens=(2,),  # EOS token ID
+        token_pad_idx=0,
+        max_decode_length=20,  # Max tokens to generate
+    )
+
+    # Create serving loop
+    serving_loop = ServingLoop(
+        serve_cfg=serve_cfg,
         model=model,
         params=params,
-        max_concurrent_slots=4,
-        pad_id=0,
+        mesh=mesh,
+        is_server=True,  # Single process, so this is the server
     )
-    orchestrator = InferenceOrchestrator(engine)
 
-    # Start orchestrator
-    orchestrator.start()
+    # Create and submit a request
+    prompt_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    request = UserRequestPrompt(
+        id=1,
+        text=prompt_tokens,  # list[int], not jax.Array
+    )
 
-    try:
-        # Create a request
-        prompt_tokens = jnp.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        request = InferenceRequest(
-            request_id="request-1",
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=20,
-            eos_token_id=2,
-        )
+    print(f"\nSubmitting request: {request.id}")
+    print(f"Prompt length: {len(prompt_tokens)} tokens")
+    serving_loop.add_request(request)
 
-        # Submit request
-        print(f"\nSubmitting request: {request.request_id}")
-        print(f"Prompt length: {len(prompt_tokens)} tokens")
-        response_queue = orchestrator.submit(request)
+    # Event loop
+    start_time = time.time()
+    max_iterations = 1000
 
-        # Collect results
-        generated_tokens = []
-        start_time = time.time()
+    for iteration in range(max_iterations):
+        serving_loop.serving_step()
 
-        while True:
-            result = response_queue.get()
+        # Check if request is complete
+        if request.id in serving_loop.results and serving_loop.results[request.id].done:
+            result = serving_loop.results[request.id]
+            total_time = time.time() - start_time
 
-            if result["status"] == "generating":
-                token = result["token"]
-                generated_tokens.append(token)
-                print(f"  Generated token: {token}")
-
-            elif result["status"] == "complete":
-                total_time = time.time() - start_time
-                print(f"\nGeneration complete!")
-                print(f"  Total tokens: {len(result['tokens'])}")
-                print(f"  Tokens: {result['tokens']}")
-                print(f"  Time: {total_time:.3f}s")
-                print(f"  Tokens/sec: {len(result['tokens']) / total_time:.2f}")
-                print(f"  Finish reason: {result['finish_reason']}")
-                break
-
-            elif result["status"] == "error":
-                print(f"  Error: {result['error']}")
-                break
-
-    finally:
-        # Stop orchestrator
-        orchestrator.stop()
+            print(f"\nGeneration complete!")
+            print(f"  Total tokens: {len(result.token_list)}")
+            print(f"  Tokens: {result.token_list}")
+            print(f"  Time: {total_time:.3f}s")
+            print(f"  Tokens/sec: {len(result.token_list) / total_time:.2f}")
+            break
 
     print()
 
 
 def concurrent_requests_example():
-    """Example 2: Multiple concurrent requests."""
+    """Example 2: Multiple concurrent requests with event loop."""
     print("=" * 80)
-    print("Example 2: Concurrent Requests (Slot-Based Batching)")
+    print("Example 2: Concurrent Requests (Event Loop + Slot-Based Batching)")
     print("=" * 80)
 
     # Load model
     print("Loading model...")
     model, params, config = load_model_and_params()
 
-    # Create engine with multiple slots
-    engine = InferenceEngine(
+    # Create mesh
+    all_devices = np.array(jax.devices())
+    mesh = Mesh(all_devices, "tp")
+
+    # Create serving config with more slots
+    serve_cfg = ServingConfig(
+        decode_steps=10,
+        decode_batch_size=8,  # Support up to 8 concurrent sequences
+        prefill_batch_size=4,  # Process 4 prefills at once
+        eos_tokens=(2,),
+        token_pad_idx=0,
+        max_decode_length=15,
+    )
+
+    # Create serving loop
+    serving_loop = ServingLoop(
+        serve_cfg=serve_cfg,
         model=model,
         params=params,
-        max_concurrent_slots=8,  # Support up to 8 concurrent sequences
-        pad_id=0,
+        mesh=mesh,
+        is_server=True,
     )
-    orchestrator = InferenceOrchestrator(engine)
 
-    # Start orchestrator
-    orchestrator.start()
+    # Create multiple requests with different prompt lengths
+    requests = [
+        UserRequestPrompt(
+            id=i,
+            text=list(range(1, 10 + i * 5)),  # Different lengths
+        )
+        for i in range(5)  # 5 concurrent users
+    ]
 
-    try:
-        # Create multiple requests with different prompt lengths
-        requests = [
-            InferenceRequest(
-                request_id=f"user-{i}",
-                prompt_tokens=jnp.array(list(range(1, 10 + i * 5))),
-                max_new_tokens=15,
-                eos_token_id=2,
-            )
-            for i in range(5)  # 5 concurrent users
-        ]
+    print(f"\nSubmitting {len(requests)} concurrent requests:")
+    for req in requests:
+        print(f"  Request {req.id}: {len(req.text)} tokens")
+        serving_loop.add_request(req)
 
-        print(f"\nSubmitting {len(requests)} concurrent requests:")
-        for req in requests:
-            print(f"  {req.request_id}: {len(req.prompt_tokens)} tokens")
+    # Event loop
+    start_time = time.time()
+    max_iterations = 1000
+    completed = 0
 
-        # Submit all requests
-        response_queues = {}
-        start_time = time.time()
+    for iteration in range(max_iterations):
+        serving_loop.serving_step()
 
-        for request in requests:
-            response_queue = orchestrator.submit(request)
-            response_queues[request.request_id] = response_queue
+        # Check for newly completed requests
+        new_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
+        if new_completed > 0:
+            for req_id, result in serving_loop.results.items():
+                if result.done and len(result.token_list) > 0:
+                    elapsed = time.time() - start_time
+                    print(f"\n✓ Request {req_id} completed:")
+                    print(f"    Tokens: {len(result.token_list)}")
+                    print(f"    Time: {elapsed:.3f}s")
+            completed += new_completed
 
-        # Collect results from all requests
-        completed = 0
-        results = {}
+        # Exit when all requests are done
+        if completed >= len(requests):
+            break
 
-        while completed < len(requests):
-            for request_id, response_queue in response_queues.items():
-                if request_id in results:
-                    continue  # Already completed
+    # Summary
+    total_time = time.time() - start_time
+    total_tokens = sum(len(r.token_list) for r in serving_loop.results.values())
 
-                try:
-                    result = response_queue.get(timeout=0.01)
-
-                    if result["status"] == "complete":
-                        results[request_id] = result
-                        completed += 1
-                        elapsed = time.time() - start_time
-                        print(f"\n✓ {request_id} completed:")
-                        print(f"    Tokens: {len(result['tokens'])}")
-                        print(f"    Time: {elapsed:.3f}s")
-                        print(f"    Finish reason: {result['finish_reason']}")
-
-                except:
-                    pass  # Queue empty, continue
-
-        # Summary
-        total_time = time.time() - start_time
-        total_tokens = sum(len(r["tokens"]) for r in results.values())
-
-        print("\n" + "=" * 80)
-        print("Summary:")
-        print(f"  Total requests: {len(requests)}")
-        print(f"  Total tokens generated: {total_tokens}")
-        print(f"  Total time: {total_time:.3f}s")
-        print(f"  Throughput: {total_tokens / total_time:.2f} tokens/sec")
-        print(f"  Avg latency: {total_time / len(requests):.3f}s/request")
-        print("=" * 80)
-
-    finally:
-        # Stop orchestrator
-        orchestrator.stop()
-
+    print("\n" + "=" * 80)
+    print("Summary:")
+    print(f"  Total requests: {len(requests)}")
+    print(f"  Total tokens generated: {total_tokens}")
+    print(f"  Total time: {total_time:.3f}s")
+    print(f"  Throughput: {total_tokens / total_time:.2f} tokens/sec")
+    print(f"  Avg latency: {total_time / len(requests):.3f}s/request")
+    print("=" * 80)
     print()
 
 
-def streaming_example():
-    """Example 3: Streaming token-by-token output."""
+def event_loop_monitoring_example():
+    """Example 3: Event loop with progress monitoring."""
     print("=" * 80)
-    print("Example 3: Streaming Generation")
+    print("Example 3: Event Loop with Progress Monitoring")
     print("=" * 80)
 
     # Load model
     print("Loading model...")
     model, params, config = load_model_and_params()
 
-    # Create engine and orchestrator
-    engine = InferenceEngine(model=model, params=params, max_concurrent_slots=4)
-    orchestrator = InferenceOrchestrator(engine)
+    # Create mesh
+    all_devices = np.array(jax.devices())
+    mesh = Mesh(all_devices, "tp")
 
-    # Start orchestrator
-    orchestrator.start()
+    # Create serving config
+    serve_cfg = ServingConfig(
+        decode_steps=5,  # Smaller steps for more frequent updates
+        decode_batch_size=4,
+        prefill_batch_size=2,
+        eos_tokens=(2,),
+        token_pad_idx=0,
+        max_decode_length=30,
+    )
 
-    try:
-        # Create request
-        prompt_tokens = jnp.array([1, 2, 3, 4, 5])
-        request = InferenceRequest(
-            request_id="stream-test",
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=30,
-            eos_token_id=2,
-        )
+    # Create serving loop
+    serving_loop = ServingLoop(
+        serve_cfg=serve_cfg,
+        model=model,
+        params=params,
+        mesh=mesh,
+        is_server=True,
+    )
 
-        print(f"\nStreaming generation for: {request.request_id}")
-        print("Generated tokens: ", end="", flush=True)
+    # Create request
+    prompt_tokens = [1, 2, 3, 4, 5]
+    request = UserRequestPrompt(id=1, text=prompt_tokens)
 
-        response_queue = orchestrator.submit(request)
+    print(f"\nMonitoring generation progress for request {request.id}")
+    print("Progress: ", end="", flush=True)
 
-        # Stream tokens as they arrive
-        while True:
-            result = response_queue.get()
+    serving_loop.add_request(request)
 
-            if result["status"] == "generating":
-                print(f"{result['token']} ", end="", flush=True)
+    # Event loop with progress tracking
+    start_time = time.time()
+    max_iterations = 1000
+    last_token_count = 0
 
-            elif result["status"] == "complete":
-                print(f"\n\nComplete! Total: {len(result['tokens'])} tokens")
+    for iteration in range(max_iterations):
+        serving_loop.serving_step()
+
+        # Check progress
+        if request.id in serving_loop.results:
+            result = serving_loop.results[request.id]
+            current_count = len(result.token_list)
+
+            # Print new tokens
+            if current_count > last_token_count:
+                for _ in range(current_count - last_token_count):
+                    print(".", end="", flush=True)
+                last_token_count = current_count
+
+            # Check if complete
+            if result.done:
+                print(f"\n\nComplete! Generated {len(result.token_list)} tokens")
+                print(f"Tokens: {result.token_list}")
+                print(f"Time: {time.time() - start_time:.3f}s")
                 break
-
-            elif result["status"] == "error":
-                print(f"\nError: {result['error']}")
-                break
-
-    finally:
-        orchestrator.stop()
 
     print()
 
@@ -278,13 +295,13 @@ def streaming_example():
 def main():
     """Run all examples."""
     print("\n" + "=" * 80)
-    print("Async Slot-Based Inference Engine Examples")
+    print("ServingLoop Event Loop-Based Inference Examples")
     print("=" * 80 + "\n")
 
     # Run examples
     single_request_example()
     concurrent_requests_example()
-    streaming_example()
+    event_loop_monitoring_example()
 
     print("All examples completed!\n")
 

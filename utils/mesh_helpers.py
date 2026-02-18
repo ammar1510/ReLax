@@ -14,12 +14,20 @@ class MeshHelper:
     """Helper class for managing mesh placement and sharding operations."""
 
     @staticmethod
+    def get_tp_axis(mesh: Optional[Mesh]) -> Optional[str]:
+        """Get the tensor-parallel axis name ('tp' for 2D mesh, first axis for 1D)."""
+        if mesh is None or not mesh.axis_names:
+            return None
+        return "tp" if "tp" in mesh.axis_names else mesh.axis_names[0]
+
+    @staticmethod
     def allgather(array: jax.Array, mesh: Mesh) -> jax.Array:
-        gather_fn = lambda x: jax.lax.all_gather(x, "i", tiled=True)
+        axis_name = MeshHelper.get_tp_axis(mesh)
+        gather_fn = lambda x: jax.lax.all_gather(x, axis_name, tiled=True)
         sharded_gather = jax.shard_map(
             gather_fn,
             mesh=mesh,
-            in_specs=PS("i"),
+            in_specs=PS(axis_name),
             out_specs=PS(),
             check_vma=False,
         )
@@ -95,16 +103,25 @@ class MeshHelper:
             return cache
 
         # Create sharding specs for k, v, and seq_positions
+        # k/v shape: [n_layers, bsz, n_kv_heads, max_seqlen, head_dim]
+        # seq_positions shape: [bsz]
         if pspec is None:
-            k_spec = MeshHelper.batch_axis_spec(
-                mesh, rank=len(cache.k.shape), batch_axis=1
-            )
-            v_spec = MeshHelper.batch_axis_spec(
-                mesh, rank=len(cache.k.shape), batch_axis=1
-            )
-            pos_spec = MeshHelper.batch_axis_spec(
-                mesh, rank=len(cache.seq_positions.shape), batch_axis=0
-            )
+            dp = "dp" if "dp" in mesh.axis_names else None
+            tp = MeshHelper.get_tp_axis(mesh)
+            if dp is not None:
+                k_spec = PS(None, dp, tp, None, None)
+                v_spec = PS(None, dp, tp, None, None)
+                pos_spec = PS(dp)
+            else:
+                k_spec = MeshHelper.batch_axis_spec(
+                    mesh, rank=len(cache.k.shape), batch_axis=1
+                )
+                v_spec = MeshHelper.batch_axis_spec(
+                    mesh, rank=len(cache.k.shape), batch_axis=1
+                )
+                pos_spec = MeshHelper.batch_axis_spec(
+                    mesh, rank=len(cache.seq_positions.shape), batch_axis=0
+                )
         else:
             k_spec = pspec
             v_spec = pspec
@@ -118,12 +135,17 @@ class MeshHelper:
 
     @staticmethod
     def param_sharding(x, name: str, mesh: Mesh):
-        if "norm" in name or "freqs_cis" in name:
+        tp = MeshHelper.get_tp_axis(mesh)
+        if tp is None or "norm" in name or "freqs_cis" in name:
             return PS()
         if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
-            return MeshHelper.batch_axis_spec(mesh, x.ndim, 1)
+            spec = [None] * x.ndim
+            spec[1] = tp
+            return PS(*spec)
         if any(k in name for k in ("down", "output", "wo")):
-            return MeshHelper.batch_axis_spec(mesh, x.ndim, 0)
+            spec = [None] * x.ndim
+            spec[0] = tp
+            return PS(*spec)
         return PS()
 
     @staticmethod
