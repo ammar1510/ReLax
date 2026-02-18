@@ -156,8 +156,10 @@ def main():
     # Load model configuration
     print(f"Loading model from {args.model_path}...")
     config = ModelConfig.from_json_file(args.model_path)
-    print(f"Config: {config.n_layers} layers, {config.dim} dim, "
-          f"{config.n_heads} heads, {config.n_kv_heads} kv_heads")
+    print(
+        f"Config: {config.n_layers} layers, {config.dim} dim, "
+        f"{config.n_heads} heads, {config.n_kv_heads} kv_heads"
+    )
 
     # Initialize model
     model = LLaMa(config)
@@ -201,7 +203,9 @@ def main():
     print(f"\nGRPO Configuration:")
     print(f"  Rollout batch size: {grpo_config.rollout_batch_size}")
     print(f"  Group size: {grpo_config.group_size}")
-    print(f"  Completions per iteration: {grpo_config.rollout_batch_size * grpo_config.group_size}")
+    print(
+        f"  Completions per iteration: {grpo_config.rollout_batch_size * grpo_config.group_size}"
+    )
     print(f"  PPO epochs: {grpo_config.ppo_epochs}")
     print(f"  Learning rate: {grpo_config.learning_rate}")
     print(f"  KL coefficient: {grpo_config.kl_coef}")
@@ -222,7 +226,9 @@ def main():
     print(f"{'='*80}\n")
 
     # Train
-    checkpoint_dir = str(output_dir / "checkpoints") if args.checkpoint_freq > 0 else None
+    checkpoint_dir = (
+        str(output_dir / "checkpoints") if args.checkpoint_freq > 0 else None
+    )
     metrics = trainer.train(
         prompt_dataset=prompt_dataset,
         num_iterations=args.num_iterations,
