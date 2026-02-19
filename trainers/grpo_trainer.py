@@ -149,7 +149,7 @@ class GRPOTrainer(Trainer):
         self.reward_fn = reward_fn
 
         # Create reference model parameters (frozen copy, also sharded)
-        self.reference_params = jax.tree.map(lambda x: x.copy(), sharded_params)
+        self.reference_params = jax.tree_map(lambda x: x.copy(), sharded_params)
 
         # Create ServingLoop for batched rollout generation
         serve_cfg = ServingConfig(
@@ -643,7 +643,7 @@ class GRPOTrainer(Trainer):
             pass
         elif self.grpo_config.reference_mode == "ema":
             alpha = self.grpo_config.ema_alpha
-            self.reference_params = jax.tree.map(
+            self.reference_params = jax.tree_map(
                 lambda ref, policy: alpha * ref + (1 - alpha) * policy,
                 self.reference_params,
                 self.state.params,
@@ -651,7 +651,7 @@ class GRPOTrainer(Trainer):
         elif self.grpo_config.reference_mode == "periodic":
             if (iteration + 1) % self.grpo_config.reference_update_freq == 0:
                 print(f"Updating reference model at iteration {iteration + 1}")
-                self.reference_params = jax.tree.map(
+                self.reference_params = jax.tree_map(
                     lambda x: x.copy(),
                     self.state.params,
                 )
