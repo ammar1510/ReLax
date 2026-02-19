@@ -176,4 +176,4 @@ class MeshHelper:
             spec = MeshHelper.param_sharding(x, name, mesh)
             return MeshHelper.put_on_mesh(x, mesh, spec)
 
-        return jax.tree_util.tree_map_with_path(shard_leaf, params)
+        return jax.tree.map_with_path(shard_leaf, params)
