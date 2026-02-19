@@ -151,7 +151,7 @@ def _convert_layer(
     hf_weights: Dict[str, np.ndarray],
     layer_idx: int,
     config: ModelConfig,
-) -> Dict[str, jnp.ndarray]:
+) -> Dict[str, np.ndarray]:
     """
     Convert a single transformer layer from HF to ReLax format.
 
