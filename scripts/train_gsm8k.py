@@ -26,6 +26,7 @@ from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 ROLLOUT_BATCH_SIZE = 64
 GROUP_SIZE = 8
 MAX_NEW_TOKENS = 512
+MAX_CACHE_SEQLEN = 1024  # prompt (~100 tokens) + MAX_NEW_TOKENS (512), with headroom
 TEMPERATURE = 0.8
 NUM_ITERATIONS = 500
 MINIBATCH_SIZE = 32
@@ -121,6 +122,7 @@ def main():
         rollout_batch_size=ROLLOUT_BATCH_SIZE,
         group_size=GROUP_SIZE,
         max_new_tokens=MAX_NEW_TOKENS,
+        max_cache_seqlen=MAX_CACHE_SEQLEN,
         temperature=TEMPERATURE,
         num_iterations=NUM_ITERATIONS,
         minibatch_size=MINIBATCH_SIZE,

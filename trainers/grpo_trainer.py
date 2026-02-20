@@ -71,6 +71,7 @@ class GRPOConfig:
     pad_token_id: int = 0
     eos_token_id: int = 2
     decode_steps: int = 10  # Tokens per multistep decode call
+    max_cache_seqlen: Optional[int] = None  # KV cache size; defaults to model's max_seqlen if None
 
     def __post_init__(self):
         """Validate configuration."""
@@ -159,7 +160,7 @@ class GRPOTrainer(Trainer):
             eos_tokens=(grpo_config.eos_token_id,),
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
-            max_cache_seqlen=config.max_seqlen,
+            max_cache_seqlen=grpo_config.max_cache_seqlen or config.max_seqlen,
             sampler=CategoricalSampler(temperature=grpo_config.temperature),
             rng_seed=seed,
         )
