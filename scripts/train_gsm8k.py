@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -102,7 +103,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading model from {args.model_path}...")
-    config = ModelConfig.from_json_file(args.model_path)
+    config = dataclasses.replace(ModelConfig.from_json_file(args.model_path), max_seqlen=8192)
     model = LLaMa(config)
     params = load_llama_weights(args.model_path, config)
     print(f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH")
