@@ -33,4 +33,17 @@ py-modules = ["sampling"]
 [tool.pytest.ini_options]
 pythonpath = [
   "."
-] 
+]
+
+[tool.pyrefly]
+project_excludes = [
+  "**/__pycache__",
+  "**/.venv",
+  "**/node_modules",
+  "**/*.egg-info",
+  "**/.git",
+  "**/dist",
+  "**/build",
+  "**/.mypy_cache",
+  "**/.pytest_cache",
+]

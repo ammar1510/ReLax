@@ -19,7 +19,7 @@ import sys
 import threading
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List, Any
+from typing import Optional, Dict, List, Any
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -531,15 +531,16 @@ class ServingLoop:
             max_cache_seqlen=serve_cfg.max_cache_seqlen,
         )
 
+        # Initialize decode state
+        decode_state = self.engine.init_decode_state()
+
         # Setup decode work
         self.decode_work = DecodeWork(
-            curr_tokens=None,
-            cache=None,
+            curr_tokens=decode_state.tokens,
+            cache=decode_state.kv_cache,
             active_results=[None for _ in range(serve_cfg.decode_batch_size)],
         )
 
-        # Initialize decode state
-        decode_state = self.engine.init_decode_state()
         self.decode_work.curr_tokens = decode_state.tokens
         self.decode_work.cache = decode_state.kv_cache
 

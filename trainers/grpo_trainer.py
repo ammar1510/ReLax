@@ -49,7 +49,7 @@ class GRPOConfig:
     rollout_batch_size: int = 256  # Number of prompts per rollout
     group_size: int = 4  # Completions per prompt
     max_new_tokens: int = 512  # Max tokens to generate per completion
-    temperature: float = 0.8  # Sampling temperature for diversity
+    temperature: float = 0.7  # Sampling temperature for diversity
 
     # Training settings
     num_iterations: int = 1000  # Number of rollout-train cycles
