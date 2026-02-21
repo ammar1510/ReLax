@@ -15,6 +15,12 @@ import jax
 import jax.numpy as jnp
 from datasets import load_dataset
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.llama.load import load_llama_weights
@@ -23,7 +29,7 @@ from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 
 # ── Hardcoded training config ──────────────────────────────────────────────────
 
-ROLLOUT_BATCH_SIZE = 64
+ROLLOUT_BATCH_SIZE = 32
 GROUP_SIZE = 8
 MAX_NEW_TOKENS = 512
 MAX_CACHE_SEQLEN = 1024
@@ -98,10 +104,35 @@ def load_gsm8k(tokenizer: Tokenizer) -> List[Tuple[List[int], str]]:
 def main():
     parser = argparse.ArgumentParser(description="GRPO training on GSM8K")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model directory")
+    parser.add_argument("--wandb_project", type=str, default="relax-grpo-gsm8k", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name (auto-generated if not set)")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable W&B logging")
     args = parser.parse_args()
 
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    use_wandb = _WANDB_AVAILABLE and not args.no_wandb
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "rollout_batch_size": ROLLOUT_BATCH_SIZE,
+                "group_size": GROUP_SIZE,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "max_cache_seqlen": MAX_CACHE_SEQLEN,
+                "temperature": TEMPERATURE,
+                "num_iterations": NUM_ITERATIONS,
+                "minibatch_size": MINIBATCH_SIZE,
+                "kl_coef": KL_COEF,
+                "learning_rate": LEARNING_RATE,
+                "reference_mode": REFERENCE_MODE,
+                "model_path": args.model_path,
+            },
+        )
+    elif not _WANDB_AVAILABLE and not args.no_wandb:
+        print("wandb not installed; skipping W&B logging. Install with: pip install wandb")
 
     print(f"Loading model from {args.model_path}...")
     config = dataclasses.replace(ModelConfig.from_json_file(args.model_path), max_seqlen=8192)
@@ -142,11 +173,24 @@ def main():
         seed=42,
     )
 
+    def wandb_log(iteration_metrics: dict):
+        if use_wandb:
+            wandb.log(
+                {
+                    "reward/mean": iteration_metrics["mean_reward"],
+                    "loss/total": iteration_metrics["mean_loss"],
+                    "loss/pg": iteration_metrics["mean_pg_loss"],
+                    "loss/kl_div": iteration_metrics["mean_kl_div"],
+                },
+                step=iteration_metrics["iteration"],
+            )
+
     print(f"Starting GRPO training for {NUM_ITERATIONS} iterations...")
     metrics = trainer.train(
         prompt_dataset=prompt_dataset,
         checkpoint_dir=str(output_dir / "checkpoints"),
         checkpoint_freq=CHECKPOINT_FREQ,
+        step_callback=wandb_log,
     )
 
     metrics_path = output_dir / "metrics.json"
@@ -155,6 +199,8 @@ def main():
     print(f"Metrics saved to {metrics_path}")
 
     trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
+    if use_wandb:
+        wandb.finish()
     print("Training complete.")
     last = metrics[-1]
     print(f"  Mean reward:  {last['mean_reward']:.4f}")

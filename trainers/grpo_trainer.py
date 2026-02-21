@@ -561,6 +561,7 @@ class GRPOTrainer(Trainer):
         num_iterations: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
         checkpoint_freq: int = 100,
+        step_callback: Optional[Callable[[Dict[str, float]], None]] = None,
     ) -> List[Dict[str, float]]:
         """Main GRPO training loop.
 
@@ -623,6 +624,9 @@ class GRPOTrainer(Trainer):
             print(f"  Loss: {iteration_metrics['mean_loss']:.4f}")
             print(f"  PG Loss: {iteration_metrics['mean_pg_loss']:.4f}")
             print(f"  KL Div: {iteration_metrics['mean_kl_div']:.4f}")
+
+            if step_callback is not None:
+                step_callback(iteration_metrics)
 
             # Update reference model (if using periodic or EMA mode)
             self._update_reference_model(iteration)

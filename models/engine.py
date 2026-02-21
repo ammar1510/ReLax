@@ -747,8 +747,9 @@ class ServingLoop:
                             break
                 result.done = True
                 self.decode_work.active_results[i] = None
-                print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
-                sys.stdout.flush()
+                if self.verbose:
+                    print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
+                    sys.stdout.flush()
 
     def decode_step(self):
         """One decode iteration: insert pending prefills + run multistep decode."""
@@ -817,10 +818,11 @@ class ServingLoop:
         self._decode_call_count += 1
         _elapsed = _time.time() - _t0
         _active = int(active_mask.sum())
-        print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
-              f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
-              f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
-        sys.stdout.flush()
+        if self.verbose:
+            print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
+                  f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
+                  f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
+            sys.stdout.flush()
 
         # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
         # Swap current output with stored output (allows decode kernel to run async)
@@ -907,8 +909,9 @@ class ServingLoop:
             )
             self.prefill_work.to_decode.append(new_decode)
 
-        print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
-        sys.stdout.flush()
+        if self.verbose:
+            print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
+            sys.stdout.flush()
 
     def _log(self, msg):
         if not self.verbose:
