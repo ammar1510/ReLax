@@ -18,7 +18,6 @@ Architecture:
 import sys
 import threading
 import dataclasses
-from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
 from functools import partial
 import jax
@@ -38,30 +37,6 @@ from utils.mesh_helpers import MeshHelper
 from models.sync_server import SyncServer
 from sampling import Sampler, GreedySampler
 
-
-@dataclass
-class DecodeState:
-    """State for batched generation across slots.
-
-    The decode state maintains a fixed-size batch dimension where each position
-    is a "slot" that can be occupied by a generating sequence. This enables
-    efficient batching of multiple concurrent requests.
-
-    Attributes:
-        kv_cache: Key-value cache for all slots
-                  Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
-        tokens: Current token for each slot
-                Shape: [max_slots, 1]
-        active_mask: Boolean mask indicating which slots are actively generating
-                     Shape: [max_slots]
-        request_ids: Which request occupies each slot (None if slot is empty)
-                     Length: max_slots
-    """
-
-    kv_cache: KVCache
-    tokens: jax.Array  # [max_slots, 1]
-    active_mask: jax.Array  # [max_slots] bool
-    request_ids: List[Optional[str]]  # [max_slots]
 
 
 ########################################################################################################################
@@ -422,13 +397,12 @@ class InferenceEngine:
 
         return multistep_decode_fn
 
-    def init_decode_state(self) -> DecodeState:
+    def init_decode_state(self) -> tuple[KVCache, jax.Array]:
         """Initialize empty decode state with all slots inactive.
 
         Returns:
-            Fresh DecodeState with empty KV cache and all slots inactive
+            Tuple of (kv_cache, tokens) placed on the mesh
         """
-        # Initialize empty KV cache for all slots
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=self.max_slots,
@@ -439,7 +413,6 @@ class InferenceEngine:
         )
         kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
 
-        # Initialize tokens (doesn't matter what they are since slots are inactive)
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = self.mesh_helper.put_on_mesh(
             tokens,
@@ -447,23 +420,7 @@ class InferenceEngine:
             self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
 
-        # All slots start inactive
-        active_mask = jnp.zeros(self.max_slots, dtype=bool)
-        active_mask = self.mesh_helper.put_on_mesh(
-            active_mask,
-            self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
-        )
-
-        # No requests assigned
-        request_ids = [None] * self.max_slots
-
-        return DecodeState(
-            kv_cache=kv_cache,
-            tokens=tokens,
-            active_mask=active_mask,
-            request_ids=request_ids,
-        )
+        return kv_cache, tokens
 
 
 ########################################################################################################################
@@ -532,17 +489,14 @@ class ServingLoop:
         )
 
         # Initialize decode state
-        decode_state = self.engine.init_decode_state()
+        kv_cache, tokens = self.engine.init_decode_state()
 
         # Setup decode work
         self.decode_work = DecodeWork(
-            curr_tokens=decode_state.tokens,
-            cache=decode_state.kv_cache,
+            curr_tokens=tokens,
+            cache=kv_cache,
             active_results=[None for _ in range(serve_cfg.decode_batch_size)],
         )
-
-        self.decode_work.curr_tokens = decode_state.tokens
-        self.decode_work.cache = decode_state.kv_cache
 
         # Create multistep decode function
         self.multistep_decode_fn = self.engine.make_multistep_decode_fn()
@@ -611,9 +565,7 @@ class ServingLoop:
         sys.stdout.flush()
 
         # Re-initialize decode state (discard dummy results)
-        decode_state = self.engine.init_decode_state()
-        self.decode_work.curr_tokens = decode_state.tokens
-        self.decode_work.cache = decode_state.kv_cache
+        self.decode_work.cache, self.decode_work.curr_tokens = self.engine.init_decode_state()
 
         print("[ServingLoop] Warmup complete")
         sys.stdout.flush()

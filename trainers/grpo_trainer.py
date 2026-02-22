@@ -183,9 +183,9 @@ class GRPOTrainer(Trainer):
 
     def _reset_serving_loop(self):
         """Reset serving loop state for a new rollout batch."""
-        decode_state = self.serving_loop.engine.init_decode_state()
-        self.serving_loop.decode_work.curr_tokens = decode_state.tokens
-        self.serving_loop.decode_work.cache = decode_state.kv_cache
+        kv_cache, tokens = self.serving_loop.engine.init_decode_state()
+        self.serving_loop.decode_work.curr_tokens = tokens
+        self.serving_loop.decode_work.cache = kv_cache
         self.serving_loop.decode_work.active_results = [
             None for _ in range(self.grpo_config.group_size)
         ]
