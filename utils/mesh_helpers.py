@@ -81,11 +81,6 @@ class MeshHelper:
         if mesh is None:
             return value
 
-        # Convert to bfloat16 to save HBM space
-        if hasattr(value, "astype"):
-            # Use jnp.bfloat16 for conversion
-            value = value.astype(jnp.bfloat16)
-
         value = jax.device_put(value, NamedSharding(mesh, spec))
         return value
 
@@ -158,6 +153,9 @@ class MeshHelper:
 
         def shard_leaf(path, x):
             name = "/".join(_get_key_name(k) for k in path)
+            # Convert float32 params to bfloat16 to save HBM
+            if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
+                x = jnp.asarray(x, dtype=jnp.bfloat16)
             spec = MeshHelper.param_sharding(x, name, mesh)
             return MeshHelper.put_on_mesh(x, mesh, spec)
 
