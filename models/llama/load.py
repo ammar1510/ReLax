@@ -169,9 +169,10 @@ def _make_checkpoint_manager(checkpoint_path: Path):
     This is required when hosts do NOT share a network filesystem.
     """
     import orbax.checkpoint as ocp
+    from orbax.checkpoint.options import MultiprocessingOptions
 
     options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=ocp.MultiprocessingOptions(primary_host=None),
+        multiprocessing_options=MultiprocessingOptions(primary_host=None),
     )
     return ocp.CheckpointManager(checkpoint_path, options=options)
 
