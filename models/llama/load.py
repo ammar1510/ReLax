@@ -3,11 +3,13 @@ Functions to load model weights from PyTorch checkpoint format.
 
 This module handles loading LLaMA weights from sharded .pth files
 in the PyTorch format, converting them to the ReLax model structure.
+It also provides orbax-based save/load for fast subsequent loads with
+optional mesh sharding.
 """
 
 import torch
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import numpy as np
 
 from .config import ModelConfig
@@ -231,3 +233,102 @@ def _convert_layer(
         "attention_norm_weight": attention_norm,
         "ffn_norm_weight": ffn_norm,
     }
+
+
+def save_orbax_weights(
+    params: Dict[str, Any], checkpoint_path: str, mesh=None
+) -> None:
+    """
+    Save ReLax params to an orbax checkpoint directory.
+
+    This is used once after converting from .pth format. Subsequent loads
+    can use load_from_orbax() which skips PyTorch entirely.
+
+    When a mesh is provided, params are sharded across devices before saving
+    so that each host writes only its local shards. This is required for
+    multi-host setups.
+
+    Args:
+        params: Nested params dict as returned by load_llama_weights()
+        checkpoint_path: Directory where the checkpoint will be written
+        mesh: Optional JAX Mesh. When provided, params are sharded before
+              saving for proper multi-host coordination.
+    """
+    import orbax.checkpoint as ocp
+    import jax
+
+    checkpoint_path = Path(checkpoint_path)
+
+    if mesh is not None:
+        from utils.mesh_helpers import MeshHelper
+
+        params = MeshHelper.shard_params(params, mesh)
+        jax.block_until_ready(params)
+
+    checkpointer = ocp.StandardCheckpointer()
+    checkpointer.save(checkpoint_path, args=ocp.args.StandardSave(params))
+    if jax.process_index() == 0:
+        print(f"Saved orbax checkpoint to {checkpoint_path}")
+
+
+def load_from_orbax(
+    checkpoint_path: str,
+    mesh=None,
+) -> Dict[str, Any]:
+    """
+    Load ReLax params from an orbax checkpoint, optionally sharding onto a mesh.
+
+    When a mesh is provided, each host reads only its own shards directly from
+    disk (no full-load-then-reshard).
+
+    Args:
+        checkpoint_path: Directory written by save_orbax_weights()
+        mesh: Optional JAX Mesh. When provided, params are restored directly
+              onto the mesh using per-array sharding specs.
+
+    Returns:
+        Nested params dict ready for model.apply() or InferenceEngine.
+    """
+    import orbax.checkpoint as ocp
+    import jax
+
+    checkpoint_path = Path(checkpoint_path)
+    checkpointer = ocp.StandardCheckpointer()
+
+    if mesh is None:
+        params = checkpointer.restore(checkpoint_path)
+        if jax.process_index() == 0:
+            print(f"Loaded orbax checkpoint from {checkpoint_path}")
+        return params
+
+    from jax.sharding import NamedSharding
+    from utils.mesh_helpers import MeshHelper
+
+    # Read metadata (shapes/dtypes only, no data loaded)
+    metadata = checkpointer.metadata(checkpoint_path)
+
+    def _get_key_name(key) -> str:
+        if hasattr(key, "key"):
+            return str(key.key)
+        elif hasattr(key, "idx"):
+            return str(key.idx)
+        elif hasattr(key, "name"):
+            return str(key.name)
+        return str(key)
+
+    def _build_restore_args(path, meta):
+        name = "/".join(_get_key_name(k) for k in path)
+        spec = MeshHelper.param_sharding(meta, name, mesh)
+        sharding = NamedSharding(mesh, spec)
+        return ocp.args.ArrayRestoreArgs(sharding=sharding)
+
+    restore_args = jax.tree.map_with_path(_build_restore_args, metadata)
+
+    params = checkpointer.restore(
+        checkpoint_path,
+        args=ocp.args.StandardRestore(restore_args),
+    )
+    if jax.process_index() == 0:
+        print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
+
+    return params

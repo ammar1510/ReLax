@@ -136,14 +136,15 @@ class MeshHelper:
     @staticmethod
     def param_sharding(x, name: str, mesh: Mesh):
         tp = MeshHelper.get_tp_axis(mesh)
+        ndim = len(x.shape) if not hasattr(x, "ndim") else x.ndim
         if tp is None or "norm" in name or "freqs_cis" in name:
             return PS()
         if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
-            spec = [None] * x.ndim
+            spec = [None] * ndim
             spec[1] = tp
             return PS(*spec)
         if any(k in name for k in ("down", "output", "wo")):
-            spec = [None] * x.ndim
+            spec = [None] * ndim
             spec[0] = tp
             return PS(*spec)
         return PS()
