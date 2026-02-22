@@ -161,11 +161,30 @@ def _convert_layer(
     }
 
 
+def _make_checkpoint_manager(checkpoint_path: Path):
+    """Create a CheckpointManager configured for local-storage multi-host use.
+
+    Setting primary_host=None makes every host act as its own primary, so each
+    host independently writes/reads its own metadata and shards to local disk.
+    This is required when hosts do NOT share a network filesystem.
+    """
+    import orbax.checkpoint as ocp
+
+    options = ocp.CheckpointManagerOptions(
+        multiprocessing_options=ocp.MultiprocessingOptions(primary_host=None),
+    )
+    return ocp.CheckpointManager(checkpoint_path, options=options)
+
+
 def save_orbax_weights(
     params: Dict[str, Any], checkpoint_path: str, mesh=None
 ) -> None:
     """
     Save ReLax params to an orbax checkpoint directory.
+
+    When a mesh is provided, params are sharded before saving so each host
+    writes only its local shards. primary_host=None ensures every host writes
+    its own metadata independently (required for local-only storage).
     """
     import orbax.checkpoint as ocp
     import jax
@@ -174,13 +193,11 @@ def save_orbax_weights(
 
     if mesh is not None:
         from utils.mesh_helpers import MeshHelper
-        # Pass model_config indirectly via dtype from first param or default
         params = MeshHelper.shard_params(params, mesh)
-        jax.block_until_ready(params)
 
-    checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(checkpoint_path, params, force=True)
-    checkpointer.wait_until_finished()
+    mngr = _make_checkpoint_manager(checkpoint_path)
+    mngr.save(0, args=ocp.args.StandardSave(params))
+    mngr.wait_until_finished()
     if jax.process_index() == 0:
         print(f"Saved orbax checkpoint to {checkpoint_path}")
 
@@ -191,25 +208,29 @@ def load_from_orbax(
 ) -> Dict[str, Any]:
     """
     Load ReLax params from an orbax checkpoint, optionally sharding onto a mesh.
+
+    When a mesh is provided, each host reads only its own shards directly from
+    disk by passing a target pytree of jax.ShapeDtypeStruct with sharding specs.
+    primary_host=None ensures every host reads its own metadata independently.
     """
     import orbax.checkpoint as ocp
     import jax
-    from jax.sharding import NamedSharding
 
     checkpoint_path = Path(checkpoint_path)
-    checkpointer = ocp.StandardCheckpointer()
+    mngr = _make_checkpoint_manager(checkpoint_path)
+    step = mngr.latest_step()
 
     if mesh is None:
-        params = checkpointer.restore(checkpoint_path)
+        params = mngr.restore(step, args=ocp.args.StandardRestore(None))
         if jax.process_index() == 0:
             print(f"Loaded orbax checkpoint from {checkpoint_path}")
         return params
 
+    from jax.sharding import NamedSharding
     from utils.mesh_helpers import MeshHelper
 
-    # Read metadata to get shapes/dtypes without loading data
-    step_metadata = checkpointer.metadata(checkpoint_path)
-    item_metadata = step_metadata.item_metadata
+    # Get array metadata (shapes/dtypes) without loading data
+    item_meta = mngr.item_metadata(step)
 
     def _get_key_name(key) -> str:
         if hasattr(key, "key"):
@@ -226,9 +247,9 @@ def load_from_orbax(
         sharding = NamedSharding(mesh, spec)
         return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
 
-    target = jax.tree.map_with_path(_build_target, item_metadata)
+    target = jax.tree.map_with_path(_build_target, item_meta)
 
-    params = checkpointer.restore(checkpoint_path, target=target)
+    params = mngr.restore(step, args=ocp.args.StandardRestore(target))
     if jax.process_index() == 0:
         print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
 
