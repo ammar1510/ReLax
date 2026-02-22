@@ -111,10 +111,12 @@ def _convert_hf_to_relax(
     if embed_weight is None:
         raise ValueError("model.embed_tokens.weight not found in checkpoint")
 
-    np_dtype = np.dtype(config.dtype)
+    import jax.numpy as jnp
+
+    jax_dtype = getattr(jnp, config.dtype)
 
     params["tok_embeddings"] = {
-        "embedding": np.array(embed_weight, dtype=np_dtype)
+        "embedding": jnp.array(embed_weight, dtype=jax_dtype)
     }
     print(f"  ✓ Embeddings: {embed_weight.shape}")
 
@@ -124,13 +126,13 @@ def _convert_hf_to_relax(
     # ReLax: output [dim, vocab_size]
     output_weight = hf_weights.get("output.weight")
 
-    params["output"] = np.array(output_weight.T, dtype=np_dtype)
+    params["output"] = jnp.array(output_weight.T, dtype=jax_dtype)
 
     # Final norm
     # HF: model.norm.weight [dim]
     # ReLax: norm_weight [dim]
     norm = hf_weights.get("norm.weight")
-    params["norm_weight"] = np.array(norm, dtype=np_dtype)
+    params["norm_weight"] = jnp.array(norm, dtype=jax_dtype)
 
     # Transformer layers
     print(f"  Converting {config.n_layers} transformer layers...")
@@ -174,8 +176,10 @@ def _convert_layer(
         - attention_norm_weight: [dim]
         - ffn_norm_weight: [dim]
     """
+    import jax.numpy as jnp
+
     prefix = f"layers.{layer_idx}"
-    np_dtype = np.dtype(config.dtype)
+    jax_dtype = getattr(jnp, config.dtype)
 
     # Attention weights
     # HF: [n_heads * head_dim, dim] or [n_kv_heads * head_dim, dim]
@@ -187,20 +191,20 @@ def _convert_layer(
 
     # Transpose and reshape for ReLax format
     # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
-    wq = np.array(q_proj.T, dtype=np_dtype).reshape(
+    wq = jnp.array(q_proj.T, dtype=jax_dtype).reshape(
         config.dim, config.n_heads, config.head_dim
     )
 
-    wk = np.array(k_proj.T, dtype=np_dtype).reshape(
+    wk = jnp.array(k_proj.T, dtype=jax_dtype).reshape(
         config.dim, config.n_kv_heads, config.head_dim
     )
 
-    wv = np.array(v_proj.T, dtype=np_dtype).reshape(
+    wv = jnp.array(v_proj.T, dtype=jax_dtype).reshape(
         config.dim, config.n_kv_heads, config.head_dim
     )
 
     # o_proj: [dim, n_heads * head_dim] -> [n_heads * head_dim, dim]
-    wo = np.array(o_proj.T, dtype=np_dtype)
+    wo = jnp.array(o_proj.T, dtype=jax_dtype)
 
     # MLP/Feed-forward weights
     # HF: [ffn_hidden_dim, dim]
@@ -209,17 +213,17 @@ def _convert_layer(
     up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]  # [ffn_hidden_dim, dim]
     down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
 
-    w_gate = np.array(gate_proj.T, dtype=np_dtype)  # [dim, ffn_hidden_dim]
-    w_up = np.array(up_proj.T, dtype=np_dtype)  # [dim, ffn_hidden_dim]
-    w_down = np.array(down_proj.T, dtype=np_dtype)  # [ffn_hidden_dim, dim]
+    w_gate = jnp.array(gate_proj.T, dtype=jax_dtype)  # [dim, ffn_hidden_dim]
+    w_up = jnp.array(up_proj.T, dtype=jax_dtype)  # [dim, ffn_hidden_dim]
+    w_down = jnp.array(down_proj.T, dtype=jax_dtype)  # [ffn_hidden_dim, dim]
 
     # Normalization weights
-    attention_norm = np.array(
-        hf_weights[f"{prefix}.attention_norm.weight"], dtype=np_dtype
+    attention_norm = jnp.array(
+        hf_weights[f"{prefix}.attention_norm.weight"], dtype=jax_dtype
     )
 
-    ffn_norm = np.array(
-        hf_weights[f"{prefix}.ffn_norm.weight"], dtype=np_dtype
+    ffn_norm = jnp.array(
+        hf_weights[f"{prefix}.ffn_norm.weight"], dtype=jax_dtype
     )
 
     return {
