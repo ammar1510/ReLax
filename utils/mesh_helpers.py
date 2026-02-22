@@ -1,11 +1,11 @@
 """Mesh and sharding helper utilities for distributed inference."""
 
-from math import gamma
 from typing import Optional, Any
 import jax
 import jax.lax as lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
-from numpy import format_float_positional
+import jax.numpy as jnp
+import numpy as np
 
 from utils.kvcache import KVCache
 
@@ -67,11 +67,11 @@ class MeshHelper:
         return PS(*spec)
 
     @staticmethod
-    def put_on_mesh(value: jax.Array, mesh: Optional[Mesh], spec: PS) -> jax.Array:
+    def put_on_mesh(value: Any, mesh: Optional[Mesh], spec: PS) -> jax.Array:
         """Place an array on a mesh with the given sharding spec.
 
         Args:
-            value: Array to place
+            value: Array to place (can be numpy or jax)
             mesh: Target mesh
             spec: Partition specification
 
@@ -80,31 +80,24 @@ class MeshHelper:
         """
         if mesh is None:
             return value
+
+        # Convert to bfloat16 to save HBM space
+        if hasattr(value, "astype"):
+            # Use jnp.bfloat16 for conversion
+            value = value.astype(jnp.bfloat16)
+
         value = jax.device_put(value, NamedSharding(mesh, spec))
-        return jax.block_until_ready(value)
+        return value
 
     @staticmethod
     def place_kv_cache(
         cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
     ) -> KVCache:
         """Place a KV cache on a mesh with appropriate sharding.
-
-        The cache is sharded along the batch dimension (axis 1 for k/v,
-        axis 0 for seq_positions).
-
-        Args:
-            cache: KVCache to place
-            mesh: Target mesh
-
-        Returns:
-            KVCache with all components placed on mesh
         """
         if mesh is None:
             return cache
 
-        # Create sharding specs for k, v, and seq_positions
-        # k/v shape: [n_layers, bsz, n_kv_heads, max_seqlen, head_dim]
-        # seq_positions shape: [bsz]
         if pspec is None:
             dp = "dp" if "dp" in mesh.axis_names else None
             tp = MeshHelper.get_tp_axis(mesh)
@@ -152,29 +145,23 @@ class MeshHelper:
     @staticmethod
     def shard_params(params: Any, mesh: Mesh) -> Any:
         """Apply parameter sharding to a pytree of parameters.
-
-        Args:
-            params: Pytree of parameters
-            mesh: JAX mesh for sharding
-
-        Returns:
-            Pytree of parameters with sharding applied
         """
 
         def _get_key_name(key) -> str:
-            """Extract string name from a JAX pytree path key."""
-            if hasattr(key, "key"):  # DictKey
+            if hasattr(key, "key"):
                 return str(key.key)
-            elif hasattr(key, "idx"):  # SequenceKey
+            elif hasattr(key, "idx"):
                 return str(key.idx)
-            elif hasattr(key, "name"):  # GetAttrKey
+            elif hasattr(key, "name"):
                 return str(key.name)
             return str(key)
 
         def shard_leaf(path, x):
-            # Convert path to string name for sharding decisions
             name = "/".join(_get_key_name(k) for k in path)
             spec = MeshHelper.param_sharding(x, name, mesh)
             return MeshHelper.put_on_mesh(x, mesh, spec)
 
-        return jax.tree.map_with_path(shard_leaf, params)
+        # shard_params is a collective, all processes must call it
+        params = jax.tree.map_with_path(shard_leaf, params)
+        # Block until sharding is complete to ensure balanced memory before next steps
+        return jax.block_until_ready(params)
