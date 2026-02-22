@@ -270,7 +270,7 @@ def save_orbax_weights(
         jax.block_until_ready(params)
 
     checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(checkpoint_path, args=ocp.args.StandardSave(params))
+    checkpointer.save(checkpoint_path, params)
     if jax.process_index() == 0:
         print(f"Saved orbax checkpoint to {checkpoint_path}")
 
@@ -283,7 +283,8 @@ def load_from_orbax(
     Load ReLax params from an orbax checkpoint, optionally sharding onto a mesh.
 
     When a mesh is provided, each host reads only its own shards directly from
-    disk (no full-load-then-reshard).
+    disk (no full-load-then-reshard). This is done by passing a target pytree
+    of jax.ShapeDtypeStruct with sharding specs to orbax's restore.
 
     Args:
         checkpoint_path: Directory written by save_orbax_weights()
@@ -295,6 +296,7 @@ def load_from_orbax(
     """
     import orbax.checkpoint as ocp
     import jax
+    from jax.sharding import NamedSharding
 
     checkpoint_path = Path(checkpoint_path)
     checkpointer = ocp.StandardCheckpointer()
@@ -305,11 +307,11 @@ def load_from_orbax(
             print(f"Loaded orbax checkpoint from {checkpoint_path}")
         return params
 
-    from jax.sharding import NamedSharding
     from utils.mesh_helpers import MeshHelper
 
-    # Read metadata (shapes/dtypes only, no data loaded)
-    metadata = checkpointer.metadata(checkpoint_path)
+    # Read metadata to get shapes/dtypes without loading data
+    step_metadata = checkpointer.metadata(checkpoint_path)
+    item_metadata = step_metadata.item_metadata
 
     def _get_key_name(key) -> str:
         if hasattr(key, "key"):
@@ -320,18 +322,15 @@ def load_from_orbax(
             return str(key.name)
         return str(key)
 
-    def _build_restore_args(path, meta):
+    def _build_target(path, meta):
         name = "/".join(_get_key_name(k) for k in path)
         spec = MeshHelper.param_sharding(meta, name, mesh)
         sharding = NamedSharding(mesh, spec)
-        return ocp.args.ArrayRestoreArgs(sharding=sharding)
+        return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
 
-    restore_args = jax.tree.map_with_path(_build_restore_args, metadata)
+    target = jax.tree.map_with_path(_build_target, item_metadata)
 
-    params = checkpointer.restore(
-        checkpoint_path,
-        args=ocp.args.StandardRestore(restore_args),
-    )
+    params = checkpointer.restore(checkpoint_path, target=target)
     if jax.process_index() == 0:
         print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
 
