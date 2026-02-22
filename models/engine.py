@@ -18,7 +18,7 @@ Architecture:
 import sys
 import threading
 import dataclasses
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, Any
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -35,7 +35,7 @@ from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BU
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
 from models.sync_server import SyncServer
-from sampling import Sampler, GreedySampler
+from sampling import greedy
 
 
 
@@ -64,7 +64,7 @@ class ServingConfig:
     token_pad_idx: int = 0
     max_decode_length: int = 64
     max_cache_seqlen: int = 1024
-    sampler: Sampler = dataclasses.field(default_factory=GreedySampler)
+    sampler: callable = greedy
     rng_seed: int = 0
 
 
@@ -166,8 +166,7 @@ class InferenceEngine:
         mesh: Mesh,
         max_concurrent_slots: int = 8,
         pad_id: int = 0,
-        buckets: Optional[List[int]] = None,
-        sampler: Optional[Sampler] = None,
+        sampler: Optional[callable] = None,
         rng_seed: int = 0,
         max_cache_seqlen: Optional[int] = None,
     ):
@@ -179,17 +178,15 @@ class InferenceEngine:
             mesh: JAX mesh for sharded computation
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
-            buckets: List of bucket sizes for prompt padding (default: power-of-2)
-            sampler: Sampling strategy (default: GreedySampler)
+            sampler: Sample function (logits, key) -> token_ids (default: greedy)
             rng_seed: Seed for PRNG key used in stochastic sampling
             max_cache_seqlen: Override model's max_seqlen for KV cache allocation
         """
         self.model = model
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
-        self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
         self.mesh = mesh
-        self.sampler = sampler or GreedySampler()
+        self.sampler = sampler or greedy
         self.rng_key = random.PRNGKey(rng_seed)
         self.max_cache_seqlen = max_cache_seqlen or model.args.max_seqlen
 
@@ -201,11 +198,7 @@ class InferenceEngine:
         # Cache model config for convenience
         self.config = model.args
 
-        # Mesh helper for sharding operations
-        self.mesh_helper = MeshHelper()
-
-        # Create a JIT-compatible sample function from the sampler
-        sample_fn = self.sampler.sample
+        sample_fn = self.sampler
 
         # Create jitted core function for batched prefill logic
         @jit
@@ -278,17 +271,17 @@ class InferenceEngine:
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
+        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
 
-        tokens = self.mesh_helper.put_on_mesh(
+        tokens = MeshHelper.put_on_mesh(
             tokens,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
-        true_lengths = self.mesh_helper.put_on_mesh(
+        true_lengths = MeshHelper.put_on_mesh(
             true_lengths,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
         mask = build_attn_mask(bucket_size, kv_cache, true_lengths)
@@ -323,7 +316,7 @@ class InferenceEngine:
         engine = self
 
         # Capture sample_fn for use inside JIT
-        sample_fn = self.sampler.sample
+        sample_fn = self.sampler
 
         @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
         def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
@@ -411,13 +404,13 @@ class InferenceEngine:
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
+        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
-        tokens = self.mesh_helper.put_on_mesh(
+        tokens = MeshHelper.put_on_mesh(
             tokens,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
 
         return kv_cache, tokens
@@ -528,7 +521,6 @@ class ServingLoop:
         during the first serving_step.
         """
         import time as _time
-        cfg = self.engine.config
         bsz_prefill = self.serve_cfg.prefill_batch_size
         bsz_decode = self.serve_cfg.decode_batch_size
 
@@ -724,13 +716,13 @@ class ServingLoop:
             if "worker" in self.roles and len(batch_updates) > 0:
                 self._update_cache_and_index(batch_updates)
                 # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
-                self.decode_work.cache = self.engine.mesh_helper.place_kv_cache(
+                self.decode_work.cache = MeshHelper.place_kv_cache(
                     self.decode_work.cache, self.mesh
                 )
-                self.decode_work.curr_tokens = self.engine.mesh_helper.put_on_mesh(
+                self.decode_work.curr_tokens = MeshHelper.put_on_mesh(
                     self.decode_work.curr_tokens,
                     self.mesh,
-                    self.engine.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+                    MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
                 )
 
         # Phase 2: Run multistep decode (skip if all slots empty)
@@ -824,7 +816,7 @@ class ServingLoop:
         self._log(f"prefill: processing {len(prefill_batch)} requests")
         # Prepare batched inputs (pad to max length in batch)
         max_len = max(len(req.text) for req in prefill_batch)
-        bucket_size = take_nearest_bucket(self.engine.buckets, max_len)
+        bucket_size = take_nearest_bucket(DEFAULT_PREFILL_BUCKETS, max_len)
 
         tokens_list = []
         true_lengths_list = []

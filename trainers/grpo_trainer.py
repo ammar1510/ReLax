@@ -37,7 +37,8 @@ from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
-from sampling import CategoricalSampler
+from functools import partial
+from sampling import categorical
 from trainers.trainer import Trainer, TrainState
 
 
@@ -161,7 +162,7 @@ class GRPOTrainer(Trainer):
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
             max_cache_seqlen=grpo_config.max_cache_seqlen or config.max_seqlen,
-            sampler=CategoricalSampler(temperature=grpo_config.temperature),
+            sampler=partial(categorical, temperature=grpo_config.temperature),
             rng_seed=seed,
         )
         self.serving_loop = ServingLoop(
