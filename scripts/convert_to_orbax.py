@@ -80,6 +80,8 @@ def main():
     if is_main:
         print("Done!")
 
+    jax.distributed.shutdown()
+
 
 if __name__ == "__main__":
     main()

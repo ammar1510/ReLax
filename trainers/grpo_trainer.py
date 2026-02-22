@@ -682,6 +682,7 @@ class GRPOTrainer(Trainer):
             "ref_params": self.reference_params,
         }
         checkpointer.save(os.path.join(ckpt_dir, "state"), ckpt_state)
+        checkpointer.wait_until_finished()
 
         # Save lightweight metadata as JSON
         metadata = {

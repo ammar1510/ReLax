@@ -271,6 +271,7 @@ def save_orbax_weights(
 
     checkpointer = ocp.StandardCheckpointer()
     checkpointer.save(checkpoint_path, params, force=True)
+    checkpointer.wait_until_finished()
     if jax.process_index() == 0:
         print(f"Saved orbax checkpoint to {checkpoint_path}")
 
