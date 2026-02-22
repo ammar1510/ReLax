@@ -38,8 +38,7 @@ def main():
     output_path = Path(args.output_path)
 
     if output_path.exists():
-        print(f"Error: output path {output_path} already exists", file=sys.stderr)
-        sys.exit(1)
+        print(f"Output path {output_path} already exists, overwriting...")
 
     # Load config
     config = ModelConfig.from_json_file(str(model_path))
