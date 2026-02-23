@@ -118,6 +118,7 @@ class GRPOTrainer(Trainer):
         reward_fn: Callable[[List[List[int]], List[Any]], jax.Array],
         mesh: Optional[Mesh] = None,
         seed: int = 42,
+        detokenize_fn: Optional[Callable[[List[int]], str]] = None,
     ):
         """Initialize GRPO trainer.
 
@@ -130,6 +131,7 @@ class GRPOTrainer(Trainer):
                        Should return array of shape [batch_size].
             mesh: JAX mesh for sharded computation. If None, creates a default mesh.
             seed: Random seed.
+            detokenize_fn: Optional function to decode token IDs to text for logging.
         """
         # Create optimizer
         optimizer = optax.chain(
@@ -151,6 +153,7 @@ class GRPOTrainer(Trainer):
         self.config = config
         self.grpo_config = grpo_config
         self.reward_fn = reward_fn
+        self.detokenize_fn = detokenize_fn
 
         # Create reference model parameters (frozen copy, also sharded)
         self.reference_params = jax.tree.map(lambda x: x.copy(), sharded_params)
@@ -656,6 +659,14 @@ class GRPOTrainer(Trainer):
             rewards = self.compute_rewards(rollout, ground_truths)
             mean_reward = float(jnp.mean(rewards))
             self._log(f"Phase 2/4: Mean reward = {mean_reward:.4f}")
+
+            # Log a sample completion every 10 iterations
+            if self.detokenize_fn is not None and self.is_main and (iteration + 1) % 10 == 0:
+                seq_len = int(rollout.seq_lengths[0])
+                sample_tokens = rollout.tokens[0, :seq_len].tolist()
+                sample_reward = float(rewards[0])
+                sample_text = self.detokenize_fn(sample_tokens)
+                self._log(f"Sample (reward={sample_reward:.1f}):\n{sample_text}\n{'─'*60}")
 
             # Phase 3 & 4: Compute advantages and train
             self._log("Phase 3/4: Computing advantages...")

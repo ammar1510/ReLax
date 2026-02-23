@@ -183,6 +183,7 @@ def main():
         reward_fn=make_reward_fn(tokenizer),
         mesh=mesh,
         seed=42,
+        detokenize_fn=tokenizer.decode,
     )
 
     def wandb_log(iteration_metrics: dict):
