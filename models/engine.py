@@ -659,7 +659,7 @@ class ServingLoop:
             has_eos = np.any(output_tokens[i, :, None] == self.eos_tokens) if len(self.eos_tokens) > 0 else False
             is_max_length = result.tokens_decoded >= self.serve_cfg.max_decode_length
 
-            done.append(has_eos or is_max_length)
+            done.append(bool(has_eos or is_max_length))
 
         return done
 

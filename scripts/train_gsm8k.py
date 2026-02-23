@@ -32,8 +32,8 @@ from models.sync_server import SyncServer
 
 # ── Hardcoded training config ──────────────────────────────────────────────────
 
-ROLLOUT_BATCH_SIZE = 32
-GROUP_SIZE = 8
+ROLLOUT_BATCH_SIZE = 64
+GROUP_SIZE = 16
 MAX_NEW_TOKENS = 512
 MAX_CACHE_SEQLEN = 1024
 TEMPERATURE = 0.8
