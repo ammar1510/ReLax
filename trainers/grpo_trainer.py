@@ -187,6 +187,18 @@ class GRPOTrainer(Trainer):
         print(f"[GRPOTrainer P{jax.process_index()}] {msg}")
         sys.stdout.flush()
 
+    def _shard_batch(self, data: Dict[str, jax.Array]) -> Dict[str, jax.Array]:
+        """Shard a batch dict along dp on the batch (first) axis."""
+        def _shard(x):
+            spec = MeshHelper.batch_axis_spec(self.mesh, rank=x.ndim, batch_axis=0)
+            return MeshHelper.put_on_mesh(x, self.mesh, spec)
+        return {k: _shard(v) for k, v in data.items()}
+
+    def _shard_array(self, x: jax.Array) -> jax.Array:
+        """Shard a single array along dp on the batch (first) axis."""
+        spec = MeshHelper.batch_axis_spec(self.mesh, rank=x.ndim, batch_axis=0)
+        return MeshHelper.put_on_mesh(x, self.mesh, spec)
+
     def _compile_functions(self):
         """Pre-compile frequently used functions."""
         self.train_step_jit = jax.jit(self._train_step_fn)
@@ -303,9 +315,9 @@ class GRPOTrainer(Trainer):
             all_masks.append(mask)
             all_seq_lengths.append(seq_len)
 
-        tokens_arr = jnp.array(all_tokens, dtype=jnp.int32)
-        mask_arr = jnp.array(all_masks, dtype=jnp.float32)
-        seq_lengths_arr = jnp.array(all_seq_lengths, dtype=jnp.int32)
+        tokens_arr = self._shard_array(jnp.array(all_tokens, dtype=jnp.int32))
+        mask_arr = self._shard_array(jnp.array(all_masks, dtype=jnp.float32))
+        seq_lengths_arr = self._shard_array(jnp.array(all_seq_lengths, dtype=jnp.int32))
 
         self._log(f"Rollout: generation done in {time.time() - t0:.1f}s, "
                   f"shape={tokens_arr.shape}, computing reference logprobs...")
@@ -321,7 +333,7 @@ class GRPOTrainer(Trainer):
         return RolloutBatch(
             tokens=tokens_arr,
             reference_logprobs=reference_logprobs,
-            advantages=jnp.zeros(total_sequences),
+            advantages=self._shard_array(jnp.zeros(total_sequences)),
             mask=mask_arr,
             seq_lengths=seq_lengths_arr,
         )
@@ -356,6 +368,7 @@ class GRPOTrainer(Trainer):
             head_dim=self.config.head_dim,
             dtype=jnp.bfloat16,
         )
+        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
 
         attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
 
@@ -550,7 +563,7 @@ class GRPOTrainer(Trainer):
         Returns:
             Training metrics accumulated over all minibatches.
         """
-        advantages = self.compute_advantages(rewards)
+        advantages = self._shard_array(self.compute_advantages(rewards))
 
         rollout = RolloutBatch(
             tokens=rollout.tokens,
@@ -572,12 +585,12 @@ class GRPOTrainer(Trainer):
             end_idx = min(i + self.grpo_config.minibatch_size, num_sequences)
             batch_indices = perm[i:end_idx]
 
-            batch = {
+            batch = self._shard_batch({
                 "tokens": rollout.tokens[batch_indices],
                 "reference_logprobs": rollout.reference_logprobs[batch_indices],
                 "advantages": rollout.advantages[batch_indices],
                 "mask": rollout.mask[batch_indices],
-            }
+            })
 
             self.state, metrics = self.train_step(
                 self.state,
