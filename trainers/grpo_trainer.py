@@ -194,7 +194,12 @@ class GRPOTrainer(Trainer):
     # ==================== PHASE 1: ROLLOUT ====================
 
     def _reset_serving_loop(self):
-        """Reset serving loop state for a new rollout batch."""
+        """Reset serving loop state for a new rollout batch.
+
+        Note: _it is NOT reset — it must increase monotonically across prompts
+        because SyncServer uses _it to namespace KV store keys, and keys are
+        global for the lifetime of the process.
+        """
         kv_cache, tokens = self.serving_loop.engine.init_decode_state()
         self.serving_loop.decode_work.curr_tokens = tokens
         self.serving_loop.decode_work.cache = kv_cache
@@ -206,7 +211,6 @@ class GRPOTrainer(Trainer):
         self.serving_loop.prefill_work.to_decode = []
         self.serving_loop.results = {}
         self.serving_loop.decode_output = (None, None)
-        self.serving_loop._it = 0
 
     def generate_rollouts(
         self,
