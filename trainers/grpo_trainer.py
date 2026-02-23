@@ -20,6 +20,8 @@ Training Loop:
 
 import json
 import os
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -47,8 +49,8 @@ class GRPOConfig:
     """Configuration for GRPO training."""
 
     # Rollout settings
-    rollout_batch_size: int = 256  # Number of prompts per rollout
-    group_size: int = 4  # Completions per prompt
+    rollout_batch_size: int = 64 # Number of prompts per rollout
+    group_size: int = 16  # Completions per prompt
     max_new_tokens: int = 512  # Max tokens to generate per completion
     temperature: float = 0.7  # Sampling temperature for diversity
 
@@ -165,16 +167,25 @@ class GRPOTrainer(Trainer):
             sampler=partial(categorical, temperature=grpo_config.temperature),
             rng_seed=seed,
         )
+        self.is_main = jax.process_index() == 0
         self.serving_loop = ServingLoop(
             serve_cfg=serve_cfg,
             model=model,
             params=sharded_params,
             mesh=mesh,
-            is_server=True,
+            is_server=self.is_main,
         )
 
         # Compile JIT functions
         self._compile_functions()
+
+        self._log(f"GRPOTrainer initialized: {grpo_config.rollout_batch_size} prompts x "
+                  f"{grpo_config.group_size} completions, is_server={self.is_main}")
+
+    def _log(self, msg: str):
+        """Log with process index prefix and flush."""
+        print(f"[GRPOTrainer P{jax.process_index()}] {msg}")
+        sys.stdout.flush()
 
     def _compile_functions(self):
         """Pre-compile frequently used functions."""
@@ -207,6 +218,10 @@ class GRPOTrainer(Trainer):
         prefill/decode via the serving infrastructure, then computes logprobs
         from both policy and reference models.
 
+        In multi-host mode, only the server (rank 0) enqueues requests.
+        All ranks participate in serving_step compute and collect results
+        (ServingLoop internally broadcasts decode output to all ranks).
+
         Args:
             prompts: List of token sequences (prompts). Length = rollout_batch_size.
 
@@ -220,25 +235,30 @@ class GRPOTrainer(Trainer):
 
         all_prompt_tokens = []
         all_generated_tokens = []
+        t0 = time.time()
+
+        self._log(f"Rollout: generating {total_sequences} completions "
+                  f"({len(prompts)} prompts x {self.grpo_config.group_size} each)")
 
         # Generate completions for each prompt via ServingLoop
-        for prompt_tokens in prompts:
+        for pi, prompt_tokens in enumerate(prompts):
             self._reset_serving_loop()
 
-            # Submit group_size requests for this prompt
-            for g in range(self.grpo_config.group_size):
-                self.serving_loop.add_request(
-                    UserRequestPrompt(id=g, text=list(prompt_tokens))
-                )
+            # Only server (rank 0) enqueues requests
+            if self.is_main:
+                for g in range(self.grpo_config.group_size):
+                    self.serving_loop.add_request(
+                        UserRequestPrompt(id=g, text=list(prompt_tokens))
+                    )
 
-            # Run serving steps until all completions are done
+            # All ranks drive the compute loop together
             max_serving_iters = (
                 self.grpo_config.max_new_tokens // self.grpo_config.decode_steps + 10
             )
-            for _ in range(max_serving_iters):
+            for si in range(max_serving_iters):
                 self.serving_loop.serving_step()
 
-                # Check if all results are done
+                # All ranks have identical results (ServingLoop broadcasts internally)
                 results = self.serving_loop.results
                 if (
                     len(results) == self.grpo_config.group_size
@@ -246,7 +266,10 @@ class GRPOTrainer(Trainer):
                 ):
                     break
 
-            # Collect results in order
+            if (pi + 1) % 10 == 0 or pi == len(prompts) - 1:
+                self._log(f"Rollout: prompt {pi + 1}/{len(prompts)} done in {si + 1} serving steps")
+
+            # All ranks collect results (ServingLoop broadcasts internally)
             for g in range(self.grpo_config.group_size):
                 result = self.serving_loop.results.get(g)
                 generated = result.token_list if result is not None else []
@@ -280,10 +303,16 @@ class GRPOTrainer(Trainer):
         mask_arr = jnp.array(all_masks, dtype=jnp.float32)
         seq_lengths_arr = jnp.array(all_seq_lengths, dtype=jnp.int32)
 
+        self._log(f"Rollout: generation done in {time.time() - t0:.1f}s, "
+                  f"shape={tokens_arr.shape}, computing reference logprobs...")
+        t1 = time.time()
+
         # Compute reference logprobs (cached for KL penalty during training)
         reference_logprobs = self._compute_logprobs_batch(
             tokens_arr, mask_arr, self.reference_params
         )
+
+        self._log(f"Rollout: reference logprobs computed in {time.time() - t1:.1f}s")
 
         return RolloutBatch(
             tokens=tokens_arr,
@@ -530,6 +559,9 @@ class GRPOTrainer(Trainer):
         all_metrics = {"loss": [], "pg_loss": [], "kl_div": []}
 
         num_sequences = rollout.tokens.shape[0]
+        num_minibatches = (num_sequences + self.grpo_config.minibatch_size - 1) // self.grpo_config.minibatch_size
+        self._log(f"Training: {num_sequences} sequences in {num_minibatches} minibatches")
+        t0 = time.time()
         perm = jax.random.permutation(self.get_rng(), num_sequences)
 
         for i in range(0, num_sequences, self.grpo_config.minibatch_size):
@@ -552,6 +584,7 @@ class GRPOTrainer(Trainer):
             for key, value in metrics.items():
                 all_metrics[key].append(float(value))
 
+        self._log(f"Training: {num_minibatches} minibatches done in {time.time() - t0:.1f}s")
         return all_metrics
 
     # ==================== MAIN TRAINING LOOP ====================
@@ -581,9 +614,9 @@ class GRPOTrainer(Trainer):
         all_iteration_metrics = []
 
         for iteration in range(num_iterations):
-            print(f"\n{'='*80}")
-            print(f"Iteration {iteration + 1}/{num_iterations}")
-            print(f"{'='*80}\n")
+            iter_t0 = time.time()
+            self._log(f"{'='*60}")
+            self._log(f"Iteration {iteration + 1}/{num_iterations}")
 
             # Sample prompts for this iteration
             num_prompts = self.grpo_config.rollout_batch_size
@@ -598,17 +631,18 @@ class GRPOTrainer(Trainer):
             ground_truths = [b[1] for b in batch]
 
             # Phase 1: Generate rollouts
-            print(f"Generating {num_prompts * self.grpo_config.group_size} completions...")
+            self._log("Phase 1/4: Generating rollouts...")
             rollout = self.generate_rollouts(prompts)
 
             # Phase 2: Compute rewards
-            print("Computing rewards...")
+            self._log("Phase 2/4: Computing rewards...")
             rewards = self.compute_rewards(rollout, ground_truths)
             mean_reward = float(jnp.mean(rewards))
-            print(f"Mean reward: {mean_reward:.4f}")
+            self._log(f"Phase 2/4: Mean reward = {mean_reward:.4f}")
 
             # Phase 3 & 4: Compute advantages and train
-            print("Training on rollout buffer...")
+            self._log("Phase 3/4: Computing advantages...")
+            self._log("Phase 4/4: Training on rollout buffer...")
             train_metrics = self.train_on_rollout(rollout, rewards)
 
             # Aggregate metrics for this iteration
@@ -621,10 +655,11 @@ class GRPOTrainer(Trainer):
             }
             all_iteration_metrics.append(iteration_metrics)
 
-            print(f"Iteration {iteration + 1} complete:")
-            print(f"  Loss: {iteration_metrics['mean_loss']:.4f}")
-            print(f"  PG Loss: {iteration_metrics['mean_pg_loss']:.4f}")
-            print(f"  KL Div: {iteration_metrics['mean_kl_div']:.4f}")
+            self._log(f"Iteration {iteration + 1} complete in {time.time() - iter_t0:.1f}s: "
+                      f"loss={iteration_metrics['mean_loss']:.4f} "
+                      f"pg_loss={iteration_metrics['mean_pg_loss']:.4f} "
+                      f"kl_div={iteration_metrics['mean_kl_div']:.4f} "
+                      f"reward={mean_reward:.4f}")
 
             if step_callback is not None:
                 step_callback(iteration_metrics)
@@ -634,6 +669,7 @@ class GRPOTrainer(Trainer):
 
             # Save checkpoint
             if checkpoint_dir is not None and (iteration + 1) % checkpoint_freq == 0:
+                self._log(f"Saving checkpoint at step {iteration + 1}...")
                 ckpt_path = os.path.join(checkpoint_dir, f"step_{iteration + 1}")
                 self.save_checkpoint(ckpt_path)
 
@@ -656,7 +692,7 @@ class GRPOTrainer(Trainer):
             )
         elif self.grpo_config.reference_mode == "periodic":
             if (iteration + 1) % self.grpo_config.reference_update_freq == 0:
-                print(f"Updating reference model at iteration {iteration + 1}")
+                self._log(f"Updating reference model at iteration {iteration + 1}")
                 self.reference_params = jax.tree.map(
                     lambda x: x.copy(),
                     self.state.params,
@@ -685,21 +721,22 @@ class GRPOTrainer(Trainer):
         checkpointer.save(os.path.join(ckpt_dir, "state"), ckpt_state)
         checkpointer.wait_until_finished()
 
-        # Save lightweight metadata as JSON
-        metadata = {
-            "step": int(self.state.step),
-            "seed": self.seed,
-            "grpo_config": {
-                field: getattr(self.grpo_config, field)
-                for field in self.grpo_config.__dataclass_fields__
-            },
-            "rng_state": self.rng.tolist(),
-        }
-        os.makedirs(ckpt_dir, exist_ok=True)
-        with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=2)
+        # Save lightweight metadata as JSON (only rank 0 writes to avoid races)
+        if self.is_main:
+            metadata = {
+                "step": int(self.state.step),
+                "seed": self.seed,
+                "grpo_config": {
+                    field: getattr(self.grpo_config, field)
+                    for field in self.grpo_config.__dataclass_fields__
+                },
+                "rng_state": self.rng.tolist(),
+            }
+            os.makedirs(ckpt_dir, exist_ok=True)
+            with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
 
-        print(f"Checkpoint saved to {ckpt_dir} at step {int(self.state.step)}")
+            print(f"Checkpoint saved to {ckpt_dir} at step {int(self.state.step)}")
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint using Orbax.

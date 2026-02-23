@@ -13,6 +13,8 @@ from typing import Any, List, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
 from datasets import load_dataset
 
 try:
@@ -26,6 +28,7 @@ from models.llama.config import ModelConfig
 from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
 from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
+from models.sync_server import SyncServer
 
 # ── Hardcoded training config ──────────────────────────────────────────────────
 
@@ -102,6 +105,8 @@ def load_gsm8k(tokenizer: Tokenizer) -> List[Tuple[List[int], str]]:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    jax.distributed.initialize()
+
     parser = argparse.ArgumentParser(description="GRPO training on GSM8K")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model directory")
     parser.add_argument("--wandb_project", type=str, default="relax-grpo-gsm8k", help="W&B project name")
@@ -109,10 +114,16 @@ def main():
     parser.add_argument("--no_wandb", action="store_true", help="Disable W&B logging")
     args = parser.parse_args()
 
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    is_main = jax.process_index() == 0
+    devices = jax.devices()
+    mesh = Mesh(np.array(devices).reshape(4, 4), ("dp", "tp"))
+    print(f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices")
 
-    use_wandb = _WANDB_AVAILABLE and not args.no_wandb
+    output_dir = Path(OUTPUT_DIR)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    use_wandb = _WANDB_AVAILABLE and not args.no_wandb and is_main
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -131,7 +142,7 @@ def main():
                 "model_path": args.model_path,
             },
         )
-    elif not _WANDB_AVAILABLE and not args.no_wandb:
+    elif not _WANDB_AVAILABLE and not args.no_wandb and is_main:
         print("wandb not installed; skipping W&B logging. Install with: pip install wandb")
 
     print(f"Loading model from {args.model_path}...")
@@ -170,6 +181,7 @@ def main():
         params=params,
         grpo_config=grpo_config,
         reward_fn=make_reward_fn(tokenizer),
+        mesh=mesh,
         seed=42,
     )
 
@@ -193,19 +205,25 @@ def main():
         step_callback=wandb_log,
     )
 
-    metrics_path = output_dir / "metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to {metrics_path}")
+    if is_main:
+        metrics_path = output_dir / "metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Metrics saved to {metrics_path}")
 
     trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
     if use_wandb:
         wandb.finish()
-    print("Training complete.")
-    last = metrics[-1]
-    print(f"  Mean reward:  {last['mean_reward']:.4f}")
-    print(f"  Mean loss:    {last['mean_loss']:.4f}")
-    print(f"  Mean KL div:  {last['mean_kl_div']:.4f}")
+
+    if is_main:
+        print("Training complete.")
+        last = metrics[-1]
+        print(f"  Mean reward:  {last['mean_reward']:.4f}")
+        print(f"  Mean loss:    {last['mean_loss']:.4f}")
+        print(f"  Mean KL div:  {last['mean_kl_div']:.4f}")
+
+    SyncServer.barrier("shutdown", 0)
+    jax.distributed.shutdown()
 
 
 if __name__ == "__main__":

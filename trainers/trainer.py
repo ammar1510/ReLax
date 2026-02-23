@@ -23,18 +23,19 @@ class TrainState:
     params: FrozenDict[str, Any]
     opt_state: Any
 
-    def apply_gradients(self, *, grads, **kwargs):
+    def apply_gradients(self, *, grads, tx, **kwargs):
         """Updates `step`, `params`, `opt_state` and `**kwargs` in return value.
 
         Args:
             grads: Gradients that have the same pytree structure as `.params`.
+            tx: An Optax optimizer used to compute parameter updates.
             **kwargs: Additional dataclass attributes that should be updated.
 
         Returns:
             An updated instance of `self` with `step` incremented, new `params`,
             and updated `opt_state` and any additional keyword arguments.
         """
-        updates, new_opt_state = kwargs.pop('tx').update(
+        updates, new_opt_state = tx.update(
             grads, self.opt_state, self.params
         )
         new_params = optax.apply_updates(self.params, updates)
