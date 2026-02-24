@@ -349,7 +349,7 @@ class GRPOTrainer(Trainer):
     ) -> jax.Array:
         """Compute log probabilities for a batch of sequences.
 
-        Uses a single batched forward pass with vectorized logprob extraction.
+        Processes in chunks of minibatch_size to avoid OOM on large batches.
 
         Args:
             tokens: Token sequences [bsz, seq_len].
@@ -360,9 +360,31 @@ class GRPOTrainer(Trainer):
             Log probabilities for each token [bsz, seq_len].
         """
         bsz, seq_len = tokens.shape
+        chunk_size = self.grpo_config.minibatch_size
+
+        if bsz <= chunk_size:
+            return self._compute_logprobs_chunk(tokens, mask, params)
+
+        all_logprobs = []
+        for start in range(0, bsz, chunk_size):
+            end = min(start + chunk_size, bsz)
+            chunk_logprobs = self._compute_logprobs_chunk(
+                tokens[start:end], mask[start:end], params
+            )
+            all_logprobs.append(chunk_logprobs)
+
+        return jnp.concatenate(all_logprobs, axis=0)
+
+    def _compute_logprobs_chunk(
+        self,
+        tokens: jax.Array,
+        mask: jax.Array,
+        params: FrozenDict,
+    ) -> jax.Array:
+        """Compute log probabilities for a single chunk of sequences."""
+        bsz, seq_len = tokens.shape
         true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
 
-        # Scratch KV cache for the forward pass (positions start at 0)
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=bsz,
@@ -383,14 +405,12 @@ class GRPOTrainer(Trainer):
             mask=attn_mask,
         )
 
-        # Vectorized logprob extraction: logits[i] predicts token[i+1]
         log_probs = jax.nn.log_softmax(logits[:, :-1, :], axis=-1)
         target_tokens = tokens[:, 1:]
         token_logprobs = jnp.take_along_axis(
             log_probs, target_tokens[:, :, None], axis=-1
         ).squeeze(-1)
 
-        # Pad to match original seq_len (position 0 has no prediction)
         token_logprobs = jnp.pad(token_logprobs, ((0, 0), (1, 0)))
         token_logprobs = token_logprobs * mask
 
