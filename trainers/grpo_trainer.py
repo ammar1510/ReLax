@@ -287,6 +287,9 @@ class GRPOTrainer(Trainer):
 
             if (pi + 1) % 10 == 0 or pi == len(prompts) - 1:
                 self._log(f"Rollout: prompt {pi + 1}/{len(prompts)} done in {si + 1} serving steps")
+                if self.detokenize_fn is not None and self.is_main:
+                    sample_tokens = all_prompt_tokens[-1] + all_generated_tokens[-1]
+                    self._log(f"Sample:\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
             # All ranks collect results (ServingLoop broadcasts internally)
             for g in range(self.grpo_config.group_size):
@@ -679,14 +682,6 @@ class GRPOTrainer(Trainer):
             rewards = self.compute_rewards(rollout, ground_truths)
             mean_reward = float(jnp.mean(rewards))
             self._log(f"Phase 2/4: Mean reward = {mean_reward:.4f}")
-
-            # Log a sample completion every 10 iterations
-            if self.detokenize_fn is not None and self.is_main and (iteration + 1) % 10 == 0:
-                seq_len = int(rollout.seq_lengths[0])
-                sample_tokens = rollout.tokens[0, :seq_len].tolist()
-                sample_reward = float(rewards[0])
-                sample_text = self.detokenize_fn(sample_tokens)
-                self._log(f"Sample (reward={sample_reward:.1f}):\n{sample_text}\n{'─'*60}")
 
             # Phase 3 & 4: Compute advantages and train
             self._log("Phase 3/4: Computing advantages...")
