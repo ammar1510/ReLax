@@ -352,7 +352,9 @@ class GRPOTrainer(Trainer):
     ) -> jax.Array:
         """Compute log probabilities for a batch of sequences.
 
-        Processes in chunks of minibatch_size to avoid OOM on large batches.
+        Processes in chunks to avoid OOM on large batches. Chunk size matches
+        the serving loop's group_size (decode_batch_size), which is already
+        sized to fit in memory during rollout generation.
 
         Args:
             tokens: Token sequences [bsz, seq_len].
@@ -363,20 +365,22 @@ class GRPOTrainer(Trainer):
             Log probabilities for each token [bsz, seq_len].
         """
         bsz, seq_len = tokens.shape
-        chunk_size = self.grpo_config.minibatch_size
-
-        if bsz <= chunk_size:
-            return self._compute_logprobs_chunk(tokens, mask, params)
+        # Use group_size as chunk size — already proven to fit in memory during rollout
+        dp_size = self.mesh.shape["dp"] if "dp" in self.mesh.shape else 1
+        chunk_size = self.grpo_config.group_size * dp_size
 
         all_logprobs = []
         for start in range(0, bsz, chunk_size):
             end = min(start + chunk_size, bsz)
+            chunk_tokens = self._shard_array(tokens[start:end])
+            chunk_mask = self._shard_array(mask[start:end])
+
             chunk_logprobs = self._compute_logprobs_chunk(
-                tokens[start:end], mask[start:end], params
+                chunk_tokens, chunk_mask, params
             )
             all_logprobs.append(chunk_logprobs)
 
-        return jnp.concatenate(all_logprobs, axis=0)
+        return self._shard_array(jnp.concatenate(all_logprobs, axis=0))
 
     def _compute_logprobs_chunk(
         self,
