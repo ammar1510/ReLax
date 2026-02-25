@@ -30,12 +30,12 @@ def categorical(logits: jax.Array, key: jax.Array, temperature: float = 1.0) -> 
 def top_k(logits: jax.Array, key: jax.Array, k: int = 10, temperature: float = 1.0) -> jax.Array:
     if temperature == 0.0:
         top_k_logits, top_k_indices = jax.lax.top_k(logits, k)
-        idx_in_top_k = jnp.argmax(top_k_logits)
-        return top_k_indices[idx_in_top_k]
+        idx_in_top_k = jnp.argmax(top_k_logits, axis=-1)
+        return jnp.take_along_axis(top_k_indices, idx_in_top_k[:, None], axis=-1)[:, 0]
     scaled_logits = temperature_scale(logits, temperature)
     top_k_logits, top_k_indices = jax.lax.top_k(scaled_logits, k)
     sampled_index = random.categorical(key, top_k_logits)
-    return jnp.take(top_k_indices, sampled_index)
+    return jnp.take_along_axis(top_k_indices, sampled_index[:, None], axis=-1)[:, 0]
 
 
 def top_p(logits: jax.Array, key: jax.Array, p: float = 0.9, temperature: float = 1.0) -> jax.Array:

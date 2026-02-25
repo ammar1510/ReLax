@@ -359,9 +359,7 @@ class InferenceEngine:
                 # Sample next tokens
                 batch_logits = logits[:, 0, :]
                 rng_key, subkey = random.split(rng_key)
-                new_tokens = sample_fn(batch_logits, subkey)
-                if new_tokens.ndim == 1:
-                    new_tokens = new_tokens[:, None]
+                new_tokens = sample_fn(batch_logits, subkey)[:, None]
 
                 # Only update tokens for active slots
                 updated_tokens = jnp.where(
@@ -371,7 +369,7 @@ class InferenceEngine:
                 )
 
                 # Reshard carry to match input sharding (prevents drift across scan iterations)
-                updated_tokens = jax.sharding.reshard(
+                updated_tokens = jax.lax.with_sharding_constraint(
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
@@ -621,23 +619,30 @@ class ServingLoop:
     def _update_cache_and_index(self, batch_updates: list):
         """Batch update cache and tokens for multiple slot insertions.
 
+        All slot updates are applied in a single scatter (one copy of the full
+        cache tensor) instead of one copy per slot.
+
         Args:
             batch_updates: List of (cache_entry, slot_idx, length, next_token) tuples
         """
-        entries, batch_idxs, lens, next_tokens = map(list, zip(*batch_updates))
+        entries, slot_idxs, lens, next_tokens = map(list, zip(*batch_updates))
 
-        # Insert all cache entries into decode cache
-        for entry, slot_idx, length, next_token in zip(entries, batch_idxs, lens, next_tokens):
-            new_k = self.decode_work.cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.k)
-            new_v = self.decode_work.cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.v)
+        # Stack all single-sequence cache entries along batch dim
+        # Each entry.k/v is [n_layers, 1, kv_heads, max_seqlen, head_dim]
+        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)  # [n_layers, N, ...]
+        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
 
-            self.decode_work.cache = KVCache(
-                k=new_k,
-                v=new_v,
-                seq_positions=self.decode_work.cache.seq_positions.at[slot_idx].set(length),
-            )
+        # Scatter all slots at once using advanced indexing
+        idx = jnp.array(slot_idxs)
+        new_k = self.decode_work.cache.k.at[:, idx, :, :, :].set(stacked_k)
+        new_v = self.decode_work.cache.v.at[:, idx, :, :, :].set(stacked_v)
 
-            self.decode_work.curr_tokens = self.decode_work.curr_tokens.at[slot_idx, 0].set(next_token)
+        # Update positions and tokens in one go
+        new_positions = self.decode_work.cache.seq_positions.at[idx].set(jnp.array(lens))
+        new_tokens = self.decode_work.curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
+
+        self.decode_work.cache = KVCache(k=new_k, v=new_v, seq_positions=new_positions)
+        self.decode_work.curr_tokens = new_tokens
 
     def _check_done_sequences(self, output_tokens: np.ndarray) -> list[bool]:
         """Check which sequences are done (EOS or max length).
