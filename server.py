@@ -232,7 +232,7 @@ def main():
     if pid == 0:
         # Server process: run the HTTP server in the main thread
         import uvicorn
-        print(f"[P{pid}] HTTP server listening on 0.0.0.0:{args.port}")
+        print(f"[P{pid}] HTTP server listening on 0.0.0.0:{port}")
         sys.stdout.flush()
         try:
             uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

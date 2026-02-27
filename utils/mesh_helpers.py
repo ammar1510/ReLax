@@ -122,6 +122,34 @@ class MeshHelper:
         )
 
     @staticmethod
+    def place_hybrid_cache(cache, mesh: Optional[Mesh]):
+        """Place a HybridCache on a mesh.
+
+        KV cache portion gets standard KV sharding.
+        DeltaNet state is replicated (batch-sharded only).
+        """
+        from utils.hybrid_cache import HybridCache, DeltaNetState
+
+        if mesh is None:
+            return cache
+
+        kv = MeshHelper.place_kv_cache(cache.kv_cache, mesh)
+
+        # DeltaNet state: batch-shard on axis 1 (shape: [layers, bsz, ...])
+        state_spec = MeshHelper.batch_axis_spec(
+            mesh, rank=len(cache.deltanet_state.state.shape), batch_axis=1
+        )
+        conv_spec = MeshHelper.batch_axis_spec(
+            mesh, rank=len(cache.deltanet_state.conv_state.shape), batch_axis=1
+        )
+        delta = DeltaNetState(
+            state=MeshHelper.put_on_mesh(cache.deltanet_state.state, mesh, state_spec),
+            conv_state=MeshHelper.put_on_mesh(cache.deltanet_state.conv_state, mesh, conv_spec),
+        )
+
+        return HybridCache(kv_cache=kv, deltanet_state=delta)
+
+    @staticmethod
     def param_sharding(x, name: str, mesh: Mesh):
         tp = MeshHelper.get_tp_axis(mesh)
         ndim = len(x.shape) if not hasattr(x, "ndim") else x.ndim
