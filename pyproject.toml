@@ -6,7 +6,12 @@ dependencies = [
   "jax",
   "flax",
   "numpy",
-  "safetensors"
+  "safetensors",
+  "huggingface",
+  "datasets",
+  "orbax-checkpoint",
+  "factorio-learning-environment>=0.3.0",
+  "gymnasium>=1.2.3",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +30,23 @@ dev = [
 where = ["."]
 include = ["*"]
 
+[tool.setuptools]
+py-modules = ["sampling"]
+
 [tool.pytest.ini_options]
 pythonpath = [
   "."
-] 
+]
+
+[tool.pyrefly]
+project_excludes = [
+  "**/__pycache__",
+  "**/.venv",
+  "**/node_modules",
+  "**/*.egg-info",
+  "**/.git",
+  "**/dist",
+  "**/build",
+  "**/.mypy_cache",
+  "**/.pytest_cache",
+]

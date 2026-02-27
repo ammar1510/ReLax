@@ -3,13 +3,13 @@ Functions to load model weights from PyTorch checkpoint format.
 
 This module handles loading LLaMA weights from sharded .pth files
 in the PyTorch format, converting them to the ReLax model structure.
+It also provides orbax-based save/load for fast subsequent loads with
+optional mesh sharding.
 """
 
-import jax
-import jax.numpy as jnp
 import torch
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import numpy as np
 
 from .config import ModelConfig
@@ -25,35 +25,11 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
 
     Returns:
         Flax parameter dictionary matching the LLaMa model structure.
-
-    PyTorch weight naming (input):
-        - model.embed_tokens.weight
-        - model.layers.{i}.self_attn.q_proj.weight
-        - model.layers.{i}.self_attn.k_proj.weight
-        - model.layers.{i}.self_attn.v_proj.weight
-        - model.layers.{i}.self_attn.o_proj.weight
-        - model.layers.{i}.mlp.gate_proj.weight
-        - model.layers.{i}.mlp.up_proj.weight
-        - model.layers.{i}.mlp.down_proj.weight
-        - model.layers.{i}.input_layernorm.weight
-        - model.layers.{i}.post_attention_layernorm.weight
-        - model.norm.weight
-        - lm_head.weight
-
-    ReLax model structure (output):
-        - tok_embeddings.embedding
-        - layer_{i}.wq, wk, wv, wo
-        - layer_{i}.w_gate, w_up, w_down
-        - layer_{i}.attention_norm_weight
-        - layer_{i}.ffn_norm_weight
-        - norm_weight
-        - output
     """
     model_path = Path(model_path) / "original"
 
     # Find all .pth checkpoint files
     shard_files = sorted(model_path.glob("*.pth"))
-    print(model_path)
 
     if len(shard_files) == 0:
         raise FileNotFoundError(
@@ -71,7 +47,7 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
         # Convert PyTorch tensors to numpy arrays
         for key, value in checkpoint.items():
             if isinstance(value, torch.Tensor):
-                # Convert BFloat16 to float32 (numpy doesn't support bfloat16)
+                # Convert BFloat16 to float32 (numpy doesn't support bfloat16 natively)
                 if value.dtype == torch.bfloat16:
                     value = value.float()
                 all_weights[key] = value.detach().cpu().numpy()
@@ -80,7 +56,7 @@ def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
 
     print(f"Loaded {len(all_weights)} tensors total")
 
-    # Convert to ReLax format
+    # Convert to ReLax format (keeping as numpy arrays on host)
     params = _convert_hf_to_relax(all_weights, config)
 
     return params
@@ -92,43 +68,29 @@ def _convert_hf_to_relax(
 ) -> Dict[str, Any]:
     """
     Convert PyTorch/HuggingFace weight format to ReLax model structure.
-
-    Args:
-        hf_weights: Dictionary of PyTorch weights (numpy arrays)
-        config: Model configuration
-
-    Returns:
-        Flax parameter dictionary for ReLax LLaMa model
+    Returns weights as numpy arrays to avoid early accelerator placement.
     """
     print("Converting PyTorch weights to ReLax format...")
 
     params = {}
 
     # Token embeddings
-    # HF: model.embed_tokens.weight [vocab_size, dim]
-    # ReLax: tok_embeddings.embedding [vocab_size, dim]
     embed_weight = hf_weights.get("tok_embeddings.weight")
     if embed_weight is None:
-        raise ValueError("model.embed_tokens.weight not found in checkpoint")
+        raise ValueError("tok_embeddings.weight not found in checkpoint")
 
     params["tok_embeddings"] = {
-        "embedding": jnp.asarray(embed_weight, dtype=config.dtype)
+        "embedding": embed_weight.astype(np.float32)
     }
     print(f"  ✓ Embeddings: {embed_weight.shape}")
 
-    # Output layer (language model head)
-    # PyTorch: lm_head.weight [vocab_size, dim] or output.weight [dim, vocab_size] (if exists)
-    # Otherwise: use tied embeddings (reuse embed_tokens.weight)
-    # ReLax: output [dim, vocab_size]
+    # Output layer
     output_weight = hf_weights.get("output.weight")
-
-    params["output"] = jnp.asarray(output_weight.T, dtype=config.dtype)
+    params["output"] = output_weight.T.astype(np.float32)
 
     # Final norm
-    # HF: model.norm.weight [dim]
-    # ReLax: norm_weight [dim]
     norm = hf_weights.get("norm.weight")
-    params["norm_weight"] = jnp.asarray(norm, dtype=config.dtype)
+    params["norm_weight"] = norm.astype(np.float32)
 
     # Transformer layers
     print(f"  Converting {config.n_layers} transformer layers...")
@@ -151,73 +113,40 @@ def _convert_layer(
     hf_weights: Dict[str, np.ndarray],
     layer_idx: int,
     config: ModelConfig,
-) -> Dict[str, jnp.ndarray]:
-    """
-    Convert a single transformer layer from HF to ReLax format.
-
-    HF format:
-        - model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
-        - model.layers.{i}.mlp.{gate,up,down}_proj.weight
-        - model.layers.{i}.input_layernorm.weight
-        - model.layers.{i}.post_attention_layernorm.weight
-
-    ReLax format:
-        - wq: [dim, n_heads, head_dim]
-        - wk: [dim, n_kv_heads, head_dim]
-        - wv: [dim, n_kv_heads, head_dim]
-        - wo: [n_heads * head_dim, dim]
-        - w_gate: [dim, ffn_hidden_dim]
-        - w_up: [dim, ffn_hidden_dim]
-        - w_down: [ffn_hidden_dim, dim]
-        - attention_norm_weight: [dim]
-        - ffn_norm_weight: [dim]
-    """
+) -> Dict[str, np.ndarray]:
+    """Convert a single transformer layer to ReLax format (as numpy arrays)."""
     prefix = f"layers.{layer_idx}"
 
     # Attention weights
-    # HF: [n_heads * head_dim, dim] or [n_kv_heads * head_dim, dim]
-    # ReLax: need to transpose and reshape
-    q_proj = hf_weights[f"{prefix}.attention.wq.weight"]  # [n_heads * head_dim, dim]
-    k_proj = hf_weights[f"{prefix}.attention.wk.weight"]  # [n_kv_heads * head_dim, dim]
-    v_proj = hf_weights[f"{prefix}.attention.wv.weight"]  # [n_kv_heads * head_dim, dim]
-    o_proj = hf_weights[f"{prefix}.attention.wo.weight"]  # [dim, n_heads * head_dim]
+    q_proj = hf_weights[f"{prefix}.attention.wq.weight"]
+    k_proj = hf_weights[f"{prefix}.attention.wk.weight"]
+    v_proj = hf_weights[f"{prefix}.attention.wv.weight"]
+    o_proj = hf_weights[f"{prefix}.attention.wo.weight"]
 
-    # Transpose and reshape for ReLax format
-    # q_proj: [n_heads * head_dim, dim] -> [dim, n_heads * head_dim] -> [dim, n_heads, head_dim]
-    wq = jnp.asarray(q_proj.T, dtype=config.dtype).reshape(
+    # Transpose and reshape
+    wq = q_proj.T.astype(np.float32).reshape(
         config.dim, config.n_heads, config.head_dim
     )
-
-    wk = jnp.asarray(k_proj.T, dtype=config.dtype).reshape(
+    wk = k_proj.T.astype(np.float32).reshape(
         config.dim, config.n_kv_heads, config.head_dim
     )
-
-    wv = jnp.asarray(v_proj.T, dtype=config.dtype).reshape(
+    wv = v_proj.T.astype(np.float32).reshape(
         config.dim, config.n_kv_heads, config.head_dim
     )
-
-    # o_proj: [dim, n_heads * head_dim] -> [n_heads * head_dim, dim]
-    wo = jnp.asarray(o_proj.T, dtype=config.dtype)
+    wo = o_proj.T.astype(np.float32)
 
     # MLP/Feed-forward weights
-    # HF: [ffn_hidden_dim, dim]
-    # ReLax: transpose to [dim, ffn_hidden_dim] or [ffn_hidden_dim, dim]
-    gate_proj = hf_weights[f"{prefix}.feed_forward.w1.weight"]  # [ffn_hidden_dim, dim]
-    up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]  # [ffn_hidden_dim, dim]
-    down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]  # [dim, ffn_hidden_dim]
+    gate_proj = hf_weights[f"{prefix}.feed_forward.w1.weight"]
+    up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]
+    down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]
 
-    w_gate = jnp.asarray(gate_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
-    w_up = jnp.asarray(up_proj.T, dtype=config.dtype)  # [dim, ffn_hidden_dim]
-    w_down = jnp.asarray(down_proj.T, dtype=config.dtype)  # [ffn_hidden_dim, dim]
+    w_gate = gate_proj.T.astype(np.float32)
+    w_up = up_proj.T.astype(np.float32)
+    w_down = down_proj.T.astype(np.float32)
 
     # Normalization weights
-    attention_norm = jnp.asarray(
-        hf_weights[f"{prefix}.attention_norm.weight"], dtype=config.dtype
-    )
-
-    ffn_norm = jnp.asarray(
-        hf_weights[f"{prefix}.ffn_norm.weight"], dtype=config.dtype
-    )
+    attention_norm = hf_weights[f"{prefix}.attention_norm.weight"].astype(np.float32)
+    ffn_norm = hf_weights[f"{prefix}.ffn_norm.weight"].astype(np.float32)
 
     return {
         "wq": wq,
@@ -230,3 +159,99 @@ def _convert_layer(
         "attention_norm_weight": attention_norm,
         "ffn_norm_weight": ffn_norm,
     }
+
+
+def _make_checkpoint_manager(checkpoint_path: Path):
+    """Create a CheckpointManager configured for local-storage multi-host use.
+
+    Setting primary_host=None makes every host act as its own primary, so each
+    host independently writes/reads its own metadata and shards to local disk.
+    This is required when hosts do NOT share a network filesystem.
+    """
+    import orbax.checkpoint as ocp
+    from orbax.checkpoint.options import MultiprocessingOptions
+
+    options = ocp.CheckpointManagerOptions(
+        multiprocessing_options=MultiprocessingOptions(primary_host=None),
+    )
+    return ocp.CheckpointManager(checkpoint_path, options=options)
+
+
+def save_orbax_weights(
+    params: Dict[str, Any], checkpoint_path: str, mesh=None
+) -> None:
+    """
+    Save ReLax params to an orbax checkpoint directory.
+
+    When a mesh is provided, params are sharded before saving so each host
+    writes only its local shards. primary_host=None ensures every host writes
+    its own metadata independently (required for local-only storage).
+    """
+    import orbax.checkpoint as ocp
+    import jax
+
+    checkpoint_path = Path(checkpoint_path)
+
+    if mesh is not None:
+        from utils.mesh_helpers import MeshHelper
+        params = MeshHelper.shard_params(params, mesh)
+
+    mngr = _make_checkpoint_manager(checkpoint_path)
+    mngr.save(0, args=ocp.args.StandardSave(params))
+    mngr.wait_until_finished()
+    if jax.process_index() == 0:
+        print(f"Saved orbax checkpoint to {checkpoint_path}")
+
+
+def load_from_orbax(
+    checkpoint_path: str,
+    mesh=None,
+) -> Dict[str, Any]:
+    """
+    Load ReLax params from an orbax checkpoint, optionally sharding onto a mesh.
+
+    When a mesh is provided, each host reads only its own shards directly from
+    disk by passing a target pytree of jax.ShapeDtypeStruct with sharding specs.
+    primary_host=None ensures every host reads its own metadata independently.
+    """
+    import orbax.checkpoint as ocp
+    import jax
+
+    checkpoint_path = Path(checkpoint_path)
+    mngr = _make_checkpoint_manager(checkpoint_path)
+    step = mngr.latest_step()
+
+    if mesh is None:
+        params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+        if jax.process_index() == 0:
+            print(f"Loaded orbax checkpoint from {checkpoint_path}")
+        return params
+
+    from jax.sharding import NamedSharding
+    from utils.mesh_helpers import MeshHelper
+
+    # Get array metadata (shapes/dtypes) without loading data
+    item_meta = mngr.item_metadata(step)
+
+    def _get_key_name(key) -> str:
+        if hasattr(key, "key"):
+            return str(key.key)
+        elif hasattr(key, "idx"):
+            return str(key.idx)
+        elif hasattr(key, "name"):
+            return str(key.name)
+        return str(key)
+
+    def _build_target(path, meta):
+        name = "/".join(_get_key_name(k) for k in path)
+        spec = MeshHelper.param_sharding(meta, name, mesh)
+        sharding = NamedSharding(mesh, spec)
+        return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+
+    target = jax.tree.map_with_path(_build_target, item_meta)
+
+    params = mngr.restore(step, args=ocp.args.StandardRestore(target))
+    if jax.process_index() == 0:
+        print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
+
+    return params

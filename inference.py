@@ -244,6 +244,7 @@ def main():
     sys.stdout.flush()
 
     print(f"\n[P{pid}] Done!")
+    jax.distributed.shutdown()
 
 
 if __name__ == "__main__":

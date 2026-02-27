@@ -18,8 +18,7 @@ Architecture:
 import sys
 import threading
 import dataclasses
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List, Any
+from typing import Optional, Dict, Any
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -36,32 +35,8 @@ from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BU
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
 from models.sync_server import SyncServer
-from sampling import Sampler, GreedySampler
+from sampling import greedy
 
-
-@dataclass
-class DecodeState:
-    """State for batched generation across slots.
-
-    The decode state maintains a fixed-size batch dimension where each position
-    is a "slot" that can be occupied by a generating sequence. This enables
-    efficient batching of multiple concurrent requests.
-
-    Attributes:
-        kv_cache: Key-value cache for all slots
-                  Shape: [layers, max_slots, max_seq_len, kv_heads, head_dim]
-        tokens: Current token for each slot
-                Shape: [max_slots, 1]
-        active_mask: Boolean mask indicating which slots are actively generating
-                     Shape: [max_slots]
-        request_ids: Which request occupies each slot (None if slot is empty)
-                     Length: max_slots
-    """
-
-    kv_cache: KVCache
-    tokens: jax.Array  # [max_slots, 1]
-    active_mask: jax.Array  # [max_slots] bool
-    request_ids: List[Optional[str]]  # [max_slots]
 
 
 ########################################################################################################################
@@ -89,7 +64,7 @@ class ServingConfig:
     token_pad_idx: int = 0
     max_decode_length: int = 64
     max_cache_seqlen: int = 1024
-    sampler: Sampler = dataclasses.field(default_factory=GreedySampler)
+    sampler: callable = greedy
     rng_seed: int = 0
 
 
@@ -191,8 +166,7 @@ class InferenceEngine:
         mesh: Mesh,
         max_concurrent_slots: int = 8,
         pad_id: int = 0,
-        buckets: Optional[List[int]] = None,
-        sampler: Optional[Sampler] = None,
+        sampler: Optional[callable] = None,
         rng_seed: int = 0,
         max_cache_seqlen: Optional[int] = None,
     ):
@@ -204,17 +178,15 @@ class InferenceEngine:
             mesh: JAX mesh for sharded computation
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
-            buckets: List of bucket sizes for prompt padding (default: power-of-2)
-            sampler: Sampling strategy (default: GreedySampler)
+            sampler: Sample function (logits, key) -> token_ids (default: greedy)
             rng_seed: Seed for PRNG key used in stochastic sampling
             max_cache_seqlen: Override model's max_seqlen for KV cache allocation
         """
         self.model = model
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
-        self.buckets = buckets or DEFAULT_PREFILL_BUCKETS
         self.mesh = mesh
-        self.sampler = sampler or GreedySampler()
+        self.sampler = sampler or greedy
         self.rng_key = random.PRNGKey(rng_seed)
         self.max_cache_seqlen = max_cache_seqlen or model.args.max_seqlen
 
@@ -226,11 +198,7 @@ class InferenceEngine:
         # Cache model config for convenience
         self.config = model.args
 
-        # Mesh helper for sharding operations
-        self.mesh_helper = MeshHelper()
-
-        # Create a JIT-compatible sample function from the sampler
-        sample_fn = self.sampler.sample
+        sample_fn = self.sampler
 
         # Create jitted core function for batched prefill logic
         @jit
@@ -303,17 +271,17 @@ class InferenceEngine:
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
+        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
 
-        tokens = self.mesh_helper.put_on_mesh(
+        tokens = MeshHelper.put_on_mesh(
             tokens,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
-        true_lengths = self.mesh_helper.put_on_mesh(
+        true_lengths = MeshHelper.put_on_mesh(
             true_lengths,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
         mask = build_attn_mask(bucket_size, kv_cache, true_lengths)
@@ -348,7 +316,7 @@ class InferenceEngine:
         engine = self
 
         # Capture sample_fn for use inside JIT
-        sample_fn = self.sampler.sample
+        sample_fn = self.sampler
 
         @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
         def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
@@ -391,9 +359,7 @@ class InferenceEngine:
                 # Sample next tokens
                 batch_logits = logits[:, 0, :]
                 rng_key, subkey = random.split(rng_key)
-                new_tokens = sample_fn(batch_logits, subkey)
-                if new_tokens.ndim == 1:
-                    new_tokens = new_tokens[:, None]
+                new_tokens = sample_fn(batch_logits, subkey)[:, None]
 
                 # Only update tokens for active slots
                 updated_tokens = jnp.where(
@@ -403,7 +369,7 @@ class InferenceEngine:
                 )
 
                 # Reshard carry to match input sharding (prevents drift across scan iterations)
-                updated_tokens = jax.sharding.reshard(
+                updated_tokens = jax.lax.with_sharding_constraint(
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
@@ -422,13 +388,12 @@ class InferenceEngine:
 
         return multistep_decode_fn
 
-    def init_decode_state(self) -> DecodeState:
+    def init_decode_state(self) -> tuple[KVCache, jax.Array]:
         """Initialize empty decode state with all slots inactive.
 
         Returns:
-            Fresh DecodeState with empty KV cache and all slots inactive
+            Tuple of (kv_cache, tokens) placed on the mesh
         """
-        # Initialize empty KV cache for all slots
         kv_cache = KVCache.new(
             n_layers=self.config.n_layers,
             bsz=self.max_slots,
@@ -437,33 +402,16 @@ class InferenceEngine:
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
         )
-        kv_cache = self.mesh_helper.place_kv_cache(kv_cache, self.mesh)
+        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
 
-        # Initialize tokens (doesn't matter what they are since slots are inactive)
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
-        tokens = self.mesh_helper.put_on_mesh(
+        tokens = MeshHelper.put_on_mesh(
             tokens,
             self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+            MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
 
-        # All slots start inactive
-        active_mask = jnp.zeros(self.max_slots, dtype=bool)
-        active_mask = self.mesh_helper.put_on_mesh(
-            active_mask,
-            self.mesh,
-            self.mesh_helper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
-        )
-
-        # No requests assigned
-        request_ids = [None] * self.max_slots
-
-        return DecodeState(
-            kv_cache=kv_cache,
-            tokens=tokens,
-            active_mask=active_mask,
-            request_ids=request_ids,
-        )
+        return kv_cache, tokens
 
 
 ########################################################################################################################
@@ -531,17 +479,15 @@ class ServingLoop:
             max_cache_seqlen=serve_cfg.max_cache_seqlen,
         )
 
+        # Initialize decode state
+        kv_cache, tokens = self.engine.init_decode_state()
+
         # Setup decode work
         self.decode_work = DecodeWork(
-            curr_tokens=None,
-            cache=None,
+            curr_tokens=tokens,
+            cache=kv_cache,
             active_results=[None for _ in range(serve_cfg.decode_batch_size)],
         )
-
-        # Initialize decode state
-        decode_state = self.engine.init_decode_state()
-        self.decode_work.curr_tokens = decode_state.tokens
-        self.decode_work.cache = decode_state.kv_cache
 
         # Create multistep decode function
         self.multistep_decode_fn = self.engine.make_multistep_decode_fn()
@@ -573,7 +519,6 @@ class ServingLoop:
         during the first serving_step.
         """
         import time as _time
-        cfg = self.engine.config
         bsz_prefill = self.serve_cfg.prefill_batch_size
         bsz_decode = self.serve_cfg.decode_batch_size
 
@@ -610,9 +555,7 @@ class ServingLoop:
         sys.stdout.flush()
 
         # Re-initialize decode state (discard dummy results)
-        decode_state = self.engine.init_decode_state()
-        self.decode_work.curr_tokens = decode_state.tokens
-        self.decode_work.cache = decode_state.kv_cache
+        self.decode_work.cache, self.decode_work.curr_tokens = self.engine.init_decode_state()
 
         print("[ServingLoop] Warmup complete")
         sys.stdout.flush()
@@ -676,23 +619,30 @@ class ServingLoop:
     def _update_cache_and_index(self, batch_updates: list):
         """Batch update cache and tokens for multiple slot insertions.
 
+        All slot updates are applied in a single scatter (one copy of the full
+        cache tensor) instead of one copy per slot.
+
         Args:
             batch_updates: List of (cache_entry, slot_idx, length, next_token) tuples
         """
-        entries, batch_idxs, lens, next_tokens = map(list, zip(*batch_updates))
+        entries, slot_idxs, lens, next_tokens = map(list, zip(*batch_updates))
 
-        # Insert all cache entries into decode cache
-        for entry, slot_idx, length, next_token in zip(entries, batch_idxs, lens, next_tokens):
-            new_k = self.decode_work.cache.k.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.k)
-            new_v = self.decode_work.cache.v.at[:, slot_idx : slot_idx + 1, :, :, :].set(entry.v)
+        # Stack all single-sequence cache entries along batch dim
+        # Each entry.k/v is [n_layers, 1, kv_heads, max_seqlen, head_dim]
+        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)  # [n_layers, N, ...]
+        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
 
-            self.decode_work.cache = KVCache(
-                k=new_k,
-                v=new_v,
-                seq_positions=self.decode_work.cache.seq_positions.at[slot_idx].set(length),
-            )
+        # Scatter all slots at once using advanced indexing
+        idx = jnp.array(slot_idxs)
+        new_k = self.decode_work.cache.k.at[:, idx, :, :, :].set(stacked_k)
+        new_v = self.decode_work.cache.v.at[:, idx, :, :, :].set(stacked_v)
 
-            self.decode_work.curr_tokens = self.decode_work.curr_tokens.at[slot_idx, 0].set(next_token)
+        # Update positions and tokens in one go
+        new_positions = self.decode_work.cache.seq_positions.at[idx].set(jnp.array(lens))
+        new_tokens = self.decode_work.curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
+
+        self.decode_work.cache = KVCache(k=new_k, v=new_v, seq_positions=new_positions)
+        self.decode_work.curr_tokens = new_tokens
 
     def _check_done_sequences(self, output_tokens: np.ndarray) -> list[bool]:
         """Check which sequences are done (EOS or max length).
@@ -714,7 +664,7 @@ class ServingLoop:
             has_eos = np.any(output_tokens[i, :, None] == self.eos_tokens) if len(self.eos_tokens) > 0 else False
             is_max_length = result.tokens_decoded >= self.serve_cfg.max_decode_length
 
-            done.append(has_eos or is_max_length)
+            done.append(bool(has_eos or is_max_length))
 
         return done
 
@@ -746,8 +696,9 @@ class ServingLoop:
                             break
                 result.done = True
                 self.decode_work.active_results[i] = None
-                print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
-                sys.stdout.flush()
+                if self.verbose:
+                    print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
+                    sys.stdout.flush()
 
     def decode_step(self):
         """One decode iteration: insert pending prefills + run multistep decode."""
@@ -770,13 +721,13 @@ class ServingLoop:
             if "worker" in self.roles and len(batch_updates) > 0:
                 self._update_cache_and_index(batch_updates)
                 # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
-                self.decode_work.cache = self.engine.mesh_helper.place_kv_cache(
+                self.decode_work.cache = MeshHelper.place_kv_cache(
                     self.decode_work.cache, self.mesh
                 )
-                self.decode_work.curr_tokens = self.engine.mesh_helper.put_on_mesh(
+                self.decode_work.curr_tokens = MeshHelper.put_on_mesh(
                     self.decode_work.curr_tokens,
                     self.mesh,
-                    self.engine.mesh_helper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
+                    MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
                 )
 
         # Phase 2: Run multistep decode (skip if all slots empty)
@@ -816,10 +767,11 @@ class ServingLoop:
         self._decode_call_count += 1
         _elapsed = _time.time() - _t0
         _active = int(active_mask.sum())
-        print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
-              f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
-              f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
-        sys.stdout.flush()
+        if self.verbose:
+            print(f"[decode #{self._decode_call_count}] {_elapsed:.3f}s for {self.serve_cfg.decode_steps} steps, "
+                  f"{_active}/{self.serve_cfg.decode_batch_size} active slots, "
+                  f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
+            sys.stdout.flush()
 
         # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
         # Swap current output with stored output (allows decode kernel to run async)
@@ -869,7 +821,7 @@ class ServingLoop:
         self._log(f"prefill: processing {len(prefill_batch)} requests")
         # Prepare batched inputs (pad to max length in batch)
         max_len = max(len(req.text) for req in prefill_batch)
-        bucket_size = take_nearest_bucket(self.engine.buckets, max_len)
+        bucket_size = take_nearest_bucket(DEFAULT_PREFILL_BUCKETS, max_len)
 
         tokens_list = []
         true_lengths_list = []
@@ -906,8 +858,9 @@ class ServingLoop:
             )
             self.prefill_work.to_decode.append(new_decode)
 
-        print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
-        sys.stdout.flush()
+        if self.verbose:
+            print(f"[ServingLoop] Prefilled {len(prefill_batch)} requests")
+            sys.stdout.flush()
 
     def _log(self, msg):
         if not self.verbose:
