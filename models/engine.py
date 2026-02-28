@@ -846,9 +846,15 @@ class ServingLoop:
             tokens_list.append(padded)
             true_lengths_list.append(len(req.text))
 
-        # Create batched inputs
-        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [bsz, bucket_size]
-        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [bsz]
+        # Pad batch to prefill_batch_size so batch dim is divisible by dp axis
+        actual_bsz = len(tokens_list)
+        target_bsz = self.serve_cfg.prefill_batch_size
+        for _ in range(target_bsz - actual_bsz):
+            tokens_list.append(np.zeros_like(tokens_list[0]))
+            true_lengths_list.append(0)
+
+        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [target_bsz, bucket_size]
+        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [target_bsz]
 
         # Call prefill
         self._log(f"prefill: calling engine.prefill (shape={batched_tokens.shape})")
