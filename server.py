@@ -102,6 +102,11 @@ async def chat_completions(req: ChatCompletionRequest):
     req_id = _next_id()
     tokens = _format_chat_prompt(req.messages, tokenizer)
     prompt_tokens_count = len(tokens)
+    if prompt_tokens_count >= serving_loop.serve_cfg.max_cache_seqlen:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt too long ({prompt_tokens_count} tokens), max is {serving_loop.serve_cfg.max_cache_seqlen - 1}",
+        )
     serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
 
     start = time.time()
@@ -182,6 +187,7 @@ def main():
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=max_decode_length,
+        max_cache_seqlen=max_decode_length,
     )
 
     serving_loop = ServingLoop(
