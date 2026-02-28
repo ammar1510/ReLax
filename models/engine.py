@@ -671,6 +671,8 @@ class ServingLoop:
 
             # Check if any token in this row matches EOS
             has_eos = np.any(output_tokens[i, :, None] == self.eos_tokens) if len(self.eos_tokens) > 0 else False
+            print(f"[EOS DEBUG] slot {i}: output_tokens={output_tokens[i].tolist()}, eos_tokens={self.eos_tokens.tolist()}, has_eos={has_eos}")
+            sys.stdout.flush()
             is_max_length = result.tokens_decoded >= self.serve_cfg.max_decode_length
 
             done.append(bool(has_eos or is_max_length))
@@ -687,7 +689,7 @@ class ServingLoop:
         """
         # Dispatch tokens to results via output_mapping
         for token, req_id in zip(output_tokens_flat, output_mapping_flat):
-            if req_id >= 0 and req_id in self.results:
+            if req_id >= 0 and req_id in self.results and not self.results[req_id].done:
                 self.results[req_id].token_list.append(token)
                 self.results[req_id].tokens_decoded += 1
 
