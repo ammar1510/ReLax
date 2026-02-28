@@ -22,7 +22,7 @@ from typing import AsyncGenerator, Optional
 
 import jax
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from jax.sharding import Mesh
 from pydantic import BaseModel
@@ -36,6 +36,7 @@ from models.sync_server import SyncServer
 # ---------------------------------------------------------------------------
 serving_loop: Optional[ServingLoop] = None
 tokenizer = None
+max_pending_requests: int = 500
 
 _request_counter = itertools.count()
 _counter_lock = threading.Lock()
@@ -79,6 +80,8 @@ async def health():
 
 @app.post("/generate")
 async def generate(req: GenerateRequest):
+    if serving_loop.pending_prefill_count() >= max_pending_requests:
+        raise HTTPException(status_code=429, detail="Too many pending requests")
     req_id = _next_id()
     tokens = format_prompt(req.prompt, tokenizer)
     serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
@@ -104,6 +107,8 @@ async def generate(req: GenerateRequest):
 
 @app.post("/generate/stream")
 async def generate_stream(req: GenerateRequest):
+    if serving_loop.pending_prefill_count() >= max_pending_requests:
+        raise HTTPException(status_code=429, detail="Too many pending requests")
     req_id = _next_id()
     tokens = format_prompt(req.prompt, tokenizer)
     serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
@@ -166,7 +171,7 @@ async def _token_stream(req_id: int) -> AsyncGenerator[str, None]:
 # ---------------------------------------------------------------------------
 
 def main():
-    global serving_loop, tokenizer
+    global serving_loop, tokenizer, max_pending_requests
 
     jax.distributed.initialize()
     pid = jax.process_index()
@@ -188,6 +193,7 @@ def main():
     decode_batch_size  = cfg["decode_batch_size"]
     prefill_batch_size = cfg["prefill_batch_size"]
     decode_steps       = cfg["decode_steps"]
+    max_pending_requests = cfg.get("max_pending_requests", 500)
 
     # Load model
     model, params, config, tokenizer = load_model(args.model_path)

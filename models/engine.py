@@ -912,6 +912,10 @@ class ServingLoop:
         self.prefill_step()
         self._log("serving_step done")
 
+    def pending_prefill_count(self) -> int:
+        """Return the number of requests waiting to be prefilled."""
+        return len(self.prefill_work.to_prefill)
+
     def add_request(self, request: UserRequestPrompt):
         """Add new request (thread-safe).
 
