@@ -1,8 +1,7 @@
-"""HTTP API server for LLaMA inference with SSE streaming.
+"""OpenAI-compatible HTTP API server for LLaMA inference.
 
-Loads a LLaMA model and serves inference requests over HTTP.
-Supports both blocking JSON responses, token-by-token SSE streaming,
-and OpenAI-compatible /v1/chat/completions endpoint.
+Loads a LLaMA model and serves inference requests over HTTP
+via the standard /v1/chat/completions endpoint.
 
 Usage:
     python server.py --model_path /path/to/model [--port 8080] [--tp 4]
@@ -20,16 +19,15 @@ import threading
 import time
 import traceback
 import uuid
-from typing import AsyncGenerator, List, Optional
+from typing import List, Optional
 
 import jax
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from jax.sharding import Mesh
 from pydantic import BaseModel
 
-from inference import format_prompt, load_model
+from inference import load_model
 from models.engine import ServingConfig, ServingLoop, UserRequestPrompt
 from models.sync_server import SyncServer
 
@@ -66,9 +64,26 @@ def _inference_loop(shutdown: threading.Event) -> None:
 app = FastAPI(title="ReLax Inference Server")
 
 
-class GenerateRequest(BaseModel):
-    prompt: str
-    max_tokens: Optional[int] = None  # overrides server default when set (future use)
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 1.0
+    max_tokens: Optional[int] = 4000
+
+
+def _format_chat_prompt(messages: List[ChatMessage], tok) -> List[int]:
+    """Convert an OpenAI-style messages array into LLaMA chat-template tokens."""
+    parts = ["<|begin_of_text|>"]
+    for msg in messages:
+        parts.append(f"<|start_header_id|>{msg.role}<|end_header_id|>\n\n{msg.content}<|eot_id|>")
+    # Open the assistant turn so the model continues from here
+    parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    return tok.encode("".join(parts), bos=False, eos=False)
 
 
 # -- Health ------------------------------------------------------------------
@@ -78,14 +93,15 @@ async def health():
     return {"status": "ok"}
 
 
-# -- Blocking JSON response --------------------------------------------------
+# -- OpenAI-compatible chat completions --------------------------------------
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
     if serving_loop.pending_prefill_count() >= max_pending_requests:
         raise HTTPException(status_code=429, detail="Too many pending requests")
     req_id = _next_id()
-    tokens = format_prompt(req.prompt, tokenizer)
+    tokens = _format_chat_prompt(req.messages, tokenizer)
+    prompt_tokens_count = len(tokens)
     serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
 
     start = time.time()
@@ -94,78 +110,30 @@ async def generate(req: GenerateRequest):
         result = serving_loop.results.get(req_id)
         if result is not None and result.done:
             text = tokenizer.decode(result.token_list)
-            elapsed = round(time.time() - start, 3)
-            # Clean up so the results dict doesn't grow unbounded
+            completion_tokens_count = result.tokens_decoded
             del serving_loop.results[req_id]
             return {
-                "id": req_id,
-                "text": text,
-                "tokens_generated": result.tokens_decoded,
-                "elapsed_seconds": elapsed,
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model or "relax",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": text,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens_count,
+                    "completion_tokens": completion_tokens_count,
+                    "total_tokens": prompt_tokens_count + completion_tokens_count,
+                },
             }
 
-
-# -- SSE streaming response --------------------------------------------------
-
-@app.post("/generate/stream")
-async def generate_stream(req: GenerateRequest):
-    if serving_loop.pending_prefill_count() >= max_pending_requests:
-        raise HTTPException(status_code=429, detail="Too many pending requests")
-    req_id = _next_id()
-    tokens = format_prompt(req.prompt, tokenizer)
-    serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
-
-    return StreamingResponse(
-        _token_stream(req_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Prevent nginx from buffering SSE
-        },
-    )
-
-
-async def _token_stream(req_id: int) -> AsyncGenerator[str, None]:
-    """Yield SSE events as tokens arrive, one chunk per decode batch.
-
-    The engine produces tokens in batches of `decode_steps` (default 10).
-    We diff the decoded string each time the token list grows to handle
-    multi-byte characters correctly.
-
-    SSE event format:
-        data: {"text": "<new text chunk>"}\n\n   — incremental text
-        data: {"done": true, "tokens_generated": N, "elapsed_seconds": F}\n\n
-    """
-    last_text = ""
-    start = time.time()
-    try:
-        while True:
-            await asyncio.sleep(0.01)
-            result = serving_loop.results.get(req_id)
-            if result is None:
-                continue
-
-            # Take a GIL-safe snapshot so the background thread can keep appending
-            token_list = list(result.token_list)
-            done = result.done
-
-            if token_list:
-                full_text = tokenizer.decode(token_list)
-                new_text = full_text[len(last_text):]
-                if new_text:
-                    yield f"data: {json.dumps({'text': new_text})}\n\n"
-                    last_text = full_text
-
-            if done:
-                elapsed = round(time.time() - start, 3)
-                yield (
-                    f"data: {json.dumps({'done': True, 'tokens_generated': result.tokens_decoded, 'elapsed_seconds': elapsed})}\n\n"
-                )
-                break
-    finally:
-        # Clean up whether the client disconnected or generation finished
-        serving_loop.results.pop(req_id, None)
 
 
 # ---------------------------------------------------------------------------
