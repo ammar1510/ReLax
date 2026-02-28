@@ -136,12 +136,10 @@ class PrefillWork:
     """State for prefill queue management.
 
     Attributes:
-        requests: New requests waiting to be triaged
         to_prefill: Requests queued for prefill
         to_decode: Prefilled results waiting for decode slots
     """
 
-    requests: list[UserRequestPrompt]
     to_prefill: list[UserRequestPrompt]
     to_decode: list[PrefillResult]
 
@@ -525,7 +523,7 @@ class ServingLoop:
         self.decode_output = (None, None)
 
         # Setup prefill work
-        self.prefill_work = PrefillWork([], [], [])
+        self.prefill_work = PrefillWork([], [])
 
         # Results tracking
         self.results = {}  # request_id -> DecodeResult
@@ -816,11 +814,6 @@ class ServingLoop:
 
     def prefill_step(self):
         """One prefill iteration: batch prefill pending requests."""
-        # Triage new requests (move from requests to to_prefill)
-        while len(self.prefill_work.requests) > 0:
-            request = self.prefill_work.requests.pop(0)
-            self.prefill_work.to_prefill.append(request)
-
         # Process up to prefill_batch_size requests
         prefill_batch = self.prefill_work.to_prefill[: self.serve_cfg.prefill_batch_size]
         self.prefill_work.to_prefill = self.prefill_work.to_prefill[len(prefill_batch) :]
@@ -910,7 +903,7 @@ class ServingLoop:
 
         # Add new requests to prefill queue
         for req in requests or []:
-            self.prefill_work.requests.append(UserRequestPrompt(**req))
+            self.prefill_work.to_prefill.append(UserRequestPrompt(**req))
 
         # Execute decode and prefill
         self._log("entering decode_step")
