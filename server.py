@@ -1,7 +1,8 @@
 """HTTP API server for LLaMA inference with SSE streaming.
 
 Loads a LLaMA model and serves inference requests over HTTP.
-Supports both blocking JSON responses and token-by-token SSE streaming.
+Supports both blocking JSON responses, token-by-token SSE streaming,
+and OpenAI-compatible /v1/chat/completions endpoint.
 
 Usage:
     python server.py --model_path /path/to/model [--port 8080] [--tp 4]
@@ -18,7 +19,8 @@ import sys
 import threading
 import time
 import traceback
-from typing import AsyncGenerator, Optional
+import uuid
+from typing import AsyncGenerator, List, Optional
 
 import jax
 import numpy as np
