@@ -254,11 +254,13 @@ class InferenceEngine:
         )
 
     def _default_cache_updater(self, decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens):
+        idx = jnp.array(slot_idxs)
+        prefill_seqlen = entries[0].k.shape[3]
         stacked_k = jnp.concatenate([e.k for e in entries], axis=1)
         stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
-        idx = jnp.array(slot_idxs)
-        new_k = decode_cache.k.at[:, idx, :, :, :].set(stacked_k)
-        new_v = decode_cache.v.at[:, idx, :, :, :].set(stacked_v)
+        # Only write the first prefill_seqlen positions into the decode cache
+        new_k = decode_cache.k.at[:, idx, :, :prefill_seqlen, :].set(stacked_k)
+        new_v = decode_cache.v.at[:, idx, :, :prefill_seqlen, :].set(stacked_v)
         new_positions = decode_cache.seq_positions.at[idx].set(jnp.array(lens))
         new_tokens = curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
         return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
