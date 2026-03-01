@@ -236,11 +236,11 @@ class InferenceEngine:
 
         self._jitted_prefill_core = _jitted_prefill_core
 
-    def _default_cache_factory(self, bsz):
+    def _default_cache_factory(self, bsz, max_seqlen):
         return KVCache.new(
             n_layers=self.config.n_layers,
             bsz=bsz,
-            max_seqlen=self.max_cache_seqlen,
+            max_seqlen=max_seqlen,
             kv_heads=self.config.n_kv_heads,
             head_dim=self.config.head_dim,
             dtype=jnp.dtype(self.config.dtype),
@@ -287,7 +287,10 @@ class InferenceEngine:
         """
         bsz, bucket_size = tokens.shape
 
-        cache = self.cache_factory(bsz)
+        try:
+            cache = self.cache_factory(bsz, max_seqlen=bucket_size)
+        except TypeError:
+            cache = self.cache_factory(bsz)
         cache = self.place_cache(cache, self.mesh)
 
         tokens = MeshHelper.put_on_mesh(
@@ -412,7 +415,7 @@ class InferenceEngine:
         Returns:
             Tuple of (cache, tokens) placed on the mesh
         """
-        cache = self.cache_factory(self.max_slots)
+        cache = self.cache_factory(self.max_slots, max_seqlen=self.max_cache_seqlen)
         cache = self.place_cache(cache, self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
