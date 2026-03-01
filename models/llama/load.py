@@ -161,18 +161,27 @@ def _convert_layer(
     }
 
 
-def _make_checkpoint_manager(checkpoint_path: Path):
-    """Create a CheckpointManager configured for local-storage multi-host use.
+def _resolve_path(checkpoint_path: str):
+    """Return an epath.Path for local or GCS paths."""
+    from etils import epath
+    return epath.Path(checkpoint_path)
 
-    Setting primary_host=None makes every host act as its own primary, so each
-    host independently writes/reads its own metadata and shards to local disk.
-    This is required when hosts do NOT share a network filesystem.
+
+def _make_checkpoint_manager(checkpoint_path):
+    """Create a CheckpointManager for local or GCS paths.
+
+    For GCS (shared filesystem): primary_host=0 so one host writes shared
+    metadata while all hosts write their own shards.
+    For local storage: primary_host=None so each host acts as its own primary
+    and independently writes metadata and shards to local disk.
     """
     import orbax.checkpoint as ocp
     from orbax.checkpoint.options import MultiprocessingOptions
 
+    is_gcs = str(checkpoint_path).startswith("gs://")
+    primary_host = 0 if is_gcs else None
     options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=MultiprocessingOptions(primary_host=None),
+        multiprocessing_options=MultiprocessingOptions(primary_host=primary_host),
     )
     return ocp.CheckpointManager(checkpoint_path, options=options)
 
@@ -181,16 +190,16 @@ def save_orbax_weights(
     params: Dict[str, Any], checkpoint_path: str, mesh=None
 ) -> None:
     """
-    Save ReLax params to an orbax checkpoint directory.
+    Save ReLax params to an orbax checkpoint directory (local or GCS).
 
     When a mesh is provided, params are sharded before saving so each host
-    writes only its local shards. primary_host=None ensures every host writes
-    its own metadata independently (required for local-only storage).
+    writes only its local shards. GCS paths (gs://) use primary_host=0 for
+    shared metadata; local paths use primary_host=None for independent writes.
     """
     import orbax.checkpoint as ocp
     import jax
 
-    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path = _resolve_path(checkpoint_path)
 
     if mesh is not None:
         from utils.mesh_helpers import MeshHelper
@@ -208,16 +217,16 @@ def load_from_orbax(
     mesh=None,
 ) -> Dict[str, Any]:
     """
-    Load ReLax params from an orbax checkpoint, optionally sharding onto a mesh.
+    Load ReLax params from an orbax checkpoint (local or GCS), optionally sharding onto a mesh.
 
-    When a mesh is provided, each host reads only its own shards directly from
-    disk by passing a target pytree of jax.ShapeDtypeStruct with sharding specs.
-    primary_host=None ensures every host reads its own metadata independently.
+    When a mesh is provided, each host reads only its own shards by passing a
+    target pytree of jax.ShapeDtypeStruct with sharding specs. GCS paths
+    (gs://) use primary_host=0; local paths use primary_host=None.
     """
     import orbax.checkpoint as ocp
     import jax
 
-    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path = _resolve_path(checkpoint_path)
     mngr = _make_checkpoint_manager(checkpoint_path)
     step = mngr.latest_step()
 

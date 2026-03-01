@@ -136,15 +136,9 @@ class MeshHelper:
             pos_spec = pspec
 
         return KVCache(
-            k=MeshHelper.create_sharded_zeros(
-                cache.k.shape, cache.k.dtype, mesh, k_spec
-            ),
-            v=MeshHelper.create_sharded_zeros(
-                cache.v.shape, cache.v.dtype, mesh, v_spec
-            ),
-            seq_positions=MeshHelper.create_sharded_zeros(
-                cache.seq_positions.shape, cache.seq_positions.dtype, mesh, pos_spec
-            ),
+            k=MeshHelper.put_on_mesh(cache.k, mesh, k_spec),
+            v=MeshHelper.put_on_mesh(cache.v, mesh, v_spec),
+            seq_positions=MeshHelper.put_on_mesh(cache.seq_positions, mesh, pos_spec),
         )
 
     @staticmethod

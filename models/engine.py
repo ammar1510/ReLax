@@ -727,7 +727,8 @@ class ServingLoop:
                     break
 
                 result: PrefillResult = self.prefill_work.to_decode.pop(0)
-                self.decode_work.active_results[i] = DecodeResult(result.id, [])
+                first_token = int(result.next_token)
+                self.decode_work.active_results[i] = DecodeResult(result.id, [first_token], tokens_decoded=1)
                 self.results[result.id] = self.decode_work.active_results[i]
                 batch_updates.append((result.cache_entry, i, result.len, result.next_token))
 
