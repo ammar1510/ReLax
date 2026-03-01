@@ -819,6 +819,11 @@ class ServingLoop:
 
     def prefill_step(self):
         """One prefill iteration: batch prefill pending requests."""
+        # Backpressure: don't prefill if too many results are waiting for decode slots
+        if len(self.prefill_work.to_decode) >= self.serve_cfg.decode_batch_size:
+            self._log(f"prefill: backpressure ({len(self.prefill_work.to_decode)} queued, skipping)")
+            return
+
         # Process up to prefill_batch_size requests
         prefill_batch = self.prefill_work.to_prefill[: self.serve_cfg.prefill_batch_size]
         self.prefill_work.to_prefill = self.prefill_work.to_prefill[len(prefill_batch) :]

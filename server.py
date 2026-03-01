@@ -21,10 +21,7 @@ import traceback
 import uuid
 from typing import List, Optional
 
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
+import wandb as _wandb
 
 import jax
 import numpy as np
@@ -136,7 +133,7 @@ async def chat_completions(req: ChatCompletionRequest):
             completion_tokens_count = result.tokens_decoded
             del serving_loop.results[req_id]
             latency = time.time() - start
-            if _wandb is not None and _wandb.run is not None:
+            if _wandb.run is not None:
                 _wandb.log({
                     "request/prompt_tokens": prompt_tokens_count,
                     "request/completion_tokens": completion_tokens_count,
@@ -232,8 +229,8 @@ def main():
     print(f"[P{pid}] Warmup complete.")
     sys.stdout.flush()
 
-    # Initialize wandb on P0 if available
-    if pid == 0 and _wandb is not None:
+    # Initialize wandb on P0
+    if pid == 0:
         _wandb.init(project="relax", config={
             "tp": tp,
             "decode_batch_size": decode_batch_size,
@@ -253,7 +250,7 @@ def main():
     inference_thread.start()
 
     # Start wandb system metrics thread on P0
-    if pid == 0 and _wandb is not None and _wandb.run is not None:
+    if pid == 0 and _wandb.run is not None:
         wandb_thread = threading.Thread(
             target=_wandb_system_loop, args=(shutdown,), daemon=True, name="wandb-system"
         )
