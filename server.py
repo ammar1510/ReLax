@@ -21,7 +21,7 @@ import traceback
 import uuid
 from typing import List, Optional
 
-import wandb as _wandb
+import wandb
 
 import jax
 import numpy as np
@@ -64,7 +64,7 @@ def _wandb_system_loop(shutdown: threading.Event, interval: float = 5.0) -> None
     while not shutdown.is_set():
         if serving_loop is not None:
             active = sum(1 for x in serving_loop.decode_work.active_results if x is not None)
-            _wandb.log({
+            wandb.log({
                 "system/pending_requests": serving_loop.pending_prefill_count(),
                 "system/active_slots": active,
                 "system/decode_call_count": serving_loop._decode_call_count,
@@ -133,8 +133,8 @@ async def chat_completions(req: ChatCompletionRequest):
             completion_tokens_count = result.tokens_decoded
             del serving_loop.results[req_id]
             latency = time.time() - start
-            if _wandb.run is not None:
-                _wandb.log({
+            if wandb.run is not None:
+                wandb.log({
                     "request/prompt_tokens": prompt_tokens_count,
                     "request/completion_tokens": completion_tokens_count,
                     "request/total_tokens": prompt_tokens_count + completion_tokens_count,
@@ -231,7 +231,7 @@ def main():
 
     # Initialize wandb on P0
     if pid == 0:
-        _wandb.init(project="relax", config={
+        wandb.init(project="relax", config={
             "tp": tp,
             "decode_batch_size": decode_batch_size,
             "prefill_batch_size": prefill_batch_size,
@@ -250,7 +250,7 @@ def main():
     inference_thread.start()
 
     # Start wandb system metrics thread on P0
-    if pid == 0 and _wandb.run is not None:
+    if pid == 0 and wandb.run is not None:
         wandb_thread = threading.Thread(
             target=_wandb_system_loop, args=(shutdown,), daemon=True, name="wandb-system"
         )
