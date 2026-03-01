@@ -85,6 +85,24 @@ class MeshHelper:
         return value
 
     @staticmethod
+    def create_sharded_zeros(
+        shape: tuple, dtype: jnp.dtype, mesh: Mesh, spec: PS
+    ) -> jax.Array:
+        """Create a zero array directly sharded on mesh without allgather.
+
+        Uses jax.make_array_from_callback to place shards directly on devices,
+        avoiding the multihost assert_equal allgather that device_put triggers.
+        """
+        sharding = NamedSharding(mesh, spec)
+
+        def _zeros_cb(index):
+            return np.zeros(
+                [s.stop - s.start for s in index], dtype=dtype
+            )
+
+        return jax.make_array_from_callback(shape, sharding, _zeros_cb)
+
+    @staticmethod
     def place_kv_cache(
         cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
     ) -> KVCache:
@@ -116,9 +134,15 @@ class MeshHelper:
             pos_spec = pspec
 
         return KVCache(
-            k=MeshHelper.put_on_mesh(cache.k, mesh, k_spec),
-            v=MeshHelper.put_on_mesh(cache.v, mesh, v_spec),
-            seq_positions=MeshHelper.put_on_mesh(cache.seq_positions, mesh, pos_spec),
+            k=MeshHelper.create_sharded_zeros(
+                cache.k.shape, cache.k.dtype, mesh, k_spec
+            ),
+            v=MeshHelper.create_sharded_zeros(
+                cache.v.shape, cache.v.dtype, mesh, v_spec
+            ),
+            seq_positions=MeshHelper.create_sharded_zeros(
+                cache.seq_positions.shape, cache.seq_positions.dtype, mesh, pos_spec
+            ),
         )
 
     @staticmethod
