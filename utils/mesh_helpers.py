@@ -96,9 +96,11 @@ class MeshHelper:
         sharding = NamedSharding(mesh, spec)
 
         def _zeros_cb(index):
-            return np.zeros(
-                [s.stop - s.start for s in index], dtype=dtype
-            )
+            shard_shape = [
+                (s.stop or full) - (s.start or 0)
+                for s, full in zip(index, shape)
+            ]
+            return np.zeros(shard_shape, dtype=dtype)
 
         return jax.make_array_from_callback(shape, sharding, _zeros_cb)
 
