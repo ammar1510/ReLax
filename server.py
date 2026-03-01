@@ -21,6 +21,11 @@ import traceback
 import uuid
 from typing import List, Optional
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 import jax
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -55,6 +60,19 @@ def _inference_loop(shutdown: threading.Event) -> None:
     """Call serving_step() continuously.  Must run on exactly one thread."""
     while not shutdown.is_set():
         serving_loop.serving_step()
+
+
+def _wandb_system_loop(shutdown: threading.Event, interval: float = 5.0) -> None:
+    """Periodically log system-level metrics to wandb."""
+    while not shutdown.is_set():
+        if serving_loop is not None:
+            active = sum(1 for x in serving_loop.decode_work.active_results if x is not None)
+            _wandb.log({
+                "system/pending_requests": serving_loop.pending_prefill_count(),
+                "system/active_slots": active,
+                "system/decode_call_count": serving_loop._decode_call_count,
+            })
+        shutdown.wait(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +135,15 @@ async def chat_completions(req: ChatCompletionRequest):
             text = tokenizer.decode(result.token_list)
             completion_tokens_count = result.tokens_decoded
             del serving_loop.results[req_id]
+            latency = time.time() - start
+            if _wandb is not None and _wandb.run is not None:
+                _wandb.log({
+                    "request/prompt_tokens": prompt_tokens_count,
+                    "request/completion_tokens": completion_tokens_count,
+                    "request/total_tokens": prompt_tokens_count + completion_tokens_count,
+                    "request/latency_s": latency,
+                    "request/tokens_per_sec": completion_tokens_count / latency if latency > 0 else 0,
+                })
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
                 "object": "chat.completion",
@@ -170,6 +197,7 @@ def main():
     decode_steps       = cfg["decode_steps"]
     max_pending_requests = cfg.get("max_pending_requests", 500)
 
+
     # Load model
     model, params, config, tokenizer = load_model(args.model_path)
 
@@ -204,12 +232,32 @@ def main():
     print(f"[P{pid}] Warmup complete.")
     sys.stdout.flush()
 
+    # Initialize wandb on P0 if available
+    if pid == 0 and _wandb is not None:
+        _wandb.init(project="relax", config={
+            "tp": tp,
+            "decode_batch_size": decode_batch_size,
+            "prefill_batch_size": prefill_batch_size,
+            "max_decode_length": max_decode_length,
+            "decode_steps": decode_steps,
+            "max_pending_requests": max_pending_requests,
+        })
+        print(f"[P{pid}] wandb initialized")
+        sys.stdout.flush()
+
     # Start background inference thread (all processes)
     shutdown = threading.Event()
     inference_thread = threading.Thread(
         target=_inference_loop, args=(shutdown,), daemon=True, name="inference"
     )
     inference_thread.start()
+
+    # Start wandb system metrics thread on P0
+    if pid == 0 and _wandb is not None and _wandb.run is not None:
+        wandb_thread = threading.Thread(
+            target=_wandb_system_loop, args=(shutdown,), daemon=True, name="wandb-system"
+        )
+        wandb_thread.start()
 
     if pid == 0:
         # Server process: run the HTTP server in the main thread
