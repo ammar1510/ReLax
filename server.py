@@ -98,7 +98,7 @@ def _format_chat_prompt(messages: List[ChatMessage], tok) -> List[int]:
         parts.append(f"<|start_header_id|>{msg.role}<|end_header_id|>\n\n{msg.content}<|eot_id|>")
     # Open the assistant turn so the model continues from here
     parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
-    return tok.encode("".join(parts), bos=False, eos=False)
+    return tok.encode("".join(parts), bos=False, eos=False, allowed_special="all")
 
 
 # -- Health ------------------------------------------------------------------
