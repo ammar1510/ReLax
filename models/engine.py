@@ -211,6 +211,7 @@ class InferenceEngine:
         self.cache_updater = cache_updater or self._default_cache_updater
         self.mask_cache_extractor = mask_cache_extractor or (lambda c: c)
         self.place_cache = place_cache or (lambda c, m: MeshHelper.place_kv_cache(c, m))
+        self.init_cache = lambda c, m: MeshHelper.init_kv_cache_on_mesh(c, m)
 
         sample_fn = self.sampler
 
@@ -293,7 +294,7 @@ class InferenceEngine:
             cache = self.cache_factory(bsz, max_seqlen=bucket_size)
         except TypeError:
             cache = self.cache_factory(bsz)
-        cache = self.place_cache(cache, self.mesh)
+        cache = self.init_cache(cache, self.mesh)
 
         tokens = MeshHelper.put_on_mesh(
             tokens,
@@ -418,7 +419,7 @@ class InferenceEngine:
             Tuple of (cache, tokens) placed on the mesh
         """
         cache = self.cache_factory(self.max_slots, max_seqlen=self.max_cache_seqlen)
-        cache = self.place_cache(cache, self.mesh)
+        cache = self.init_cache(cache, self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = MeshHelper.put_on_mesh(

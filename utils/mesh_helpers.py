@@ -105,36 +105,57 @@ class MeshHelper:
         return jax.make_array_from_callback(shape, sharding, _zeros_cb)
 
     @staticmethod
-    def place_kv_cache(
+    def _kv_cache_specs(cache: KVCache, mesh: Mesh, pspec: Optional[PS] = None):
+        """Compute partition specs for KV cache placement."""
+        if pspec is not None:
+            return pspec, pspec, pspec
+        dp = "dp" if "dp" in mesh.axis_names else None
+        tp = MeshHelper.get_tp_axis(mesh)
+        if dp is not None:
+            return PS(None, dp, tp, None, None), PS(None, dp, tp, None, None), PS(dp)
+        k_spec = MeshHelper.batch_axis_spec(
+            mesh, rank=len(cache.k.shape), batch_axis=1
+        )
+        v_spec = MeshHelper.batch_axis_spec(
+            mesh, rank=len(cache.k.shape), batch_axis=1
+        )
+        pos_spec = MeshHelper.batch_axis_spec(
+            mesh, rank=len(cache.seq_positions.shape), batch_axis=0
+        )
+        return k_spec, v_spec, pos_spec
+
+    @staticmethod
+    def init_kv_cache_on_mesh(
         cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
     ) -> KVCache:
-        """Place a KV cache on a mesh with appropriate sharding.
+        """Create a zero KV cache sharded on mesh without allgather.
+
+        Use this for initialization only — the cache values are ignored and
+        replaced with zeros placed directly on each device shard.
         """
         if mesh is None:
             return cache
+        k_spec, v_spec, pos_spec = MeshHelper._kv_cache_specs(cache, mesh, pspec)
+        return KVCache(
+            k=MeshHelper.create_sharded_zeros(cache.k.shape, cache.k.dtype, mesh, k_spec),
+            v=MeshHelper.create_sharded_zeros(cache.v.shape, cache.v.dtype, mesh, v_spec),
+            seq_positions=MeshHelper.create_sharded_zeros(
+                cache.seq_positions.shape, cache.seq_positions.dtype, mesh, pos_spec
+            ),
+        )
 
-        if pspec is None:
-            dp = "dp" if "dp" in mesh.axis_names else None
-            tp = MeshHelper.get_tp_axis(mesh)
-            if dp is not None:
-                k_spec = PS(None, dp, tp, None, None)
-                v_spec = PS(None, dp, tp, None, None)
-                pos_spec = PS(dp)
-            else:
-                k_spec = MeshHelper.batch_axis_spec(
-                    mesh, rank=len(cache.k.shape), batch_axis=1
-                )
-                v_spec = MeshHelper.batch_axis_spec(
-                    mesh, rank=len(cache.k.shape), batch_axis=1
-                )
-                pos_spec = MeshHelper.batch_axis_spec(
-                    mesh, rank=len(cache.seq_positions.shape), batch_axis=0
-                )
-        else:
-            k_spec = pspec
-            v_spec = pspec
-            pos_spec = pspec
+    @staticmethod
+    def place_kv_cache(
+        cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
+    ) -> KVCache:
+        """Re-shard an existing KV cache on a mesh, preserving data.
 
+        Use this for re-sharding after cache mutations (e.g. prefill insertion).
+        For initial zero cache creation, use init_kv_cache_on_mesh instead.
+        """
+        if mesh is None:
+            return cache
+        k_spec, v_spec, pos_spec = MeshHelper._kv_cache_specs(cache, mesh, pspec)
         return KVCache(
             k=MeshHelper.put_on_mesh(cache.k, mesh, k_spec),
             v=MeshHelper.put_on_mesh(cache.v, mesh, v_spec),
