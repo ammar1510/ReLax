@@ -29,7 +29,6 @@ from jax import jit
 
 from jax import random
 
-from models.llama.model import LLaMa
 from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
 from utils.ops import build_attn_mask
@@ -128,7 +127,7 @@ class DecodeWork:
     """
 
     curr_tokens: jax.Array
-    cache: KVCache
+    cache: Any
     active_results: list[Optional[DecodeResult]]
 
 
@@ -137,12 +136,10 @@ class PrefillWork:
     """State for prefill queue management.
 
     Attributes:
-        requests: New requests waiting to be triaged
         to_prefill: Requests queued for prefill
         to_decode: Prefilled results waiting for decode slots
     """
 
-    requests: list[UserRequestPrompt]
     to_prefill: list[UserRequestPrompt]
     to_decode: list[PrefillResult]
 
@@ -161,7 +158,7 @@ class InferenceEngine:
 
     def __init__(
         self,
-        model: LLaMa,
+        model,
         params: FrozenDict,
         mesh: Mesh,
         max_concurrent_slots: int = 8,
@@ -169,11 +166,16 @@ class InferenceEngine:
         sampler: Optional[callable] = None,
         rng_seed: int = 0,
         max_cache_seqlen: Optional[int] = None,
+        cache_factory: Optional[callable] = None,
+        cache_slicer: Optional[callable] = None,
+        cache_updater: Optional[callable] = None,
+        mask_cache_extractor: Optional[callable] = None,
+        place_cache: Optional[callable] = None,
     ):
         """Initialize the inference engine.
 
         Args:
-            model: LLaMa model instance
+            model: Model instance (LLaMa, Qwen, or any duck-typed model)
             params: Model parameters (Flax FrozenDict)
             mesh: JAX mesh for sharded computation
             max_concurrent_slots: Maximum number of sequences to generate concurrently
@@ -181,6 +183,11 @@ class InferenceEngine:
             sampler: Sample function (logits, key) -> token_ids (default: greedy)
             rng_seed: Seed for PRNG key used in stochastic sampling
             max_cache_seqlen: Override model's max_seqlen for KV cache allocation
+            cache_factory: (bsz) -> cache. Defaults to KVCache.new().
+            cache_slicer: (cache, idx) -> single_cache. Defaults to KVCache slicing.
+            cache_updater: (decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens) -> (cache, tokens).
+            mask_cache_extractor: (cache) -> kv_cache_for_mask. Defaults to identity.
+            place_cache: (cache, mesh) -> cache. Defaults to MeshHelper.place_kv_cache.
         """
         self.model = model
         self.max_slots = max_concurrent_slots
@@ -198,46 +205,66 @@ class InferenceEngine:
         # Cache model config for convenience
         self.config = model.args
 
+        # Cache callbacks (default to KVCache behavior)
+        self.cache_factory = cache_factory or self._default_cache_factory
+        self.cache_slicer = cache_slicer or self._default_cache_slicer
+        self.cache_updater = cache_updater or self._default_cache_updater
+        self.mask_cache_extractor = mask_cache_extractor or (lambda c: c)
+        self.place_cache = place_cache or (lambda c, m: MeshHelper.place_kv_cache(c, m))
+        self.init_cache = lambda c, m: MeshHelper.init_kv_cache_on_mesh(c, m)
+
         sample_fn = self.sampler
 
         # Create jitted core function for batched prefill logic
         @jit
-        def _jitted_prefill_core(params, tokens, true_lengths, kv_cache, mask, rng_key):
-            """Jitable core logic for batched prefill.
-
-            Args:
-                params: Model parameters
-                tokens: Batched tokens [bsz, seqlen]
-                true_lengths: True lengths for each sequence [bsz]
-                kv_cache: KV cache for batch
-                mask: Attention mask
-                rng_key: PRNG key for sampling
-
-            Returns:
-                Tuple of (updated_cache, next_tokens)
-            """
-            # Forward pass through model
+        def _jitted_prefill_core(params, tokens, true_lengths, cache, mask, rng_key):
+            # Forward pass through model (positional args for model-agnostic call)
             logits, updated_cache = self.model.apply(
                 {"params": params},
                 tokens,
-                true_lengths=true_lengths,
-                kv_cache=kv_cache,
-                mask=mask,
+                true_lengths,
+                cache,
+                mask,
             )
 
-            # Batched logit extraction using take_along_axis
-            # logits: [bsz, bucket_size, vocab_size]
             # Extract logit at position (true_length - 1) for each sequence
             indices = (true_lengths - 1)[:, None, None]  # [bsz, 1, 1]
-            last_logits = jnp.take_along_axis(logits, indices, axis=1).squeeze(
-                1
-            )  # [bsz, vocab_size]
+            last_logits = jnp.take_along_axis(logits, indices, axis=1).squeeze(1)
 
             next_tokens = sample_fn(last_logits, rng_key)  # [bsz]
 
             return updated_cache, next_tokens
 
         self._jitted_prefill_core = _jitted_prefill_core
+
+    def _default_cache_factory(self, bsz, max_seqlen):
+        return KVCache.new(
+            n_layers=self.config.n_layers,
+            bsz=bsz,
+            max_seqlen=max_seqlen,
+            kv_heads=self.config.n_kv_heads,
+            head_dim=self.config.head_dim,
+            dtype=jnp.dtype(self.config.dtype),
+        )
+
+    def _default_cache_slicer(self, cache, idx):
+        return KVCache(
+            k=cache.k[:, idx : idx + 1, :, :, :],
+            v=cache.v[:, idx : idx + 1, :, :, :],
+            seq_positions=cache.seq_positions[idx : idx + 1],
+        )
+
+    def _default_cache_updater(self, decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens):
+        idx = jnp.array(slot_idxs)
+        prefill_seqlen = entries[0].k.shape[3]
+        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)
+        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
+        # Only write the first prefill_seqlen positions into the decode cache
+        new_k = decode_cache.k.at[:, idx, :, :prefill_seqlen, :].set(stacked_k)
+        new_v = decode_cache.v.at[:, idx, :, :prefill_seqlen, :].set(stacked_v)
+        new_positions = decode_cache.seq_positions.at[idx].set(jnp.array(lens))
+        new_tokens = curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
+        return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
 
     def prefill(
         self,
@@ -263,15 +290,11 @@ class InferenceEngine:
         """
         bsz, bucket_size = tokens.shape
 
-        kv_cache = KVCache.new(
-            n_layers=self.config.n_layers,
-            bsz=bsz,
-            max_seqlen=self.max_cache_seqlen,
-            kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.head_dim,
-            dtype=jnp.dtype(self.config.dtype),
-        )
-        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
+        try:
+            cache = self.cache_factory(bsz, max_seqlen=bucket_size)
+        except TypeError:
+            cache = self.cache_factory(bsz)
+        cache = self.init_cache(cache, self.mesh)
 
         tokens = MeshHelper.put_on_mesh(
             tokens,
@@ -284,14 +307,14 @@ class InferenceEngine:
             MeshHelper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
-        mask = build_attn_mask(bucket_size, kv_cache, true_lengths)
+        mask = build_attn_mask(bucket_size, self.mask_cache_extractor(cache), true_lengths)
 
         self.rng_key, subkey = random.split(self.rng_key)
         updated_cache, next_tokens = self._jitted_prefill_core(
             self.params,
             tokens,
             true_lengths,
-            kv_cache,
+            cache,
             mask,
             subkey,
         )
@@ -315,8 +338,9 @@ class InferenceEngine:
         """
         engine = self
 
-        # Capture sample_fn for use inside JIT
+        # Capture callbacks for use inside JIT
         sample_fn = self.sampler
+        mask_extractor = self.mask_cache_extractor
 
         @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
         def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
@@ -345,7 +369,7 @@ class InferenceEngine:
 
                 # Build attention mask
                 bsz, seqlen = curr_tokens.shape
-                mask = build_attn_mask(seqlen, cache, true_lengths)
+                mask = build_attn_mask(seqlen, mask_extractor(cache), true_lengths)
 
                 # Forward pass — params passed from outer scope (JIT arg, not closure capture)
                 logits, updated_cache = engine.model.apply(
@@ -388,21 +412,14 @@ class InferenceEngine:
 
         return multistep_decode_fn
 
-    def init_decode_state(self) -> tuple[KVCache, jax.Array]:
+    def init_decode_state(self) -> tuple[Any, jax.Array]:
         """Initialize empty decode state with all slots inactive.
 
         Returns:
-            Tuple of (kv_cache, tokens) placed on the mesh
+            Tuple of (cache, tokens) placed on the mesh
         """
-        kv_cache = KVCache.new(
-            n_layers=self.config.n_layers,
-            bsz=self.max_slots,
-            max_seqlen=self.max_cache_seqlen,
-            kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.head_dim,
-            dtype=jnp.dtype(self.config.dtype),
-        )
-        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
+        cache = self.cache_factory(self.max_slots, max_seqlen=self.max_cache_seqlen)
+        cache = self.init_cache(cache, self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = MeshHelper.put_on_mesh(
@@ -411,7 +428,7 @@ class InferenceEngine:
             MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0),
         )
 
-        return kv_cache, tokens
+        return cache, tokens
 
 
 ########################################################################################################################
@@ -447,20 +464,30 @@ class ServingLoop:
     def __init__(
         self,
         serve_cfg: ServingConfig,
-        model: LLaMa,
+        model,
         params: FrozenDict,
         mesh: Mesh,
         is_server: bool = False,
         verbose: bool = False,
+        cache_factory: Optional[callable] = None,
+        cache_slicer: Optional[callable] = None,
+        cache_updater: Optional[callable] = None,
+        mask_cache_extractor: Optional[callable] = None,
+        place_cache: Optional[callable] = None,
     ):
         """Initialize the serving loop.
 
         Args:
             serve_cfg: Serving configuration
-            model: LLaMa model instance
+            model: Model instance (LLaMa, Qwen, or any duck-typed model)
             params: Model parameters
             mesh: JAX mesh for sharded computation
             is_server: Whether this process is the server (receives requests)
+            cache_factory: Cache factory callback (forwarded to InferenceEngine)
+            cache_slicer: Cache slicer callback (forwarded to InferenceEngine)
+            cache_updater: Cache updater callback (forwarded to InferenceEngine)
+            mask_cache_extractor: Mask cache extractor callback (forwarded to InferenceEngine)
+            place_cache: Cache placement callback (forwarded to InferenceEngine)
         """
         self.serve_cfg = serve_cfg
         self.model = model
@@ -477,6 +504,11 @@ class ServingLoop:
             sampler=serve_cfg.sampler,
             rng_seed=serve_cfg.rng_seed,
             max_cache_seqlen=serve_cfg.max_cache_seqlen,
+            cache_factory=cache_factory,
+            cache_slicer=cache_slicer,
+            cache_updater=cache_updater,
+            mask_cache_extractor=mask_cache_extractor,
+            place_cache=place_cache,
         )
 
         # Initialize decode state
@@ -497,7 +529,7 @@ class ServingLoop:
         self.decode_output = (None, None)
 
         # Setup prefill work
-        self.prefill_work = PrefillWork([], [], [])
+        self.prefill_work = PrefillWork([], [])
 
         # Results tracking
         self.results = {}  # request_id -> DecodeResult
@@ -601,14 +633,7 @@ class ServingLoop:
         Returns:
             Dict with single-sequence cache matching prefill() output format
         """
-        cache = batched_result["cache"]
-
-        # Slice KV cache at batch dimension
-        single_cache = KVCache(
-            k=cache.k[:, idx : idx + 1, :, :, :],
-            v=cache.v[:, idx : idx + 1, :, :, :],
-            seq_positions=cache.seq_positions[idx : idx + 1],
-        )
+        single_cache = self.engine.cache_slicer(batched_result["cache"], idx)
 
         return {
             "cache": single_cache,
@@ -627,21 +652,11 @@ class ServingLoop:
         """
         entries, slot_idxs, lens, next_tokens = map(list, zip(*batch_updates))
 
-        # Stack all single-sequence cache entries along batch dim
-        # Each entry.k/v is [n_layers, 1, kv_heads, max_seqlen, head_dim]
-        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)  # [n_layers, N, ...]
-        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
-
-        # Scatter all slots at once using advanced indexing
-        idx = jnp.array(slot_idxs)
-        new_k = self.decode_work.cache.k.at[:, idx, :, :, :].set(stacked_k)
-        new_v = self.decode_work.cache.v.at[:, idx, :, :, :].set(stacked_v)
-
-        # Update positions and tokens in one go
-        new_positions = self.decode_work.cache.seq_positions.at[idx].set(jnp.array(lens))
-        new_tokens = self.decode_work.curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
-
-        self.decode_work.cache = KVCache(k=new_k, v=new_v, seq_positions=new_positions)
+        new_cache, new_tokens = self.engine.cache_updater(
+            self.decode_work.cache, entries, slot_idxs, lens, next_tokens,
+            self.decode_work.curr_tokens,
+        )
+        self.decode_work.cache = new_cache
         self.decode_work.curr_tokens = new_tokens
 
     def _check_done_sequences(self, output_tokens: np.ndarray) -> list[bool]:
@@ -713,7 +728,8 @@ class ServingLoop:
                     break
 
                 result: PrefillResult = self.prefill_work.to_decode.pop(0)
-                self.decode_work.active_results[i] = DecodeResult(result.id, [])
+                first_token = int(result.next_token)
+                self.decode_work.active_results[i] = DecodeResult(result.id, [first_token], tokens_decoded=1)
                 self.results[result.id] = self.decode_work.active_results[i]
                 batch_updates.append((result.cache_entry, i, result.len, result.next_token))
 
@@ -721,7 +737,7 @@ class ServingLoop:
             if "worker" in self.roles and len(batch_updates) > 0:
                 self._update_cache_and_index(batch_updates)
                 # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
-                self.decode_work.cache = MeshHelper.place_kv_cache(
+                self.decode_work.cache = self.engine.place_cache(
                     self.decode_work.cache, self.mesh
                 )
                 self.decode_work.curr_tokens = MeshHelper.put_on_mesh(
@@ -805,10 +821,10 @@ class ServingLoop:
 
     def prefill_step(self):
         """One prefill iteration: batch prefill pending requests."""
-        # Triage new requests (move from requests to to_prefill)
-        while len(self.prefill_work.requests) > 0:
-            request = self.prefill_work.requests.pop(0)
-            self.prefill_work.to_prefill.append(request)
+        # Backpressure: don't prefill if too many results are waiting for decode slots
+        if len(self.prefill_work.to_decode) >= self.serve_cfg.decode_batch_size:
+            self._log(f"prefill: backpressure ({len(self.prefill_work.to_decode)} queued, skipping)")
+            return
 
         # Process up to prefill_batch_size requests
         prefill_batch = self.prefill_work.to_prefill[: self.serve_cfg.prefill_batch_size]
@@ -835,9 +851,15 @@ class ServingLoop:
             tokens_list.append(padded)
             true_lengths_list.append(len(req.text))
 
-        # Create batched inputs
-        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [bsz, bucket_size]
-        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [bsz]
+        # Pad batch to prefill_batch_size so batch dim is divisible by dp axis
+        actual_bsz = len(tokens_list)
+        target_bsz = self.serve_cfg.prefill_batch_size
+        for _ in range(target_bsz - actual_bsz):
+            tokens_list.append(np.zeros_like(tokens_list[0]))
+            true_lengths_list.append(0)
+
+        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [target_bsz, bucket_size]
+        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [target_bsz]
 
         # Call prefill
         self._log(f"prefill: calling engine.prefill (shape={batched_tokens.shape})")
@@ -893,7 +915,7 @@ class ServingLoop:
 
         # Add new requests to prefill queue
         for req in requests or []:
-            self.prefill_work.requests.append(UserRequestPrompt(**req))
+            self.prefill_work.to_prefill.append(UserRequestPrompt(**req))
 
         # Execute decode and prefill
         self._log("entering decode_step")
@@ -901,6 +923,10 @@ class ServingLoop:
         self._log("entering prefill_step")
         self.prefill_step()
         self._log("serving_step done")
+
+    def pending_prefill_count(self) -> int:
+        """Return the number of requests waiting to be prefilled."""
+        return len(self.prefill_work.to_prefill)
 
     def add_request(self, request: UserRequestPrompt):
         """Add new request (thread-safe).

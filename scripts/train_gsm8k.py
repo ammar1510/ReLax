@@ -17,11 +17,7 @@ import numpy as np
 from jax.sharding import Mesh
 from datasets import load_dataset
 
-try:
-    import wandb
-    _WANDB_AVAILABLE = True
-except ImportError:
-    _WANDB_AVAILABLE = False
+import wandb
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
@@ -123,7 +119,7 @@ def main():
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    use_wandb = _WANDB_AVAILABLE and not args.no_wandb and is_main
+    use_wandb = not args.no_wandb and is_main
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -142,8 +138,6 @@ def main():
                 "model_path": args.model_path,
             },
         )
-    elif not _WANDB_AVAILABLE and not args.no_wandb and is_main:
-        print("wandb not installed; skipping W&B logging. Install with: pip install wandb")
 
     print(f"Loading model from {args.model_path}...")
     config = dataclasses.replace(ModelConfig.from_json_file(args.model_path), max_seqlen=8192)

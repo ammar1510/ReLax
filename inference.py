@@ -86,7 +86,7 @@ def load_model(model_path: str, config_path: Optional[str] = None):
 
 def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
-    return tokenizer.encode(formatted_prompt, bos=False, eos=False)
+    return tokenizer.encode(formatted_prompt, bos=False, eos=False, allowed_special="all")
 
 
 def generate_batch(

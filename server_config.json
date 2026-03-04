@@ -1,0 +1,9 @@
+{
+  "port": 8080,
+  "tp": 4,
+  "max_decode_length": 8192,
+  "decode_batch_size": 16,
+  "prefill_batch_size": 4,
+  "decode_steps": 10,
+  "max_pending_requests":1000
+}

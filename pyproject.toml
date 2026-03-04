@@ -9,9 +9,13 @@ dependencies = [
   "safetensors",
   "huggingface",
   "datasets",
+  "wandb",
   "orbax-checkpoint",
   "factorio-learning-environment>=0.3.0",
   "gymnasium>=1.2.3",
+  "fastapi",
+  "uvicorn[standard]",
+  "google-cloud-storage"
 ]
 
 [project.optional-dependencies]
