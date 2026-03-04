@@ -400,7 +400,7 @@ class GRPOTrainer(Trainer):
             head_dim=self.config.head_dim,
             dtype=jnp.bfloat16,
         )
-        kv_cache = MeshHelper.place_kv_cache(kv_cache, self.mesh)
+        kv_cache = MeshHelper.init_kv_cache_on_mesh(kv_cache, self.mesh)
 
         attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
 
