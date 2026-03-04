@@ -2,28 +2,32 @@
 Memory-efficient script to convert Qwen3.5 MoE safetensors weights to an
 Orbax checkpoint on GCS.
 
-Two-pass approach:
-  Pass 1 — Stream each tensor from safetensors, apply the HF→ReLax
-           transformation (transpose, reshape, etc.), and save as a .npy
-           file on local disk.  Only one tensor is in RAM at a time.
-  Pass 2 — Memory-map every .npy file, assemble the ReLax pytree, and let
-           Orbax stream chunks to GCS.
+Downloads safetensors shards from HuggingFace one at a time, extracts and
+transforms each tensor into a local .npy file, then deletes the shard.
+After all shards are processed, memory-maps the .npy files and streams
+the assembled pytree to GCS via Orbax.
 
 Usage:
+    # Dry run — print HF→ReLax key mappings and shapes (downloads 1 tensor
+    # per shard at most, lightweight):
+    python scripts/orbax_load.py --repo Qwen/Qwen3.5-MoE --dry_run
+
+    # Full conversion:
     python scripts/orbax_load.py \
-        --model_path /path/to/downloaded/model \
-        --gcs_path gs://my-bucket/qwen3.5-orbax \
-        [--temp_dir ./temp_npy_weights]
+        --repo Qwen/Qwen3.5-MoE \
+        --gcs_path gs://my-bucket/qwen3.5-orbax
 """
 
 import argparse
 import gc
 import os
+import shutil
 from pathlib import Path
 
 import ml_dtypes  # noqa: F401 – registers bfloat16 with numpy
 import numpy as np
 import orbax.checkpoint as ocp
+from huggingface_hub import HfApi, hf_hub_download
 from safetensors import safe_open
 
 # ---------------------------------------------------------------------------
@@ -40,11 +44,6 @@ _HF_PREFIX = "model.language_model.layers"
 
 
 # ---- helpers ---------------------------------------------------------------
-
-
-def _relax_key(parts: list[str]) -> str:
-    """Join parts into a dot-separated ReLax pytree key."""
-    return ".".join(parts)
 
 
 def _transform(tensor: np.ndarray, *, transpose: bool = False,
@@ -159,24 +158,47 @@ def _insert_into_pytree(tree: dict, dotted_key: str, value):
     tree[parts[-1]] = value
 
 
+# ---- HuggingFace helpers ---------------------------------------------------
+
+def _list_safetensor_files(repo_id: str) -> list[str]:
+    """List all .safetensors filenames in a HF repo."""
+    api = HfApi()
+    files = api.list_repo_files(repo_id)
+    return sorted(f for f in files if f.endswith(".safetensors"))
+
+
+def _download_config(repo_id: str, cache_dir: Path) -> Path:
+    """Download config.json from a HF repo, return local path."""
+    return Path(hf_hub_download(
+        repo_id, "config.json", local_dir=cache_dir,
+    ))
+
+
 # ---- main ------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Qwen3.5 MoE safetensors to Orbax on GCS"
     )
-    parser.add_argument("--model_path", required=True,
-                        help="Directory with *.safetensors and config.json")
-    parser.add_argument("--gcs_path", required=True,
+    parser.add_argument("--repo", required=True,
+                        help="HuggingFace repo id, e.g. Qwen/Qwen3.5-MoE")
+    parser.add_argument("--gcs_path",
                         help="GCS destination, e.g. gs://bucket/checkpoint")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Only print HF→ReLax key mappings and shapes, skip writing")
     args = parser.parse_args()
 
-    model_path = Path(args.model_path)
+    if not args.dry_run and not args.gcs_path:
+        parser.error("--gcs_path is required unless --dry_run is set")
+
     temp_dir = Path("./temp_npy_weights")
+    download_dir = Path("./temp_hf_download")
     target_dtype = ml_dtypes.bfloat16
 
-    # Load config
-    config = QwenConfig.from_json_file(str(model_path))
+    # Download config.json
+    os.makedirs(download_dir, exist_ok=True)
+    config_path = _download_config(args.repo, download_dir)
+    config = QwenConfig.from_json_file(str(config_path.parent))
     print(f"Config: {config.n_layers} layers, {config.num_experts} experts, "
           f"dim={config.dim}, head_dim={config.head_dim}")
 
@@ -184,21 +206,29 @@ def main():
     key_map = _build_key_map(config)
     print(f"Key map has {len(key_map)} entries")
 
-    safetensor_files = sorted(model_path.glob("*.safetensors"))
-    if not safetensor_files:
-        raise FileNotFoundError(f"No safetensors files in {model_path}")
-    print(f"Found {len(safetensor_files)} safetensors file(s)")
-
-    os.makedirs(temp_dir, exist_ok=True)
+    shard_filenames = _list_safetensor_files(args.repo)
+    if not shard_filenames:
+        raise FileNotFoundError(f"No safetensors files in repo {args.repo}")
+    print(f"Found {len(shard_filenames)} safetensors file(s) in {args.repo}")
 
     # ------------------------------------------------------------------
-    # PASS 1: extract, transform, save to local .npy (one tensor at a time)
+    # PASS 1: download each shard, extract + transform, delete shard
     # ------------------------------------------------------------------
-    print("\n--- PASS 1: Extract + transform → local .npy ---")
+    if args.dry_run:
+        print("\n--- DRY RUN: HF key → ReLax key + shape ---")
+    else:
+        print("\n--- PASS 1: Download + extract + transform → local .npy ---")
+        os.makedirs(temp_dir, exist_ok=True)
+
     seen_relax_keys: set[str] = set()
 
-    for sf in safetensor_files:
-        with safe_open(str(sf), framework="np", device="cpu") as f:
+    for shard_name in shard_filenames:
+        print(f"\n  Downloading {shard_name} ...")
+        local_shard = Path(hf_hub_download(
+            args.repo, shard_name, local_dir=download_dir,
+        ))
+
+        with safe_open(str(local_shard), framework="np", device="cpu") as f:
             for hf_key in f.keys():
                 if hf_key not in key_map:
                     print(f"  [SKIP] Unknown HF key: {hf_key}")
@@ -210,22 +240,34 @@ def main():
                 tensor = _transform(tensor, **xform_kw)
                 tensor = tensor.astype(target_dtype)
 
-                npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-                np.save(str(npy_path), tensor)
-                seen_relax_keys.add(relax_key)
+                if args.dry_run:
+                    print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
+                else:
+                    npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+                    np.save(str(npy_path), tensor)
 
+                seen_relax_keys.add(relax_key)
                 del tensor
 
+        # Delete the shard to reclaim disk space
+        local_shard.unlink(missing_ok=True)
         gc.collect()
-        print(f"  Processed {sf.name}")
+        if not args.dry_run:
+            print(f"  Processed and deleted {shard_name}")
 
     # Sanity check
-    expected = set(key_map.values().__iter__().__class__.__name__)  # just count
     missing = set(v[0] for v in key_map.values()) - seen_relax_keys
     if missing:
         print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
         for m in sorted(missing)[:20]:
             print(f"    {m}")
+
+    # Clean up download directory
+    shutil.rmtree(download_dir, ignore_errors=True)
+
+    if args.dry_run:
+        print(f"\nTotal: {len(seen_relax_keys)} tensors mapped")
+        return
 
     # ------------------------------------------------------------------
     # PASS 2: mmap .npy files, build pytree, stream to GCS via Orbax
@@ -255,6 +297,10 @@ def main():
     mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
     mngr.wait_until_finished()
     print("Upload complete!")
+
+    # Clean up .npy temp files
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    print("Cleaned up temp files.")
 
 
 if __name__ == "__main__":
