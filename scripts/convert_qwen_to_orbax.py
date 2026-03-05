@@ -1,118 +1,306 @@
-"""Convert Qwen safetensors weights to orbax checkpoint on GCS.
+"""
+Memory-efficient script to convert Qwen3.5 MoE safetensors weights to an
+Orbax checkpoint on GCS.
 
-One-time script: loads weights from local safetensors files, shards them
-onto the device mesh, and saves as an orbax checkpoint to a GCS bucket
-(or local path). Subsequent inference runs can then load directly from
-the orbax checkpoint, avoiding repeated safetensors parsing.
+Downloads safetensors shards from HuggingFace one at a time, extracts and
+transforms each tensor into a local .npy file, then deletes the shard.
+After all shards are processed, memory-maps the .npy files and streams
+the assembled pytree to GCS via Orbax.
 
-This script must be run on all hosts (each host saves its own shards).
+Usage:
+    # Dry run — print HF→ReLax key mappings and shapes (downloads 1 tensor
+    # per shard at most, lightweight):
+    python scripts/orbax_load.py --repo Qwen/Qwen3.5-MoE --dry_run
 
-Usage (run on each host):
-    python scripts/convert_qwen_to_orbax.py \
-        --model_path /path/to/Qwen3.5-MoE \
-        --output_path gs://your-bucket/qwen-orbax-ckpt
-
-    # Or to a local path:
-    python scripts/convert_qwen_to_orbax.py \
-        --model_path /path/to/Qwen3.5-MoE \
-        --output_path /local/orbax_ckpt
+    # Full conversion:
+    python scripts/orbax_load.py \
+        --repo Qwen/Qwen3.5-MoE \
+        --gcs_path gs://my-bucket/qwen3.5-orbax
 """
 
 import argparse
-import sys
-import time
+import gc
+import os
+import shutil
+from pathlib import Path
 
-import jax
-import jax.numpy as jnp
+import ml_dtypes  # noqa: F401 – registers bfloat16 with numpy
 import numpy as np
-from jax.sharding import Mesh
+import orbax.checkpoint as ocp
+from huggingface_hub import HfApi, hf_hub_download
+from safetensors import safe_open
 
+# ---------------------------------------------------------------------------
+# We import QwenConfig so we know the exact shapes and layer types.
+# ---------------------------------------------------------------------------
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.qwen.config import QwenConfig
-from models.qwen.load import load_qwen_weights, save_orbax_weights
 
+
+# ---- HF key prefix for Qwen3.5 MoE text backbone -------------------------
+_HF_PREFIX = "model.language_model.layers"
+
+
+# ---- helpers ---------------------------------------------------------------
+
+
+def _transform(tensor: np.ndarray, *, transpose: bool = False,
+               reshape: tuple | None = None,
+               squeeze_axis: int | None = None) -> np.ndarray:
+    if squeeze_axis is not None:
+        tensor = tensor.squeeze(axis=squeeze_axis)
+    if transpose:
+        tensor = tensor.T
+    if reshape is not None:
+        tensor = tensor.reshape(reshape)
+    return tensor
+
+
+# ---- per-key transformation table ------------------------------------------
+
+def _build_key_map(config: QwenConfig):
+    """Return a dict mapping every HF key to (relax_key, transform_kwargs).
+
+    This mirrors the logic in models/qwen/load.py but produces flat
+    (dot-separated) ReLax keys so we can save each tensor independently.
+    """
+    key_map: dict[str, tuple[str, dict]] = {}
+
+    # --- embeddings & head ---
+    key_map["model.language_model.embed_tokens.weight"] = (
+        "tok_embeddings.embedding", {}
+    )
+    key_map["lm_head.weight"] = (
+        "output", {"transpose": True}
+    )
+    key_map["model.language_model.norm.weight"] = (
+        "norm_weight", {}
+    )
+
+    # --- per-layer ---
+    for i in range(config.n_layers):
+        pfx = f"{_HF_PREFIX}.{i}"
+        lt = config.layer_types[i]
+        lk = f"layer_{i}"
+
+        # ---- attention ----
+        if lt == "full_attention":
+            attn = f"{pfx}.self_attn"
+            key_map[f"{attn}.q_proj.weight"] = (
+                f"{lk}.wq",
+                {"transpose": True, "reshape": (config.dim, config.n_heads, config.head_dim * 2)},
+            )
+            key_map[f"{attn}.k_proj.weight"] = (
+                f"{lk}.wk",
+                {"transpose": True, "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
+            )
+            key_map[f"{attn}.v_proj.weight"] = (
+                f"{lk}.wv",
+                {"transpose": True, "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
+            )
+            key_map[f"{attn}.o_proj.weight"] = (
+                f"{lk}.wo", {"transpose": True},
+            )
+            key_map[f"{attn}.q_norm.weight"] = (f"{lk}.q_norm", {})
+            key_map[f"{attn}.k_norm.weight"] = (f"{lk}.k_norm", {})
+        else:
+            # linear attention (Gated DeltaNet)
+            attn = f"{pfx}.linear_attn"
+            for proj in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+                key_map[f"{attn}.{proj}.weight"] = (
+                    f"{lk}.{proj}", {"transpose": True},
+                )
+            key_map[f"{attn}.conv1d.weight"] = (
+                f"{lk}.conv1d_weight", {"squeeze_axis": 1},
+            )
+            key_map[f"{attn}.dt_bias"] = (f"{lk}.dt_bias", {})
+            key_map[f"{attn}.A_log"] = (f"{lk}.A_log", {})
+            key_map[f"{attn}.norm.weight"] = (f"{lk}.norm_weight", {})
+
+        # ---- MoE (every layer) ----
+        mlp = f"{pfx}.mlp"
+        key_map[f"{mlp}.gate.weight"] = (f"{lk}.router_weight", {})
+        key_map[f"{mlp}.experts.gate_up_proj"] = (f"{lk}.expert_gate_up", {})
+        key_map[f"{mlp}.experts.down_proj"] = (f"{lk}.expert_down", {})
+        key_map[f"{mlp}.shared_expert.gate_proj.weight"] = (
+            f"{lk}.shared_gate", {"transpose": True},
+        )
+        key_map[f"{mlp}.shared_expert.up_proj.weight"] = (
+            f"{lk}.shared_up", {"transpose": True},
+        )
+        key_map[f"{mlp}.shared_expert.down_proj.weight"] = (
+            f"{lk}.shared_down", {"transpose": True},
+        )
+        key_map[f"{mlp}.shared_expert_gate.weight"] = (
+            f"{lk}.shared_expert_gate", {"transpose": True},
+        )
+
+        # ---- layer norms ----
+        key_map[f"{pfx}.input_layernorm.weight"] = (
+            f"{lk}.attention_norm_weight", {},
+        )
+        key_map[f"{pfx}.post_attention_layernorm.weight"] = (
+            f"{lk}.ffn_norm_weight", {},
+        )
+
+    return key_map
+
+
+# ---- pytree builder --------------------------------------------------------
+
+def _insert_into_pytree(tree: dict, dotted_key: str, value):
+    """Insert *value* into a nested dict following a dot-separated key."""
+    parts = dotted_key.split(".")
+    for part in parts[:-1]:
+        tree = tree.setdefault(part, {})
+    tree[parts[-1]] = value
+
+
+# ---- HuggingFace helpers ---------------------------------------------------
+
+def _list_safetensor_files(repo_id: str) -> list[str]:
+    """List all .safetensors filenames in a HF repo."""
+    api = HfApi()
+    files = api.list_repo_files(repo_id)
+    return sorted(f for f in files if f.endswith(".safetensors"))
+
+
+def _download_config(repo_id: str, cache_dir: Path) -> Path:
+    """Download config.json from a HF repo, return local path."""
+    return Path(hf_hub_download(
+        repo_id, "config.json", local_dir=cache_dir,
+    ))
+
+
+# ---- main ------------------------------------------------------------------
 
 def main():
-    jax.distributed.initialize()
-
     parser = argparse.ArgumentParser(
-        description="Convert Qwen safetensors to orbax checkpoint (supports GCS)"
+        description="Convert Qwen3.5 MoE safetensors to Orbax on GCS"
     )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        required=True,
-        help="Path to Qwen model directory with *.safetensors and config.json",
-    )
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        required=True,
-        help="Output path for orbax checkpoint (local or gs://bucket/path)",
-    )
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        default=None,
-        help="Optional separate path to config.json directory",
-    )
-    parser.add_argument(
-        "--dp",
-        type=int,
-        default=4,
-        help="Data-parallel mesh dimension (default: 4)",
-    )
-    parser.add_argument(
-        "--tp",
-        type=int,
-        default=4,
-        help="Tensor-parallel mesh dimension (default: 4)",
-    )
+    parser.add_argument("--repo", required=True,
+                        help="HuggingFace repo id, e.g. Qwen/Qwen3.5-MoE")
+    parser.add_argument("--gcs_path",
+                        help="GCS destination, e.g. gs://bucket/checkpoint")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Only print HF→ReLax key mappings and shapes, skip writing")
     args = parser.parse_args()
 
-    is_main = jax.process_index() == 0
+    if not args.dry_run and not args.gcs_path:
+        parser.error("--gcs_path is required unless --dry_run is set")
 
-    # Load config
-    cfg_path = args.config_path or args.model_path
-    config = QwenConfig.from_json_file(cfg_path)
-    if is_main:
-        print(
-            f"Config: {config.n_layers} layers, {config.dim} dim, "
-            f"{config.n_heads} heads, {config.n_kv_heads} kv_heads, "
-            f"{config.num_experts} experts (top-{config.num_experts_per_tok}), "
-            f"full_attn={config.n_full_attn_layers}, "
-            f"linear_attn={config.n_linear_attn_layers}"
+    temp_dir = Path("./temp_npy_weights")
+    download_dir = Path("./temp_hf_download")
+    target_dtype = ml_dtypes.bfloat16
+
+    # Download config.json
+    os.makedirs(download_dir, exist_ok=True)
+    config_path = _download_config(args.repo, download_dir)
+    config = QwenConfig.from_json_file(str(config_path.parent))
+    print(f"Config: {config.n_layers} layers, {config.num_experts} experts, "
+          f"dim={config.dim}, head_dim={config.head_dim}")
+
+    # Build the mapping from HF keys → (relax_key, transform)
+    key_map = _build_key_map(config)
+    print(f"Key map has {len(key_map)} entries")
+
+    shard_filenames = _list_safetensor_files(args.repo)
+    if not shard_filenames:
+        raise FileNotFoundError(f"No safetensors files in repo {args.repo}")
+    print(f"Found {len(shard_filenames)} safetensors file(s) in {args.repo}")
+
+    # ------------------------------------------------------------------
+    # PASS 1: download each shard, extract + transform, delete shard
+    # ------------------------------------------------------------------
+    if args.dry_run:
+        print("\n--- DRY RUN: HF key → ReLax key + shape ---")
+    else:
+        print("\n--- PASS 1: Download + extract + transform → local .npy ---")
+        os.makedirs(temp_dir, exist_ok=True)
+
+    seen_relax_keys: set[str] = set()
+
+    for shard_name in shard_filenames:
+        print(f"\n  Downloading {shard_name} ...")
+        local_shard = Path(hf_hub_download(
+            args.repo, shard_name, local_dir=download_dir,
+        ))
+
+        with safe_open(str(local_shard), framework="np", device="cpu") as f:
+            for hf_key in f.keys():
+                if hf_key not in key_map:
+                    print(f"  [SKIP] Unknown HF key: {hf_key}")
+                    continue
+
+                relax_key, xform_kw = key_map[hf_key]
+
+                tensor = f.get_tensor(hf_key)
+                tensor = _transform(tensor, **xform_kw)
+                tensor = tensor.astype(target_dtype)
+
+                if args.dry_run:
+                    print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
+                else:
+                    npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+                    np.save(str(npy_path), tensor)
+
+                seen_relax_keys.add(relax_key)
+                del tensor
+
+        # Delete the shard to reclaim disk space
+        local_shard.unlink(missing_ok=True)
+        gc.collect()
+        if not args.dry_run:
+            print(f"  Processed and deleted {shard_name}")
+
+    # Sanity check
+    missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+    if missing:
+        print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
+        for m in sorted(missing)[:20]:
+            print(f"    {m}")
+
+    # Clean up download directory
+    shutil.rmtree(download_dir, ignore_errors=True)
+
+    if args.dry_run:
+        print(f"\nTotal: {len(seen_relax_keys)} tensors mapped")
+        return
+
+    # ------------------------------------------------------------------
+    # PASS 2: mmap .npy files, build pytree, stream to GCS via Orbax
+    # ------------------------------------------------------------------
+    print("\n--- PASS 2: Build lazy pytree → Orbax to GCS ---")
+    jax_pytree: dict = {}
+
+    for relax_key in sorted(seen_relax_keys):
+        npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+        lazy = np.load(str(npy_path), mmap_mode="r")
+        _insert_into_pytree(jax_pytree, relax_key, lazy)
+
+    print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
+
+    shared = args.gcs_path.startswith("gs://")
+    if shared:
+        from orbax.checkpoint.options import MultiprocessingOptions
+        options = ocp.CheckpointManagerOptions(
+            multiprocessing_options=MultiprocessingOptions(primary_host=0),
         )
-        sys.stdout.flush()
+    else:
+        options = ocp.CheckpointManagerOptions()
 
-    # Load weights from safetensors (every host loads independently)
-    if is_main:
-        print(f"Loading safetensors weights from {args.model_path}...")
-        sys.stdout.flush()
-    t0 = time.time()
-    params = load_qwen_weights(args.model_path, config)
-    if is_main:
-        print(f"Weights loaded in {time.time() - t0:.1f}s")
-        sys.stdout.flush()
+    mngr = ocp.CheckpointManager(args.gcs_path, options=options)
 
-    # Build mesh
-    devices = jax.devices()
-    mesh = Mesh(np.array(devices).reshape(args.dp, args.tp), ("dp", "tp"))
-    if is_main:
-        print(f"Mesh: {mesh.shape} axes={mesh.axis_names} ({len(devices)} devices)")
-        sys.stdout.flush()
+    print(f"Streaming to {args.gcs_path} ...")
+    mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
+    mngr.wait_until_finished()
+    print("Upload complete!")
 
-    # Save as orbax checkpoint (sharded onto mesh)
-    if is_main:
-        print(f"Saving orbax checkpoint to {args.output_path}...")
-        sys.stdout.flush()
-    t0 = time.time()
-    save_orbax_weights(params, args.output_path, mesh=mesh)
-    if is_main:
-        print(f"Checkpoint saved in {time.time() - t0:.1f}s")
-        print("Done!")
-        sys.stdout.flush()
-
-    jax.distributed.shutdown()
+    # Clean up .npy temp files
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    print("Cleaned up temp files.")
 
 
 if __name__ == "__main__":
