@@ -14,14 +14,16 @@ import sys
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+import orbax.checkpoint as ocp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.llama.config import ModelConfig
-from models.llama.load import load_from_orbax
 from models.llama.model import LLaMa
+from utils.mesh_helpers import MeshHelper
 from utils.ops import precompute_freqs_cis
 
 
@@ -53,26 +55,55 @@ def main():
         print(f"Config: {config.n_layers}L, dim={config.dim}, "
               f"heads={config.n_heads}, kv_heads={config.n_kv_heads}")
 
-    # 4. Load weights sharded onto mesh
-    params = load_from_orbax(args.gcs_path, mesh=mesh)
-
-    # 5. Verify sharding
-    if jax.process_index() == 0:
-        print("\nParameter sharding:")
-        for key, val in jax.tree.leaves_with_path(params):
-            name = "/".join(str(k.key) for k in key)
-            sharding = val.sharding if hasattr(val, "sharding") else "N/A"
-            print(f"  {name}: {val.shape} {val.dtype} | {sharding}")
-
-    # 6. Quick forward pass sanity check
+    # 4. Get abstract parameter shapes (no memory allocated)
     model = LLaMa(config)
+    dummy_input = jnp.ones((1, 1), dtype=jnp.int32)
     freqs_cis = precompute_freqs_cis(
         config.head_dim, config.max_seqlen,
         config.rope_theta, config.use_scaled_rope,
     )
+    abstract_vars = jax.eval_shape(model.init, jax.random.PRNGKey(0), dummy_input, 0, freqs_cis)
 
-    # Dummy single-token input
-    tokens = jax.numpy.ones((1, 1), dtype=jax.numpy.int32)
+    # 5. Build per-parameter sharding specs using MeshHelper
+    def _get_key_name(key) -> str:
+        if hasattr(key, "key"):
+            return str(key.key)
+        return str(key)
+
+    def make_restore_args(path, val):
+        name = "/".join(_get_key_name(k) for k in path)
+        spec = MeshHelper.param_sharding(val, name, mesh)
+        sharding = NamedSharding(mesh, spec)
+        return ocp.ArrayRestoreArgs(sharding=sharding)
+
+    restore_args = jax.tree.map_with_path(make_restore_args, abstract_vars)
+
+    # 6. Restore from GCS — each worker reads only its shards
+    checkpointer = ocp.PyTreeCheckpointer()
+    if jax.process_index() == 0:
+        print(f"\nRestoring from {args.gcs_path} ...")
+
+    with mesh:
+        params = checkpointer.restore(
+            args.gcs_path,
+            item=abstract_vars,
+            restore_args=restore_args,
+        )
+
+    # Unwrap the flax {'params': ...} wrapper if present
+    if "params" in params:
+        params = params["params"]
+
+    if jax.process_index() == 0:
+        print("Loaded successfully!\n")
+        print("Parameter sharding:")
+        for key, val in jax.tree.leaves_with_path(params):
+            name = "/".join(_get_key_name(k) for k in key)
+            sharding = val.sharding if hasattr(val, "sharding") else "N/A"
+            print(f"  {name}: {val.shape} {val.dtype} | {sharding}")
+
+    # 7. Quick forward pass sanity check
+    tokens = jnp.ones((1, 1), dtype=jnp.int32)
     logits = model.apply({"params": params}, tokens, 0, freqs_cis)
     jax.block_until_ready(logits)
 

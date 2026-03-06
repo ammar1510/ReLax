@@ -7,6 +7,8 @@ It also provides orbax-based save/load for fast subsequent loads with
 optional mesh sharding.
 """
 
+import contextlib
+
 import torch
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -227,40 +229,45 @@ def load_from_orbax(
     import jax
 
     checkpoint_path = _resolve_path(checkpoint_path)
-    mngr = _make_checkpoint_manager(checkpoint_path)
-    step = mngr.latest_step()
 
-    if mesh is None:
-        params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+    # Wrap in mesh context so Orbax's internal collective ops
+    # (sync_global_devices / process_allgather) run with proper sharding.
+    ctx = mesh if mesh is not None else contextlib.nullcontext()
+    with ctx:
+        mngr = _make_checkpoint_manager(checkpoint_path)
+        step = mngr.latest_step()
+
+        if mesh is None:
+            params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+            if jax.process_index() == 0:
+                print(f"Loaded orbax checkpoint from {checkpoint_path}")
+            return params
+
+        from jax.sharding import NamedSharding
+        from utils.mesh_helpers import MeshHelper
+
+        # Get array metadata (shapes/dtypes) without loading data
+        item_meta = mngr.item_metadata(step)
+
+        def _get_key_name(key) -> str:
+            if hasattr(key, "key"):
+                return str(key.key)
+            elif hasattr(key, "idx"):
+                return str(key.idx)
+            elif hasattr(key, "name"):
+                return str(key.name)
+            return str(key)
+
+        def _build_target(path, meta):
+            name = "/".join(_get_key_name(k) for k in path)
+            spec = MeshHelper.param_sharding(meta, name, mesh)
+            sharding = NamedSharding(mesh, spec)
+            return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+
+        target = jax.tree.map_with_path(_build_target, item_meta)
+
+        params = mngr.restore(step, args=ocp.args.StandardRestore(target))
         if jax.process_index() == 0:
-            print(f"Loaded orbax checkpoint from {checkpoint_path}")
+            print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
+
         return params
-
-    from jax.sharding import NamedSharding
-    from utils.mesh_helpers import MeshHelper
-
-    # Get array metadata (shapes/dtypes) without loading data
-    item_meta = mngr.item_metadata(step)
-
-    def _get_key_name(key) -> str:
-        if hasattr(key, "key"):
-            return str(key.key)
-        elif hasattr(key, "idx"):
-            return str(key.idx)
-        elif hasattr(key, "name"):
-            return str(key.name)
-        return str(key)
-
-    def _build_target(path, meta):
-        name = "/".join(_get_key_name(k) for k in path)
-        spec = MeshHelper.param_sharding(meta, name, mesh)
-        sharding = NamedSharding(mesh, spec)
-        return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
-
-    target = jax.tree.map_with_path(_build_target, item_meta)
-
-    params = mngr.restore(step, args=ocp.args.StandardRestore(target))
-    if jax.process_index() == 0:
-        print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
-
-    return params
