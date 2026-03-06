@@ -15,7 +15,8 @@ dependencies = [
   "gymnasium>=1.2.3",
   "fastapi",
   "uvicorn[standard]",
-  "google-cloud-storage"
+  "google-cloud-storage",
+  "gcsfs"
 ]
 
 [project.optional-dependencies]
