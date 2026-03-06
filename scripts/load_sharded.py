@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.llama.config import ModelConfig
 from models.llama.model import LLaMa
 from utils.mesh_helpers import MeshHelper
-from utils.ops import precompute_freqs_cis
 
 
 def main():
@@ -55,44 +54,33 @@ def main():
         print(f"Config: {config.n_layers}L, dim={config.dim}, "
               f"heads={config.n_heads}, kv_heads={config.n_kv_heads}")
 
-    # 4. Get abstract parameter shapes (no memory allocated)
-    model = LLaMa(config)
-    dummy_input = jnp.ones((1, 1), dtype=jnp.int32)
-    freqs_cis = precompute_freqs_cis(
-        config.head_dim, config.max_seqlen,
-        config.rope_theta, config.use_scaled_rope,
-    )
-    abstract_vars = jax.eval_shape(model.init, jax.random.PRNGKey(0), dummy_input, 0, freqs_cis)
+    # 4. Get checkpoint metadata (shapes/dtypes, no data loaded)
+    checkpointer = ocp.PyTreeCheckpointer()
+    metadata = checkpointer.metadata(args.gcs_path)
 
-    # 5. Build per-parameter sharding specs using MeshHelper
+    # 5. Build per-parameter restore args with sharding specs
     def _get_key_name(key) -> str:
         if hasattr(key, "key"):
             return str(key.key)
         return str(key)
 
-    def make_restore_args(path, val):
+    def make_restore_args(path, meta):
         name = "/".join(_get_key_name(k) for k in path)
-        spec = MeshHelper.param_sharding(val, name, mesh)
+        spec = MeshHelper.param_sharding(meta, name, mesh)
         sharding = NamedSharding(mesh, spec)
         return ocp.ArrayRestoreArgs(sharding=sharding)
 
-    restore_args = jax.tree.map_with_path(make_restore_args, abstract_vars)
+    restore_args = jax.tree.map_with_path(make_restore_args, metadata)
 
     # 6. Restore from GCS — each worker reads only its shards
-    checkpointer = ocp.PyTreeCheckpointer()
     if jax.process_index() == 0:
         print(f"\nRestoring from {args.gcs_path} ...")
 
     with mesh:
         params = checkpointer.restore(
             args.gcs_path,
-            item=abstract_vars,
             restore_args=restore_args,
         )
-
-    # Unwrap the flax {'params': ...} wrapper if present
-    if "params" in params:
-        params = params["params"]
 
     if jax.process_index() == 0:
         print("Loaded successfully!\n")
@@ -101,14 +89,6 @@ def main():
             name = "/".join(_get_key_name(k) for k in key)
             sharding = val.sharding if hasattr(val, "sharding") else "N/A"
             print(f"  {name}: {val.shape} {val.dtype} | {sharding}")
-
-    # 7. Quick forward pass sanity check
-    tokens = jnp.ones((1, 1), dtype=jnp.int32)
-    logits = model.apply({"params": params}, tokens, 0, freqs_cis)
-    jax.block_until_ready(logits)
-
-    if jax.process_index() == 0:
-        print(f"\nForward pass OK — logits shape: {logits.shape}")
 
 
 if __name__ == "__main__":
