@@ -5,7 +5,6 @@ onto a sharded mesh of TPU workers.
 Usage (run on each TPU worker):
     python scripts/load_sharded.py \
         --model_path /path/to/model \
-        --gcs_path gs://bucket/llama-orbax \
         --dp 1 --tp 4
 """
 
@@ -17,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+from orbax.checkpoint.options import MultiprocessingOptions
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.llama.config import ModelConfig
 from models.llama.model import LLaMa
 from utils.mesh_helpers import MeshHelper
+
+GCS_PATH = "gs://model-weights-1510/llama-3.1-8b-instruct"
 
 
 def main():
@@ -33,7 +35,6 @@ def main():
     parser.add_argument("--dp", type=int, default=1, help="Data-parallel dim")
     parser.add_argument("--tp", type=int, default=4, help="Tensor-parallel dim")
     args = parser.parse_args()
-    args.gcs_path = "gs://model-weights-1510/llama-3.1-8b-instruct/0"
 
     # 1. Initialize distributed JAX (must be first)
     jax.distributed.initialize()
@@ -53,33 +54,38 @@ def main():
         print(f"Config: {config.n_layers}L, dim={config.dim}, "
               f"heads={config.n_heads}, kv_heads={config.n_kv_heads}")
 
-    # 4. Get checkpoint metadata (shapes/dtypes, no data loaded)
-    checkpointer = ocp.PyTreeCheckpointer()
-    metadata = checkpointer.metadata(args.gcs_path)
-
-    # 5. Build per-parameter restore args with sharding specs
-    def _get_key_name(key) -> str:
-        if hasattr(key, "key"):
-            return str(key.key)
-        return str(key)
-
-    def make_restore_args(path, meta):
-        name = "/".join(_get_key_name(k) for k in path)
-        spec = MeshHelper.param_sharding(meta, name, mesh)
-        sharding = NamedSharding(mesh, spec)
-        return ocp.ArrayRestoreArgs(sharding=sharding)
-
-    restore_args = jax.tree.map_with_path(make_restore_args, metadata)
-
-    # 6. Restore from GCS — each worker reads only its shards
-    if jax.process_index() == 0:
-        print(f"\nRestoring from {args.gcs_path} ...")
-
+    # 4. Create CheckpointManager (matches how the checkpoint was saved)
+    options = ocp.CheckpointManagerOptions(
+        multiprocessing_options=MultiprocessingOptions(primary_host=0),
+    )
     with mesh:
-        params = checkpointer.restore(
-            args.gcs_path,
-            restore_args=restore_args,
-        )
+        mngr = ocp.CheckpointManager(GCS_PATH, options=options)
+        step = mngr.latest_step()
+        if jax.process_index() == 0:
+            print(f"Found checkpoint at step {step}")
+
+        # 5. Get array metadata (shapes/dtypes) from checkpoint
+        item_meta = mngr.item_metadata(step)
+
+        # 6. Build target pytree with sharding specs
+        def _get_key_name(key) -> str:
+            if hasattr(key, "key"):
+                return str(key.key)
+            return str(key)
+
+        def _build_target(path, meta):
+            name = "/".join(_get_key_name(k) for k in path)
+            spec = MeshHelper.param_sharding(meta, name, mesh)
+            sharding = NamedSharding(mesh, spec)
+            return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+
+        target = jax.tree.map_with_path(_build_target, item_meta)
+
+        # 7. Restore — each worker reads only its shards from GCS
+        if jax.process_index() == 0:
+            print(f"Restoring from {GCS_PATH} ...")
+
+        params = mngr.restore(step, args=ocp.args.StandardRestore(target))
 
     if jax.process_index() == 0:
         print("Loaded successfully!\n")
