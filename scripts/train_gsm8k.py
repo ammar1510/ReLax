@@ -89,8 +89,18 @@ def load_gsm8k(tokenizer: Tokenizer) -> List[Tuple[List[int], str]]:
 
     pairs = []
     for example in dataset:
-        prompt = f"Question: {example['question']}\nAnswer:"
-        tokens = tokenizer.encode(prompt, bos=True, eos=False)
+        prompt = (
+            "<|begin_of_text|>"
+            "<|start_header_id|>system<|end_header_id|>\n\n"
+            "You are a math problem solver. Think through the problem step by step, "
+            "then output your final answer on a new line in the format: #### <number>. "
+            "The number should be just the numeric value with no units, commas, or extra text."
+            "<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"Question: {example['question']}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special="all")
         expected = extract_answer(example["answer"])
         if expected:  # skip any malformed entries
             pairs.append((tokens, expected))
