@@ -30,12 +30,10 @@ def main():
     parser = argparse.ArgumentParser(description="Load sharded LLaMA from GCS")
     parser.add_argument("--model_path", required=True,
                         help="Directory containing config.json")
-    parser.add_argument("--gcs_path",
-                        default="gs://model-weights-1510/llama-3.1-8b-instruct/0",
-                        help="GCS Orbax checkpoint path")
     parser.add_argument("--dp", type=int, default=1, help="Data-parallel dim")
     parser.add_argument("--tp", type=int, default=4, help="Tensor-parallel dim")
     args = parser.parse_args()
+    args.gcs_path = "gs://model-weights-1510/llama-3.1-8b-instruct/0"
 
     # 1. Initialize distributed JAX (must be first)
     jax.distributed.initialize()
