@@ -193,7 +193,7 @@ def main():
 
     for relax_key in sorted(seen_relax_keys):
         npy_path = _TEMP_DIR / (relax_key.replace(".", "__") + ".npy")
-        lazy = np.load(str(npy_path), mmap_mode="r")
+        lazy = np.load(str(npy_path), mmap_mode="r").view(ml_dtypes.bfloat16)
         _insert_into_pytree(jax_pytree, relax_key, lazy)
 
     print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
