@@ -1,14 +1,13 @@
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-import orbax.checkpoint as ocp
 import flax.linen as nn
+import orbax.checkpoint as ocp
 
 # 1. Initialize multi-host environment
 jax.distributed.initialize()
 
-
-# 1. Define the Toy Llama Model
+# Define your model architecture
 class ToyLlama(nn.Module):
     vocab_size: int
     hidden_size: int
@@ -19,14 +18,13 @@ class ToyLlama(nn.Module):
         x = nn.Dense(self.hidden_size, name='attn_proj')(x)
         return x
 
-
 def main():
     mesh = Mesh(jax.devices(), axis_names=('tp',))
-    gcs_checkpoint_dir = 'gs://model-weights-1510/toy-llama'
+    gcs_checkpoint_dir = 'gs://your-bucket-name/llama-orbax-ckpts'
     step = 100 
     
-    # 2. Get zero-memory abstract shapes 
-    # (This traces the shapes instantly without running a forward pass or using memory)
+    # 2. Get zero-memory pure abstract shapes 
+    # (No metadata contamination from the old single-device checkpoint)
     model = ToyLlama(vocab_size=32000, hidden_size=4096)
     dummy_input = jnp.ones((1, 128), dtype=jnp.int32)
     abstract_vars = jax.eval_shape(model.init, jax.random.PRNGKey(0), dummy_input)
@@ -41,20 +39,16 @@ def main():
         
     abstract_target = jax.tree_util.tree_map(apply_sharding, abstract_vars)
 
-    # 4. Restore the specific "default" item using Composite
+    # 4. Restore the single item directly
     with ocp.CheckpointManager(gcs_checkpoint_dir) as mngr:
         print(f"Worker {jax.process_index()}: Downloading and sharding weights...")
         
         with mesh:
-            restored = mngr.restore(
+            # We pass abstract_target directly to item. No Composite needed.
+            restored_vars = mngr.restore(
                 step,
-                args=ocp.args.Composite(
-                    default=ocp.args.StandardRestore(item=abstract_target)
-                )
+                args=ocp.args.StandardRestore(item=abstract_target)
             )
-            
-    # Extract the weights from the restored default item
-    restored_vars = restored.default
 
     print(f"Worker {jax.process_index()}: Successfully loaded sharded weights!")
 
