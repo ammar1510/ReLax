@@ -22,7 +22,7 @@ class ToyLlama(nn.Module):
 
 def main():
     mesh = Mesh(jax.devices(), axis_names=('tp',))
-    gcs_checkpoint_dir = 'gs://your-bucket-name/llama-orbax-ckpts'
+    gcs_checkpoint_dir = 'gs://model-weights-1510/toy-llama'
     step = 100 
     
     # 2. Get zero-memory abstract shapes 
