@@ -1,11 +1,24 @@
 import jax
+import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import orbax.checkpoint as ocp
+import flax.linen as nn
 
 # 1. Initialize multi-host environment
 jax.distributed.initialize()
 
-# (Include your ToyLlama definition here)
+
+# 1. Define the Toy Llama Model
+class ToyLlama(nn.Module):
+    vocab_size: int
+    hidden_size: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Embed(self.vocab_size, self.hidden_size, name='tok_embeddings')(x)
+        x = nn.Dense(self.hidden_size, name='attn_proj')(x)
+        return x
+
 
 def main():
     mesh = Mesh(jax.devices(), axis_names=('tp',))
