@@ -163,31 +163,6 @@ def _convert_layer(
     }
 
 
-def _resolve_path(checkpoint_path: str):
-    """Return an epath.Path for local or GCS paths."""
-    from etils import epath
-    return epath.Path(checkpoint_path)
-
-
-def _make_checkpoint_manager(checkpoint_path):
-    """Create a CheckpointManager for local or GCS paths.
-
-    For GCS (shared filesystem): primary_host=0 so one host writes shared
-    metadata while all hosts write their own shards.
-    For local storage: primary_host=None so each host acts as its own primary
-    and independently writes metadata and shards to local disk.
-    """
-    import orbax.checkpoint as ocp
-    from orbax.checkpoint.options import MultiprocessingOptions
-
-    is_gcs = str(checkpoint_path).startswith("gs://")
-    primary_host = 0 if is_gcs else None
-    options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=MultiprocessingOptions(primary_host=primary_host),
-    )
-    return ocp.CheckpointManager(checkpoint_path, options=options)
-
-
 def save_orbax_weights(
     params: Dict[str, Any], checkpoint_path: str, mesh=None
 ) -> None:
@@ -195,21 +170,19 @@ def save_orbax_weights(
     Save ReLax params to an orbax checkpoint directory (local or GCS).
 
     When a mesh is provided, params are sharded before saving so each host
-    writes only its local shards. GCS paths (gs://) use primary_host=0 for
-    shared metadata; local paths use primary_host=None for independent writes.
+    writes only its local shards.
     """
     import orbax.checkpoint as ocp
     import jax
-
-    checkpoint_path = _resolve_path(checkpoint_path)
 
     if mesh is not None:
         from utils.mesh_helpers import MeshHelper
         params = MeshHelper.shard_params(params, mesh)
 
-    mngr = _make_checkpoint_manager(checkpoint_path)
-    mngr.save(0, args=ocp.args.StandardSave(params))
-    mngr.wait_until_finished()
+    options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
+    with ocp.CheckpointManager(checkpoint_path, options=options) as mngr:
+        mngr.save(0, args=ocp.args.StandardSave(params))
+        mngr.wait_until_finished()
     if jax.process_index() == 0:
         print(f"Saved orbax checkpoint to {checkpoint_path}")
 
@@ -222,52 +195,47 @@ def load_from_orbax(
     Load ReLax params from an orbax checkpoint (local or GCS), optionally sharding onto a mesh.
 
     When a mesh is provided, each host reads only its own shards by passing a
-    target pytree of jax.ShapeDtypeStruct with sharding specs. GCS paths
-    (gs://) use primary_host=0; local paths use primary_host=None.
+    target pytree of jax.ShapeDtypeStruct with sharding specs.
     """
     import orbax.checkpoint as ocp
     import jax
 
-    checkpoint_path = _resolve_path(checkpoint_path)
-
-    # Wrap in mesh context so Orbax's internal collective ops
-    # (sync_global_devices / process_allgather) run with proper sharding.
     ctx = mesh if mesh is not None else contextlib.nullcontext()
     with ctx:
-        mngr = _make_checkpoint_manager(checkpoint_path)
-        step = mngr.latest_step()
+        with ocp.CheckpointManager(checkpoint_path) as mngr:
+            step = mngr.latest_step()
 
-        if mesh is None:
-            params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+            if mesh is None:
+                params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+                if jax.process_index() == 0:
+                    print(f"Loaded orbax checkpoint from {checkpoint_path}")
+                return params
+
+            from jax.sharding import NamedSharding
+            from utils.mesh_helpers import MeshHelper
+
+            # Get array metadata (shapes/dtypes) without loading data
+            item_meta = mngr.item_metadata(step)
+
+            def _get_key_name(key) -> str:
+                if hasattr(key, "key"):
+                    return str(key.key)
+                elif hasattr(key, "idx"):
+                    return str(key.idx)
+                elif hasattr(key, "name"):
+                    return str(key.name)
+                return str(key)
+
+            def _build_target(path, meta):
+                name = "/".join(_get_key_name(k) for k in path)
+                spec = MeshHelper.param_sharding(meta, name, mesh)
+                sharding = NamedSharding(mesh, spec)
+                return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+
+            target = jax.tree.map_with_path(_build_target, item_meta)
+
+            params = mngr.restore(step, args=ocp.args.StandardRestore(target))
             if jax.process_index() == 0:
-                print(f"Loaded orbax checkpoint from {checkpoint_path}")
+                print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
+
             return params
-
-        from jax.sharding import NamedSharding
-        from utils.mesh_helpers import MeshHelper
-
-        # Get array metadata (shapes/dtypes) without loading data
-        item_meta = mngr.item_metadata(step)
-
-        def _get_key_name(key) -> str:
-            if hasattr(key, "key"):
-                return str(key.key)
-            elif hasattr(key, "idx"):
-                return str(key.idx)
-            elif hasattr(key, "name"):
-                return str(key.name)
-            return str(key)
-
-        def _build_target(path, meta):
-            name = "/".join(_get_key_name(k) for k in path)
-            spec = MeshHelper.param_sharding(meta, name, mesh)
-            sharding = NamedSharding(mesh, spec)
-            return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
-
-        target = jax.tree.map_with_path(_build_target, item_meta)
-
-        params = mngr.restore(step, args=ocp.args.StandardRestore(target))
-        if jax.process_index() == 0:
-            print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
-
-        return params
