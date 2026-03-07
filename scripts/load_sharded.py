@@ -16,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
-from orbax.checkpoint.options import MultiprocessingOptions
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -54,38 +53,35 @@ def main():
         print(f"Config: {config.n_layers}L, dim={config.dim}, "
               f"heads={config.n_heads}, kv_heads={config.n_kv_heads}")
 
-    # 4. Create CheckpointManager (matches how the checkpoint was saved)
-    options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=MultiprocessingOptions(primary_host=0),
-    )
+    # 4. Create CheckpointManager and restore sharded weights
     with mesh:
-        mngr = ocp.CheckpointManager(GCS_PATH, options=options)
-        step = mngr.latest_step()
-        if jax.process_index() == 0:
-            print(f"Found checkpoint at step {step}")
+        with ocp.CheckpointManager(GCS_PATH) as mngr:
+            step = mngr.latest_step()
+            if jax.process_index() == 0:
+                print(f"Found checkpoint at step {step}")
 
-        # 5. Get array metadata (shapes/dtypes) from checkpoint
-        item_meta = mngr.item_metadata(step)
+            # 5. Get array metadata (shapes/dtypes) from checkpoint
+            item_meta = mngr.item_metadata(step)
 
-        # 6. Build target pytree with sharding specs
-        def _get_key_name(key) -> str:
-            if hasattr(key, "key"):
-                return str(key.key)
-            return str(key)
+            # 6. Build target pytree with sharding specs
+            def _get_key_name(key) -> str:
+                if hasattr(key, "key"):
+                    return str(key.key)
+                return str(key)
 
-        def _build_target(path, meta):
-            name = "/".join(_get_key_name(k) for k in path)
-            spec = MeshHelper.param_sharding(meta, name, mesh)
-            sharding = NamedSharding(mesh, spec)
-            return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+            def _build_target(path, meta):
+                name = "/".join(_get_key_name(k) for k in path)
+                spec = MeshHelper.param_sharding(meta, name, mesh)
+                sharding = NamedSharding(mesh, spec)
+                return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
 
-        target = jax.tree.map_with_path(_build_target, item_meta)
+            target = jax.tree.map_with_path(_build_target, item_meta)
 
-        # 7. Restore — each worker reads only its shards from GCS
-        if jax.process_index() == 0:
-            print(f"Restoring from {GCS_PATH} ...")
+            # 7. Restore — each worker reads only its shards from GCS
+            if jax.process_index() == 0:
+                print(f"Restoring from {GCS_PATH} ...")
 
-        params = mngr.restore(step, args=ocp.args.StandardRestore(target))
+            params = mngr.restore(step, args=ocp.args.StandardRestore(target))
 
     if jax.process_index() == 0:
         print("Loaded successfully!\n")
