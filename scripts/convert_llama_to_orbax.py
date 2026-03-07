@@ -198,19 +198,12 @@ def main():
 
     print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
 
-    is_gcs = args.gcs_path.startswith("gs://")
-    if is_gcs:
-        from orbax.checkpoint.options import MultiprocessingOptions
-        options = ocp.CheckpointManagerOptions(
-            multiprocessing_options=MultiprocessingOptions(primary_host=0),
-        )
-    else:
-        options = ocp.CheckpointManagerOptions()
+    options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
 
-    mngr = ocp.CheckpointManager(args.gcs_path, options=options)
-    print(f"Streaming to {args.gcs_path} ...")
-    mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
-    mngr.wait_until_finished()
+    with ocp.CheckpointManager(args.gcs_path, options=options) as mngr:
+        print(f"Streaming to {args.gcs_path} ...")
+        mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
+        mngr.wait_until_finished()
     print("Upload complete!")
 
     shutil.rmtree(_TEMP_DIR, ignore_errors=True)
