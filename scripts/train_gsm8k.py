@@ -6,6 +6,7 @@ Usage:
 
 import argparse
 import json
+import wandb
 import re
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -38,7 +39,7 @@ CHECKPOINT_FREQ = 100
 
 # ── GSM8K answer extraction ────────────────────────────────────────────────────
 
-_ANSWER_RE = re.compile(r'####\s*(.+)')
+_ANSWER_RE = re.compile(r"####\s*(.+)")
 
 
 def extract_answer(text: str) -> str:
@@ -52,6 +53,7 @@ def extract_answer(text: str) -> str:
 
 # ── Reward function ────────────────────────────────────────────────────────────
 
+
 def make_reward_fn(tokenizer: Tokenizer):
     """Return a reward function closed over the tokenizer.
 
@@ -60,6 +62,7 @@ def make_reward_fn(tokenizer: Tokenizer):
         0.5  — correct format but wrong answer
         0.0  — no #### marker found
     """
+
     def reward_fn(completions: List[List[int]], ground_truths: List[str]) -> jax.Array:
         rewards = []
         for tokens, expected in zip(completions, ground_truths):
@@ -77,6 +80,7 @@ def make_reward_fn(tokenizer: Tokenizer):
 
 
 # ── Dataset loading ────────────────────────────────────────────────────────────
+
 
 def load_gsm8k(tokenizer: Tokenizer) -> List[Tuple[List[int], str]]:
     """Load GSM8K train split and return (prompt_tokens, expected_answer) pairs."""
@@ -105,18 +109,28 @@ def load_gsm8k(tokenizer: Tokenizer) -> List[Tuple[List[int], str]]:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+
 def main():
     jax.distributed.initialize()
 
     parser = argparse.ArgumentParser(description="GRPO training on GSM8K")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to model directory")
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="Orbax checkpoint path (GCS or local)")
+    parser.add_argument(
+        "--model_path", type=str, required=True, help="Path to model directory"
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        required=True,
+        help="Orbax checkpoint path (GCS or local)",
+    )
     args = parser.parse_args()
 
     is_main = jax.process_index() == 0
     devices = jax.devices()
     mesh = Mesh(np.array(devices).reshape(4, 4), ("dp", "tp"))
-    print(f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices")
+    print(
+        f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices"
+    )
 
     output_dir = Path(OUTPUT_DIR)
     if is_main:
@@ -141,8 +155,12 @@ def main():
         )
 
     print(f"Loading model from {args.model_path}...")
-    model, params, config, tokenizer = load_model(args.model_path, args.checkpoint_path, mesh)
-    print(f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH")
+    model, params, config, tokenizer = load_model(
+        args.model_path, args.checkpoint_path, mesh
+    )
+    print(
+        f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH"
+    )
 
     print("Loading GSM8K dataset...")
     prompt_dataset = load_gsm8k(tokenizer)
