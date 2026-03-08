@@ -5,7 +5,6 @@ Usage:
 """
 
 import argparse
-import dataclasses
 import json
 import re
 from pathlib import Path
@@ -17,14 +16,10 @@ import numpy as np
 from jax.sharding import Mesh
 from datasets import load_dataset
 
-import wandb
-
-from models.llama.model import LLaMa
-from models.llama.config import ModelConfig
-from models.llama.load import load_llama_weights
 from models.llama.tokenizer import Tokenizer
-from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 from models.sync_server import SyncServer
+from inference import load_model
+from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 
 # ── Hardcoded training config ──────────────────────────────────────────────────
 
@@ -115,9 +110,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="GRPO training on GSM8K")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model directory")
-    parser.add_argument("--wandb_project", type=str, default="relax-grpo-gsm8k", help="W&B project name")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name (auto-generated if not set)")
-    parser.add_argument("--no_wandb", action="store_true", help="Disable W&B logging")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="Orbax checkpoint path (GCS or local)")
     args = parser.parse_args()
 
     is_main = jax.process_index() == 0
@@ -129,11 +122,9 @@ def main():
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    use_wandb = not args.no_wandb and is_main
-    if use_wandb:
+    if is_main:
         wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
+            project="relax-grpo-gsm8k",
             config={
                 "rollout_batch_size": ROLLOUT_BATCH_SIZE,
                 "group_size": GROUP_SIZE,
@@ -150,15 +141,8 @@ def main():
         )
 
     print(f"Loading model from {args.model_path}...")
-    config = dataclasses.replace(ModelConfig.from_json_file(args.model_path), max_seqlen=8192)
-    model = LLaMa(config)
-    params = load_llama_weights(args.model_path, config)
+    model, params, config, tokenizer = load_model(args.model_path, args.checkpoint_path, mesh)
     print(f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH")
-
-    tokenizer_path = Path(args.model_path) / "original/tokenizer.model"
-    if not tokenizer_path.exists():
-        tokenizer_path = Path(args.model_path) / "tokenizer.model"
-    tokenizer = Tokenizer(str(tokenizer_path))
 
     print("Loading GSM8K dataset...")
     prompt_dataset = load_gsm8k(tokenizer)
@@ -191,7 +175,7 @@ def main():
     )
 
     def wandb_log(iteration_metrics: dict):
-        if use_wandb:
+        if wandb.run is not None:
             wandb.log(
                 {
                     "reward/mean": iteration_metrics["mean_reward"],
@@ -217,7 +201,7 @@ def main():
         print(f"Metrics saved to {metrics_path}")
 
     trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
-    if use_wandb:
+    if wandb.run is not None:
         wandb.finish()
 
     if is_main:

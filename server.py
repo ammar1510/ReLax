@@ -177,6 +177,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="ReLax inference API server")
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--checkpoint_path", type=str, required=True,
+                        help="Orbax checkpoint path (GCS or local)")
     parser.add_argument("--config", type=str, default="server_config.json",
                         help="Path to server config JSON (default: server_config.json)")
     args = parser.parse_args()
@@ -194,16 +196,15 @@ def main():
     decode_steps       = cfg["decode_steps"]
     max_pending_requests = cfg.get("max_pending_requests", 500)
 
-
-    # Load model
-    model, params, config, tokenizer = load_model(args.model_path)
-
-    # Build device mesh
+    # Build device mesh (must happen before load_model for sharded restore)
     devices = jax.devices()
     dp = len(devices) // tp
     mesh = Mesh(np.array(devices).reshape(dp, tp), ("dp", "tp"))
     print(f"[P{pid}] Mesh: dp={dp} tp={tp} ({len(devices)} devices total)")
     sys.stdout.flush()
+
+    # Load model
+    model, params, config, tokenizer = load_model(args.model_path, args.checkpoint_path, mesh)
 
     serve_cfg = ServingConfig(
         decode_steps=decode_steps,

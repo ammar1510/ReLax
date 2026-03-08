@@ -24,7 +24,6 @@ from models.llama.load import load_from_orbax
 from models.llama.tokenizer import Tokenizer
 from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 
-
 DEFAULT_PROMPTS = [
     "What is JAX and how does it differ from PyTorch?",
     "Explain the transformer architecture in simple terms.",
@@ -79,7 +78,9 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
 
 def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
-    return tokenizer.encode(formatted_prompt, bos=False, eos=False, allowed_special="all")
+    return tokenizer.encode(
+        formatted_prompt, bos=False, eos=False, allowed_special="all"
+    )
 
 
 def generate_batch(
@@ -128,20 +129,28 @@ def generate_batch(
     debug = serving_loop.verbose
     for iteration in range(max_iterations):
         if debug:
-            print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+            print(
+                f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
+            )
             sys.stdout.flush()
         serving_loop.serving_step()
 
-        newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
+        newly_completed = (
+            sum(1 for r in serving_loop.results.values() if r.done) - completed
+        )
         completed += newly_completed
 
         if completed >= len(prompts):
             if verbose:
                 elapsed = time.time() - start_time
-                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+                print(
+                    f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s"
+                )
                 sys.stdout.flush()
             if debug:
-                print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
+                print(
+                    f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}"
+                )
                 sys.stdout.flush()
             break
 
@@ -151,8 +160,10 @@ def generate_batch(
         if i in serving_loop.results and serving_loop.results[i].done:
             result = serving_loop.results[i]
             generated_tokens = result.token_list
-            if generated_tokens and hasattr(generated_tokens[0], 'item'):
-                generated_tokens = [t.item() if hasattr(t, 'item') else t for t in generated_tokens]
+            if generated_tokens and hasattr(generated_tokens[0], "item"):
+                generated_tokens = [
+                    t.item() if hasattr(t, "item") else t for t in generated_tokens
+                ]
             decoded_text = tokenizer.decode(generated_tokens)
             decoded_results.append(decoded_text)
 
@@ -197,9 +208,9 @@ def main():
 
     # Create mesh before loading so weights are sharded during restore
     devices = jax.devices()
-    assert len(devices) == args.dp * args.tp, (
-        f"Expected {args.dp * args.tp} devices, got {len(devices)}"
-    )
+    assert (
+        len(devices) == args.dp * args.tp
+    ), f"Expected {args.dp * args.tp} devices, got {len(devices)}"
     mesh = Mesh(np.array(devices).reshape(args.dp, args.tp), ("dp", "tp"))
 
     print(f"Created mesh with {len(devices)} device(s): {mesh}")
@@ -244,6 +255,7 @@ def main():
     print(f"[P{pid}] reaching shutdown barrier")
     sys.stdout.flush()
     from models.sync_server import SyncServer
+
     SyncServer.barrier("shutdown", 0)
     print(f"[P{pid}] passed shutdown barrier")
     sys.stdout.flush()
