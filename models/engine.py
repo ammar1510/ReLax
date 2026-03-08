@@ -702,7 +702,7 @@ class ServingLoop:
         """
         # Dispatch tokens to results via output_mapping
         for token, req_id in zip(output_tokens_flat, output_mapping_flat):
-            if req_id >= 0 and req_id in self.results:
+            if req_id >= 0 and req_id in self.results and not self.results[req_id].done:
                 self.results[req_id].token_list.append(token)
                 self.results[req_id].tokens_decoded += 1
 
