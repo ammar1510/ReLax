@@ -116,9 +116,9 @@ class GRPOTrainer(Trainer):
         params: FrozenDict,
         grpo_config: GRPOConfig,
         reward_fn: Callable[[List[List[int]], List[Any]], jax.Array],
+        detokenize_fn: Callable[[List[int]], str],
         mesh: Optional[Mesh] = None,
         seed: int = 42,
-        detokenize_fn: Optional[Callable[[List[int]], str]] = None,
     ):
         """Initialize GRPO trainer.
 
@@ -131,7 +131,7 @@ class GRPOTrainer(Trainer):
                        Should return array of shape [batch_size].
             mesh: JAX mesh for sharded computation. If None, creates a default mesh.
             seed: Random seed.
-            detokenize_fn: Optional function to decode token IDs to text for logging.
+            detokenize_fn: Function to decode token IDs to text for logging.
         """
         # Create optimizer
         optimizer = optax.chain(
@@ -161,7 +161,7 @@ class GRPOTrainer(Trainer):
         # Create ServingLoop for batched rollout generation
         serve_cfg = ServingConfig(
             decode_steps=grpo_config.decode_steps,
-            decode_batch_size=grpo_config.group_size,
+            decode_batch_size=grpo_config.rollout_batch_size,
             prefill_batch_size=grpo_config.group_size,
             eos_tokens=grpo_config.eos_token_ids,
             token_pad_idx=grpo_config.pad_token_id,
@@ -233,13 +233,8 @@ class GRPOTrainer(Trainer):
     ) -> RolloutBatch:
         """Generate rollouts for a batch of prompts using ServingLoop.
 
-        For each prompt, generates `group_size` completions using batched
-        prefill/decode via the serving infrastructure, then computes logprobs
-        from both policy and reference models.
-
-        In multi-host mode, only the server (rank 0) enqueues requests.
-        All ranks participate in serving_step compute and collect results
-        (ServingLoop internally broadcasts decode output to all ranks).
+        All prompts are enqueued at once. The serving loop runs continuously
+        until every completion is done — no per-prompt reset or iteration cap.
 
         Args:
             prompts: List of token sequences (prompts). Length = rollout_batch_size.
@@ -252,51 +247,48 @@ class GRPOTrainer(Trainer):
         # Point engine to current policy params (already sharded)
         self.serving_loop.engine.params = self.state.params
 
-        all_prompt_tokens = []
-        all_generated_tokens = []
-        t0 = time.time()
+        # Single reset before the whole rollout batch
+        self._reset_serving_loop()
 
+        t0 = time.time()
         self._log(f"Rollout: generating {total_sequences} completions "
                   f"({len(prompts)} prompts x {self.grpo_config.group_size} each)")
 
-        # Generate completions for each prompt via ServingLoop
-        for pi, prompt_tokens in enumerate(prompts):
-            self._reset_serving_loop()
-
-            # Only server (rank 0) enqueues requests
-            if self.is_main:
+        # Enqueue all requests at once; unique id = pi * group_size + g
+        if self.is_main:
+            for pi, prompt_tokens in enumerate(prompts):
                 for g in range(self.grpo_config.group_size):
+                    req_id = pi * self.grpo_config.group_size + g
                     self.serving_loop.add_request(
-                        UserRequestPrompt(id=g, text=list(prompt_tokens))
+                        UserRequestPrompt(id=req_id, text=list(prompt_tokens))
                     )
 
-            # All ranks drive the compute loop together
-            max_serving_iters = (
-                self.grpo_config.max_new_tokens // self.grpo_config.decode_steps + 10
-            )
-            for si in range(max_serving_iters):
-                self.serving_loop.serving_step()
+        # Drive the serving loop until every completion is done
+        step = 0
+        while True:
+            self.serving_loop.serving_step()
+            step += 1
+            results = self.serving_loop.results
+            if len(results) == total_sequences and all(r.done for r in results.values()):
+                break
 
-                # All ranks have identical results (ServingLoop broadcasts internally)
-                results = self.serving_loop.results
-                if (
-                    len(results) == self.grpo_config.group_size
-                    and all(r.done for r in results.values())
-                ):
-                    break
+        self._log(f"Rollout: all {total_sequences} completions done in {step} serving steps, "
+                  f"{time.time() - t0:.1f}s")
 
-            if (pi + 1) % 10 == 0 or pi == len(prompts) - 1:
-                self._log(f"Rollout: prompt {pi + 1}/{len(prompts)} done in {si + 1} serving steps")
-                if self.detokenize_fn is not None and self.is_main:
-                    sample_tokens = all_prompt_tokens[-1] + all_generated_tokens[-1]
-                    self._log(f"Sample:\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
-
-            # All ranks collect results (ServingLoop broadcasts internally)
+        # Collect results in prompt order
+        all_prompt_tokens = []
+        all_generated_tokens = []
+        for pi, prompt_tokens in enumerate(prompts):
             for g in range(self.grpo_config.group_size):
-                result = self.serving_loop.results.get(g)
+                req_id = pi * self.grpo_config.group_size + g
+                result = self.serving_loop.results.get(req_id)
                 generated = result.token_list if result is not None else []
                 all_prompt_tokens.append(list(prompt_tokens))
                 all_generated_tokens.append(generated)
+
+        if self.is_main:
+            sample_tokens = all_prompt_tokens[0] + all_generated_tokens[0]
+            self._log(f"Sample:\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
