@@ -36,7 +36,7 @@ where = ["."]
 include = ["*"]
 
 [tool.setuptools]
-py-modules = ["sampling"]
+py-modules = ["sampling", "inference"]
 
 [tool.pytest.ini_options]
 pythonpath = [
