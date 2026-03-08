@@ -26,7 +26,7 @@ import wandb
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.llama.load import load_llama_weights
+from models.llama.load import load_from_orbax
 from models.llama.tokenizer import Tokenizer
 from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 from models.sync_server import SyncServer
@@ -163,7 +163,7 @@ def main():
     print(f"Loading model from {args.model_path}...")
     config = dataclasses.replace(ModelConfig.from_json_file(args.model_path), max_seqlen=8192)
     model = LLaMa(config)
-    params = load_llama_weights(args.model_path, config)
+    params = load_from_orbax(args.model_path)
     print(f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH")
 
     # Load tokenizer

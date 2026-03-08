@@ -219,7 +219,7 @@ class GRPOTrainer(Trainer):
         self.serving_loop.decode_work.curr_tokens = tokens
         self.serving_loop.decode_work.cache = kv_cache
         self.serving_loop.decode_work.active_results = [
-            None for _ in range(self.grpo_config.group_size)
+            None for _ in range(self.grpo_config.rollout_batch_size)
         ]
         self.serving_loop.prefill_work.requests = []
         self.serving_loop.prefill_work.to_prefill = []
