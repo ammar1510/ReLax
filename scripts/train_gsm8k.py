@@ -127,7 +127,7 @@ def main():
 
     is_main = jax.process_index() == 0
     devices = jax.devices()
-    mesh = Mesh(np.array(devices).reshape(4, 4), ("dp", "tp"))
+    mesh = Mesh(np.array(devices).reshape(2,8), ("dp", "tp"))
     print(
         f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices"
     )
