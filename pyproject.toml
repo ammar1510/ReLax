@@ -23,7 +23,6 @@ dependencies = [
 dev = [
   "pytest",
   "ipykernel",
-  "torch",
   "chex",
   "huggingface_hub",
   "fire",
