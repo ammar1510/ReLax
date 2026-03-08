@@ -288,10 +288,9 @@ class GRPOTrainer(Trainer):
 
         if self.is_main:
             for pi in range(len(prompts)):
-                if pi % 5 == 0:
-                    idx = pi * self.grpo_config.group_size
-                    sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
-                    self._log(f"Sample (prompt {pi}):\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
+                idx = pi * self.grpo_config.group_size
+                sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
+                self._log(f"Sample (prompt {pi}):\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
