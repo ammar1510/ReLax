@@ -20,7 +20,7 @@ def main():
 
     text = "Hello, world! This is a test."
     tokens = tokenizer.encode(text, bos=True, eos=False)
-    decoded = tokenizer.decode(tokens)
+    decoded = tokenizer.decode(tokens[1:])  # skip BOS token
     print(f"Input:   {text}")
     print(f"Tokens:  {tokens}")
     print(f"Decoded: {decoded}")
