@@ -335,6 +335,7 @@ class InferenceEngine:
             A JIT-compiled function with signature:
                 (curr_tokens, active_mask, cache, steps) -> ((curr_tokens, cache), output_tokens)
             where output_tokens has shape [batch, steps]
+
         """
         engine = self
 
@@ -356,9 +357,8 @@ class InferenceEngine:
                 eos_tokens: Tuple of EOS token IDs; slots are masked out after generating one
 
             Returns:
-                Tuple of ((curr_tokens, active_mask, cache), output_tokens) where:
+                Tuple of ((curr_tokens, cache), output_tokens) where:
                     - curr_tokens: Updated current tokens [batch, 1]
-                    - active_mask: Updated active mask (slots disabled after EOS) [batch]
                     - cache: Updated KV cache
                     - output_tokens: Generated tokens [batch, steps]
             """
@@ -408,8 +408,7 @@ class InferenceEngine:
 
                 return (updated_tokens, updated_mask, updated_cache, rng_key), new_tokens
 
-            # Run scan for N steps — active_mask is now part of carry so it updates per step
-            (final_tokens, final_active_mask, final_cache, final_rng_key), output_tokens = jax.lax.scan(
+            (final_tokens, _, final_cache, _), output_tokens = jax.lax.scan(
                 body, (curr_tokens, active_mask, cache, rng_key), length=steps
             )
 
@@ -417,7 +416,7 @@ class InferenceEngine:
             # Transpose to [batch, steps] and squeeze last dim
             output_tokens = output_tokens[:, :, 0].T  # [batch, steps]
 
-            return (final_tokens, final_active_mask, final_cache), output_tokens
+            return (final_tokens, final_cache), output_tokens
 
         return multistep_decode_fn
 
@@ -776,7 +775,7 @@ class ServingLoop:
         import time as _time
         _t0 = _time.time()
         with set_mesh(self.mesh):
-            (final_tokens, final_active_mask, final_cache), output_tokens = self.multistep_decode_fn(
+            (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
                 active_mask,
                 self.engine.params,
