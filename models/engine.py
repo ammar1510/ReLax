@@ -888,7 +888,7 @@ class ServingLoop:
                 np.array(req.text),
                 individual_result["next_token"],
                 individual_result["cache"],
-                len(req.text) - 1,
+                len(req.text),
             )
             self.prefill_work.to_decode.append(new_decode)
 
