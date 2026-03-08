@@ -72,7 +72,7 @@ class GRPOConfig:
 
     # Generation
     pad_token_id: int = 0
-    eos_token_id: int = 2
+    eos_token_ids: Tuple[int, ...] = (2,)
     decode_steps: int = 10  # Tokens per multistep decode call
     max_cache_seqlen: Optional[int] = None  # KV cache size; defaults to model's max_seqlen if None
 
@@ -163,7 +163,7 @@ class GRPOTrainer(Trainer):
             decode_steps=grpo_config.decode_steps,
             decode_batch_size=grpo_config.group_size,
             prefill_batch_size=grpo_config.group_size,
-            eos_tokens=(grpo_config.eos_token_id,),
+            eos_tokens=grpo_config.eos_token_ids,
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
             max_cache_seqlen=grpo_config.max_cache_seqlen or config.max_seqlen,
@@ -496,13 +496,12 @@ class GRPOTrainer(Trainer):
         Returns:
             Tuple of (updated_state, metrics).
         """
-        return self.train_step_jit(state, batch, self.reference_params, self.grpo_config.kl_coef)
+        return self.train_step_jit(state, batch, self.grpo_config.kl_coef)
 
     def _train_step_fn(
         self,
         state: TrainState,
         batch: Dict[str, jax.Array],
-        reference_params: FrozenDict,
         kl_coef: float,
     ) -> Tuple[TrainState, Dict[str, float]]:
         """Training step with logprob recomputation from current policy.
@@ -514,7 +513,6 @@ class GRPOTrainer(Trainer):
         Args:
             state: Training state.
             batch: Minibatch with keys: tokens, mask, advantages, policy_logprobs, reference_logprobs.
-            reference_params: Reference model parameters.
             kl_coef: KL coefficient.
 
         Returns:

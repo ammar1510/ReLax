@@ -178,7 +178,7 @@ def main():
         learning_rate=LEARNING_RATE,
         reference_mode=REFERENCE_MODE,
         pad_token_id=tokenizer.pad_id,
-        eos_token_id=tokenizer.eot_id,
+        eos_token_ids=(tokenizer.eot_id, tokenizer.eos_id, tokenizer.eom_id),
     )
 
     trainer = GRPOTrainer(

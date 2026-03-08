@@ -342,8 +342,8 @@ class InferenceEngine:
         sample_fn = self.sampler
         mask_extractor = self.mask_cache_extractor
 
-        @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
-        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
+        @partial(jax.jit, static_argnames=("steps", "eos_tokens"), donate_argnames=("cache",))
+        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10, eos_tokens: tuple = ()):
             """Generate multiple tokens in a single JIT-compiled call.
 
             Args:
@@ -353,18 +353,20 @@ class InferenceEngine:
                 cache: KV cache
                 rng_key: PRNG key for sampling (split each step)
                 steps: Number of tokens to generate
+                eos_tokens: Tuple of EOS token IDs; slots are masked out after generating one
 
             Returns:
-                Tuple of ((curr_tokens, cache), output_tokens) where:
+                Tuple of ((curr_tokens, active_mask, cache), output_tokens) where:
                     - curr_tokens: Updated current tokens [batch, 1]
+                    - active_mask: Updated active mask (slots disabled after EOS) [batch]
                     - cache: Updated KV cache
                     - output_tokens: Generated tokens [batch, steps]
             """
+            eos_ids = jnp.array(eos_tokens, dtype=curr_tokens.dtype) if eos_tokens else None
 
             def body(carry, _):
-                curr_tokens, cache, rng_key = carry
+                curr_tokens, active_mask, cache, rng_key = carry
 
-                # Compute true_lengths from active_mask (captured from closure)
                 true_lengths = active_mask.astype(jnp.int32)
 
                 # Build attention mask
@@ -392,23 +394,30 @@ class InferenceEngine:
                     curr_tokens,
                 )
 
+                # Disable slots that just produced an EOS token
+                if eos_ids is not None:
+                    hit_eos = jnp.any(new_tokens == eos_ids[None, :], axis=-1)  # [batch]
+                    updated_mask = active_mask & ~hit_eos
+                else:
+                    updated_mask = active_mask
+
                 # Reshard carry to match input sharding (prevents drift across scan iterations)
                 updated_tokens = jax.lax.with_sharding_constraint(
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
-                return (updated_tokens, updated_cache, rng_key), new_tokens
+                return (updated_tokens, updated_mask, updated_cache, rng_key), new_tokens
 
-            # Run scan for N steps — (curr_tokens, cache, rng_key) in carry
-            (final_tokens, final_cache, final_rng_key), output_tokens = jax.lax.scan(
-                body, (curr_tokens, cache, rng_key), length=steps
+            # Run scan for N steps — active_mask is now part of carry so it updates per step
+            (final_tokens, final_active_mask, final_cache, final_rng_key), output_tokens = jax.lax.scan(
+                body, (curr_tokens, active_mask, cache, rng_key), length=steps
             )
 
             # output_tokens shape: [steps, batch, 1]
             # Transpose to [batch, steps] and squeeze last dim
             output_tokens = output_tokens[:, :, 0].T  # [batch, steps]
 
-            return (final_tokens, final_cache), output_tokens
+            return (final_tokens, final_active_mask, final_cache), output_tokens
 
         return multistep_decode_fn
 
@@ -582,6 +591,7 @@ class ServingLoop:
                 self.decode_work.cache,
                 dummy_rng_key,
                 steps=self.serve_cfg.decode_steps,
+                eos_tokens=tuple(self.eos_tokens.tolist()),
             )
         print(f"[ServingLoop] Decode compiled in {_time.time() - t0:.1f}s")
         sys.stdout.flush()
@@ -766,13 +776,14 @@ class ServingLoop:
         import time as _time
         _t0 = _time.time()
         with set_mesh(self.mesh):
-            (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
+            (final_tokens, final_active_mask, final_cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
                 active_mask,
                 self.engine.params,
                 self.decode_work.cache,
                 decode_rng_key,
                 steps=self.serve_cfg.decode_steps,
+                eos_tokens=tuple(self.eos_tokens.tolist()),
             )
             jax.block_until_ready((final_tokens, final_cache, output_tokens))
 
