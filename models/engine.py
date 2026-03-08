@@ -256,14 +256,16 @@ class InferenceEngine:
 
     def _default_cache_updater(self, decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens):
         idx = jnp.array(slot_idxs)
-        prefill_seqlen = entries[0].k.shape[3]
-        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)
-        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
-        # Only write the first prefill_seqlen positions into the decode cache
-        new_k = decode_cache.k.at[:, idx, :, :prefill_seqlen, :].set(stacked_k)
-        new_v = decode_cache.v.at[:, idx, :, :prefill_seqlen, :].set(stacked_v)
+        # Batch-update positions and tokens (scalars, no seqlen dimension)
         new_positions = decode_cache.seq_positions.at[idx].set(jnp.array(lens))
         new_tokens = curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
+        # Update KV cache per-entry to handle different prefill bucket sizes
+        new_k = decode_cache.k
+        new_v = decode_cache.v
+        for entry, slot_idx in zip(entries, slot_idxs):
+            prefill_seqlen = entry.k.shape[3]
+            new_k = new_k.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.k[:, 0, :, :, :])
+            new_v = new_v.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.v[:, 0, :, :, :])
         return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
 
     def prefill(
