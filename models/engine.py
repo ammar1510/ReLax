@@ -256,14 +256,16 @@ class InferenceEngine:
 
     def _default_cache_updater(self, decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens):
         idx = jnp.array(slot_idxs)
-        prefill_seqlen = entries[0].k.shape[3]
-        stacked_k = jnp.concatenate([e.k for e in entries], axis=1)
-        stacked_v = jnp.concatenate([e.v for e in entries], axis=1)
-        # Only write the first prefill_seqlen positions into the decode cache
-        new_k = decode_cache.k.at[:, idx, :, :prefill_seqlen, :].set(stacked_k)
-        new_v = decode_cache.v.at[:, idx, :, :prefill_seqlen, :].set(stacked_v)
+        # Batch-update positions and tokens (scalars, no seqlen dimension)
         new_positions = decode_cache.seq_positions.at[idx].set(jnp.array(lens))
         new_tokens = curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
+        # Update KV cache per-entry to handle different prefill bucket sizes
+        new_k = decode_cache.k
+        new_v = decode_cache.v
+        for entry, slot_idx in zip(entries, slot_idxs):
+            prefill_seqlen = entry.k.shape[3]
+            new_k = new_k.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.k[:, 0, :, :, :])
+            new_v = new_v.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.v[:, 0, :, :, :])
         return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
 
     def prefill(
@@ -335,6 +337,7 @@ class InferenceEngine:
             A JIT-compiled function with signature:
                 (curr_tokens, active_mask, cache, steps) -> ((curr_tokens, cache), output_tokens)
             where output_tokens has shape [batch, steps]
+
         """
         engine = self
 
@@ -342,8 +345,8 @@ class InferenceEngine:
         sample_fn = self.sampler
         mask_extractor = self.mask_cache_extractor
 
-        @partial(jax.jit, static_argnames=("steps",), donate_argnames=("cache",))
-        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10):
+        @partial(jax.jit, static_argnames=("steps", "eos_tokens"), donate_argnames=("cache",))
+        def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10, eos_tokens: tuple = ()):
             """Generate multiple tokens in a single JIT-compiled call.
 
             Args:
@@ -353,6 +356,7 @@ class InferenceEngine:
                 cache: KV cache
                 rng_key: PRNG key for sampling (split each step)
                 steps: Number of tokens to generate
+                eos_tokens: Tuple of EOS token IDs; slots are masked out after generating one
 
             Returns:
                 Tuple of ((curr_tokens, cache), output_tokens) where:
@@ -360,11 +364,11 @@ class InferenceEngine:
                     - cache: Updated KV cache
                     - output_tokens: Generated tokens [batch, steps]
             """
+            eos_ids = jnp.array(eos_tokens, dtype=curr_tokens.dtype) if eos_tokens else None
 
             def body(carry, _):
-                curr_tokens, cache, rng_key = carry
+                curr_tokens, active_mask, cache, rng_key = carry
 
-                # Compute true_lengths from active_mask (captured from closure)
                 true_lengths = active_mask.astype(jnp.int32)
 
                 # Build attention mask
@@ -392,16 +396,22 @@ class InferenceEngine:
                     curr_tokens,
                 )
 
+                # Disable slots that just produced an EOS token
+                if eos_ids is not None:
+                    hit_eos = jnp.any(new_tokens == eos_ids[None, :], axis=-1)  # [batch]
+                    updated_mask = active_mask & ~hit_eos
+                else:
+                    updated_mask = active_mask
+
                 # Reshard carry to match input sharding (prevents drift across scan iterations)
                 updated_tokens = jax.lax.with_sharding_constraint(
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
-                return (updated_tokens, updated_cache, rng_key), new_tokens
+                return (updated_tokens, updated_mask, updated_cache, rng_key), new_tokens
 
-            # Run scan for N steps — (curr_tokens, cache, rng_key) in carry
-            (final_tokens, final_cache, final_rng_key), output_tokens = jax.lax.scan(
-                body, (curr_tokens, cache, rng_key), length=steps
+            (final_tokens, _, final_cache, _), output_tokens = jax.lax.scan(
+                body, (curr_tokens, active_mask, cache, rng_key), length=steps
             )
 
             # output_tokens shape: [steps, batch, 1]
@@ -582,6 +592,7 @@ class ServingLoop:
                 self.decode_work.cache,
                 dummy_rng_key,
                 steps=self.serve_cfg.decode_steps,
+                eos_tokens=tuple(self.eos_tokens.tolist()),
             )
         print(f"[ServingLoop] Decode compiled in {_time.time() - t0:.1f}s")
         sys.stdout.flush()
@@ -693,7 +704,7 @@ class ServingLoop:
         """
         # Dispatch tokens to results via output_mapping
         for token, req_id in zip(output_tokens_flat, output_mapping_flat):
-            if req_id >= 0 and req_id in self.results:
+            if req_id >= 0 and req_id in self.results and not self.results[req_id].done:
                 self.results[req_id].token_list.append(token)
                 self.results[req_id].tokens_decoded += 1
 
@@ -773,6 +784,7 @@ class ServingLoop:
                 self.decode_work.cache,
                 decode_rng_key,
                 steps=self.serve_cfg.decode_steps,
+                eos_tokens=tuple(self.eos_tokens.tolist()),
             )
             jax.block_until_ready((final_tokens, final_cache, output_tokens))
 
@@ -876,7 +888,7 @@ class ServingLoop:
                 np.array(req.text),
                 individual_result["next_token"],
                 individual_result["cache"],
-                len(req.text) - 1,
+                len(req.text),
             )
             self.prefill_work.to_decode.append(new_decode)
 

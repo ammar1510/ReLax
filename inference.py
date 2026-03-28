@@ -12,19 +12,17 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.llama.load import load_llama_weights
+from models.llama.load import load_from_orbax
 from models.llama.tokenizer import Tokenizer
 from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
-
 
 DEFAULT_PROMPTS = [
     "What is JAX and how does it differ from PyTorch?",
@@ -34,16 +32,13 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def load_model(model_path: str, config_path: Optional[str] = None):
-    """Load model, config, and tokenizer.
+def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
+    """Load model, config, tokenizer, and weights from orbax checkpoint.
 
     Args:
-        model_path: Path to model directory containing:
-            - model.safetensors.index.json (required - weight mapping)
-            - model-0000X-of-0000Y.safetensors (sharded weight files)
-            - config.json (model configuration)
-            - tokenizer.model (tokenizer file)
-        config_path: Optional separate path to config.json directory
+        model_path: Path to model directory containing config.json and tokenizer.model
+        checkpoint_path: Orbax checkpoint path (GCS or local)
+        mesh: JAX device mesh for sharded restore
 
     Returns:
         Tuple of (model, params, config, tokenizer)
@@ -51,11 +46,7 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     model_path = Path(model_path)
 
     # Load configuration
-    if config_path:
-        config = ModelConfig.from_json_file(config_path)
-    else:
-        config = ModelConfig.from_json_file(str(model_path))
-
+    config = ModelConfig.from_json_file(str(model_path))
     print(
         f"Loaded config: {config.n_layers} layers, {config.dim} dim, "
         f"{config.n_heads} heads, {config.n_kv_heads} kv_heads, {config.max_seqlen} max_seqlen"
@@ -64,8 +55,9 @@ def load_model(model_path: str, config_path: Optional[str] = None):
     # Initialize model
     model = LLaMa(config)
 
-    print(f"Loading weights from {model_path}...")
-    params = load_llama_weights(str(model_path), config)
+    # Load weights from orbax checkpoint (sharded onto mesh)
+    print(f"Loading weights from {checkpoint_path}...")
+    params = load_from_orbax(checkpoint_path, mesh=mesh)
     print("Weights loaded successfully")
 
     # Load tokenizer
@@ -86,7 +78,9 @@ def load_model(model_path: str, config_path: Optional[str] = None):
 
 def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\nToday Date: 23 July 2024\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
-    return tokenizer.encode(formatted_prompt, bos=False, eos=False, allowed_special="all")
+    return tokenizer.encode(
+        formatted_prompt, bos=False, eos=False, allowed_special="all"
+    )
 
 
 def generate_batch(
@@ -135,20 +129,28 @@ def generate_batch(
     debug = serving_loop.verbose
     for iteration in range(max_iterations):
         if debug:
-            print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+            print(
+                f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
+            )
             sys.stdout.flush()
         serving_loop.serving_step()
 
-        newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
+        newly_completed = (
+            sum(1 for r in serving_loop.results.values() if r.done) - completed
+        )
         completed += newly_completed
 
         if completed >= len(prompts):
             if verbose:
                 elapsed = time.time() - start_time
-                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+                print(
+                    f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s"
+                )
                 sys.stdout.flush()
             if debug:
-                print(f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}")
+                print(
+                    f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}"
+                )
                 sys.stdout.flush()
             break
 
@@ -158,8 +160,10 @@ def generate_batch(
         if i in serving_loop.results and serving_loop.results[i].done:
             result = serving_loop.results[i]
             generated_tokens = result.token_list
-            if generated_tokens and hasattr(generated_tokens[0], 'item'):
-                generated_tokens = [t.item() if hasattr(t, 'item') else t for t in generated_tokens]
+            if generated_tokens and hasattr(generated_tokens[0], "item"):
+                generated_tokens = [
+                    t.item() if hasattr(t, "item") else t for t in generated_tokens
+                ]
             decoded_text = tokenizer.decode(generated_tokens)
             decoded_results.append(decoded_text)
 
@@ -182,30 +186,42 @@ def main():
         "--model_path",
         type=str,
         required=True,
-        help="Path to model directory (containing model.safetensors, config.json, tokenizer.model)",
+        help="Path to model directory (containing config.json, tokenizer.model)",
     )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        required=True,
+        help="Orbax checkpoint path (GCS or local), e.g. gs://bucket/llama-orbax",
+    )
+    parser.add_argument("--dp", type=int, default=4, help="Data-parallel dim")
+    parser.add_argument("--tp", type=int, default=4, help="Tensor-parallel dim")
     parser.add_argument(
         "--max_decode_length",
         type=int,
         default=256,
-        help="Maximum number of tokens to generate per request (default: 512)",
+        help="Maximum number of tokens to generate per request",
     )
     args = parser.parse_args()
 
     prompts = DEFAULT_PROMPTS
 
-    # Load model
-    print("Loading model...")
-    model, params, config, tokenizer = load_model(args.model_path)
-
-    # Create mesh — all devices along single TP axis
-    # On multi-chip TPUs (e.g. v4-8), JAX auto-discovers all chips
+    # Create mesh before loading so weights are sharded during restore
     devices = jax.devices()
-    mesh = Mesh(np.array(devices).reshape(4, 4), ("dp", "tp"))
+    assert (
+        len(devices) == args.dp * args.tp
+    ), f"Expected {args.dp * args.tp} devices, got {len(devices)}"
+    mesh = Mesh(np.array(devices).reshape(args.dp, args.tp), ("dp", "tp"))
 
     print(f"Created mesh with {len(devices)} device(s): {mesh}")
     print(f"Process {jax.process_index()}: devices {jax.local_devices()}")
     sys.stdout.flush()
+
+    # Load model with sharded weights
+    print("Loading model...")
+    model, params, config, tokenizer = load_model(
+        args.model_path, args.checkpoint_path, mesh
+    )
 
     # Create serving configuration
     serve_cfg = ServingConfig(
@@ -239,6 +255,7 @@ def main():
     print(f"[P{pid}] reaching shutdown barrier")
     sys.stdout.flush()
     from models.sync_server import SyncServer
+
     SyncServer.barrier("shutdown", 0)
     print(f"[P{pid}] passed shutdown barrier")
     sys.stdout.flush()

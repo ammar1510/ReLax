@@ -15,14 +15,14 @@ dependencies = [
   "gymnasium>=1.2.3",
   "fastapi",
   "uvicorn[standard]",
-  "google-cloud-storage"
+  "google-cloud-storage",
+  "gcsfs"
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest",
   "ipykernel",
-  "torch",
   "chex",
   "huggingface_hub",
   "fire",
@@ -35,7 +35,7 @@ where = ["."]
 include = ["*"]
 
 [tool.setuptools]
-py-modules = ["sampling"]
+py-modules = ["sampling", "inference"]
 
 [tool.pytest.ini_options]
 pythonpath = [

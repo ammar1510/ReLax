@@ -1,189 +1,13 @@
 """
-Functions to load model weights from PyTorch checkpoint format.
-
-This module handles loading LLaMA weights from sharded .pth files
-in the PyTorch format, converting them to the ReLax model structure.
-It also provides orbax-based save/load for fast subsequent loads with
-optional mesh sharding.
+Functions to save/load model weights in orbax checkpoint format.
 """
 
-import torch
-from pathlib import Path
-from typing import Dict, Any, Optional
+import contextlib
+
+from typing import Dict, Any
 import numpy as np
 
 from .config import ModelConfig
-
-
-def load_llama_weights(model_path: str, config: ModelConfig) -> Dict[str, Any]:
-    """
-    Loads LLaMA model weights from PyTorch sharded .pth format.
-
-    Args:
-        model_path: Path to directory containing *.pth files
-        config: ModelConfig instance for the LLaMa model.
-
-    Returns:
-        Flax parameter dictionary matching the LLaMa model structure.
-    """
-    model_path = Path(model_path) / "original"
-
-    # Find all .pth checkpoint files
-    shard_files = sorted(model_path.glob("*.pth"))
-
-    if len(shard_files) == 0:
-        raise FileNotFoundError(
-            f"No .pth checkpoint files found in {model_path}\n" f"Expected *.pth files"
-        )
-
-    print(f"Loading model from {model_path}")
-    print(f"Found {len(shard_files)} checkpoint file(s)")
-
-    # Load all weights from all shards
-    all_weights = {}
-    for shard_path in shard_files:
-        print(f"  Loading {shard_path.name}...")
-        checkpoint = torch.load(shard_path, map_location="cpu", weights_only=True)
-        # Convert PyTorch tensors to numpy arrays
-        for key, value in checkpoint.items():
-            if isinstance(value, torch.Tensor):
-                # Convert BFloat16 to float32 (numpy doesn't support bfloat16 natively)
-                if value.dtype == torch.bfloat16:
-                    value = value.float()
-                all_weights[key] = value.detach().cpu().numpy()
-            else:
-                all_weights[key] = value
-
-    print(f"Loaded {len(all_weights)} tensors total")
-
-    # Convert to ReLax format (keeping as numpy arrays on host)
-    params = _convert_hf_to_relax(all_weights, config)
-
-    return params
-
-
-def _convert_hf_to_relax(
-    hf_weights: Dict[str, np.ndarray],
-    config: ModelConfig,
-) -> Dict[str, Any]:
-    """
-    Convert PyTorch/HuggingFace weight format to ReLax model structure.
-    Returns weights as numpy arrays to avoid early accelerator placement.
-    """
-    print("Converting PyTorch weights to ReLax format...")
-
-    params = {}
-
-    # Token embeddings
-    embed_weight = hf_weights.get("tok_embeddings.weight")
-    if embed_weight is None:
-        raise ValueError("tok_embeddings.weight not found in checkpoint")
-
-    params["tok_embeddings"] = {
-        "embedding": embed_weight.astype(np.float32)
-    }
-    print(f"  ✓ Embeddings: {embed_weight.shape}")
-
-    # Output layer
-    output_weight = hf_weights.get("output.weight")
-    params["output"] = output_weight.T.astype(np.float32)
-
-    # Final norm
-    norm = hf_weights.get("norm.weight")
-    params["norm_weight"] = norm.astype(np.float32)
-
-    # Transformer layers
-    print(f"  Converting {config.n_layers} transformer layers...")
-    for i in range(config.n_layers):
-        layer_params = _convert_layer(hf_weights, i, config)
-        params[f"layer_{i}"] = layer_params
-
-        if i == 0:
-            # Print shapes for first layer as reference
-            print(f"    Layer 0 shapes:")
-            for k, v in layer_params.items():
-                print(f"      {k}: {v.shape}")
-
-    print(f"  ✓ Converted all {config.n_layers} layers")
-
-    return params
-
-
-def _convert_layer(
-    hf_weights: Dict[str, np.ndarray],
-    layer_idx: int,
-    config: ModelConfig,
-) -> Dict[str, np.ndarray]:
-    """Convert a single transformer layer to ReLax format (as numpy arrays)."""
-    prefix = f"layers.{layer_idx}"
-
-    # Attention weights
-    q_proj = hf_weights[f"{prefix}.attention.wq.weight"]
-    k_proj = hf_weights[f"{prefix}.attention.wk.weight"]
-    v_proj = hf_weights[f"{prefix}.attention.wv.weight"]
-    o_proj = hf_weights[f"{prefix}.attention.wo.weight"]
-
-    # Transpose and reshape
-    wq = q_proj.T.astype(np.float32).reshape(
-        config.dim, config.n_heads, config.head_dim
-    )
-    wk = k_proj.T.astype(np.float32).reshape(
-        config.dim, config.n_kv_heads, config.head_dim
-    )
-    wv = v_proj.T.astype(np.float32).reshape(
-        config.dim, config.n_kv_heads, config.head_dim
-    )
-    wo = o_proj.T.astype(np.float32)
-
-    # MLP/Feed-forward weights
-    gate_proj = hf_weights[f"{prefix}.feed_forward.w1.weight"]
-    up_proj = hf_weights[f"{prefix}.feed_forward.w3.weight"]
-    down_proj = hf_weights[f"{prefix}.feed_forward.w2.weight"]
-
-    w_gate = gate_proj.T.astype(np.float32)
-    w_up = up_proj.T.astype(np.float32)
-    w_down = down_proj.T.astype(np.float32)
-
-    # Normalization weights
-    attention_norm = hf_weights[f"{prefix}.attention_norm.weight"].astype(np.float32)
-    ffn_norm = hf_weights[f"{prefix}.ffn_norm.weight"].astype(np.float32)
-
-    return {
-        "wq": wq,
-        "wk": wk,
-        "wv": wv,
-        "wo": wo,
-        "w_gate": w_gate,
-        "w_up": w_up,
-        "w_down": w_down,
-        "attention_norm_weight": attention_norm,
-        "ffn_norm_weight": ffn_norm,
-    }
-
-
-def _resolve_path(checkpoint_path: str):
-    """Return an epath.Path for local or GCS paths."""
-    from etils import epath
-    return epath.Path(checkpoint_path)
-
-
-def _make_checkpoint_manager(checkpoint_path):
-    """Create a CheckpointManager for local or GCS paths.
-
-    For GCS (shared filesystem): primary_host=0 so one host writes shared
-    metadata while all hosts write their own shards.
-    For local storage: primary_host=None so each host acts as its own primary
-    and independently writes metadata and shards to local disk.
-    """
-    import orbax.checkpoint as ocp
-    from orbax.checkpoint.options import MultiprocessingOptions
-
-    is_gcs = str(checkpoint_path).startswith("gs://")
-    primary_host = 0 if is_gcs else None
-    options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=MultiprocessingOptions(primary_host=primary_host),
-    )
-    return ocp.CheckpointManager(checkpoint_path, options=options)
 
 
 def save_orbax_weights(
@@ -193,21 +17,19 @@ def save_orbax_weights(
     Save ReLax params to an orbax checkpoint directory (local or GCS).
 
     When a mesh is provided, params are sharded before saving so each host
-    writes only its local shards. GCS paths (gs://) use primary_host=0 for
-    shared metadata; local paths use primary_host=None for independent writes.
+    writes only its local shards.
     """
     import orbax.checkpoint as ocp
     import jax
-
-    checkpoint_path = _resolve_path(checkpoint_path)
 
     if mesh is not None:
         from utils.mesh_helpers import MeshHelper
         params = MeshHelper.shard_params(params, mesh)
 
-    mngr = _make_checkpoint_manager(checkpoint_path)
-    mngr.save(0, args=ocp.args.StandardSave(params))
-    mngr.wait_until_finished()
+    options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
+    with ocp.CheckpointManager(checkpoint_path, options=options) as mngr:
+        mngr.save(0, args=ocp.args.StandardSave(params))
+        mngr.wait_until_finished()
     if jax.process_index() == 0:
         print(f"Saved orbax checkpoint to {checkpoint_path}")
 
@@ -220,47 +42,47 @@ def load_from_orbax(
     Load ReLax params from an orbax checkpoint (local or GCS), optionally sharding onto a mesh.
 
     When a mesh is provided, each host reads only its own shards by passing a
-    target pytree of jax.ShapeDtypeStruct with sharding specs. GCS paths
-    (gs://) use primary_host=0; local paths use primary_host=None.
+    target pytree of jax.ShapeDtypeStruct with sharding specs.
     """
     import orbax.checkpoint as ocp
     import jax
 
-    checkpoint_path = _resolve_path(checkpoint_path)
-    mngr = _make_checkpoint_manager(checkpoint_path)
-    step = mngr.latest_step()
+    ctx = mesh if mesh is not None else contextlib.nullcontext()
+    with ctx:
+        with ocp.CheckpointManager(checkpoint_path) as mngr:
+            step = mngr.latest_step()
 
-    if mesh is None:
-        params = mngr.restore(step, args=ocp.args.StandardRestore(None))
-        if jax.process_index() == 0:
-            print(f"Loaded orbax checkpoint from {checkpoint_path}")
-        return params
+            if mesh is None:
+                params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+                if jax.process_index() == 0:
+                    print(f"Loaded orbax checkpoint from {checkpoint_path}")
+                return params
 
-    from jax.sharding import NamedSharding
-    from utils.mesh_helpers import MeshHelper
+            from jax.sharding import NamedSharding
+            from utils.mesh_helpers import MeshHelper
 
-    # Get array metadata (shapes/dtypes) without loading data
-    item_meta = mngr.item_metadata(step)
+            # Get array metadata (shapes/dtypes) without loading data
+            item_meta = mngr.item_metadata(step)
 
-    def _get_key_name(key) -> str:
-        if hasattr(key, "key"):
-            return str(key.key)
-        elif hasattr(key, "idx"):
-            return str(key.idx)
-        elif hasattr(key, "name"):
-            return str(key.name)
-        return str(key)
+            def _get_key_name(key) -> str:
+                if hasattr(key, "key"):
+                    return str(key.key)
+                elif hasattr(key, "idx"):
+                    return str(key.idx)
+                elif hasattr(key, "name"):
+                    return str(key.name)
+                return str(key)
 
-    def _build_target(path, meta):
-        name = "/".join(_get_key_name(k) for k in path)
-        spec = MeshHelper.param_sharding(meta, name, mesh)
-        sharding = NamedSharding(mesh, spec)
-        return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+            def _build_target(path, meta):
+                name = "/".join(_get_key_name(k) for k in path)
+                spec = MeshHelper.param_sharding(meta, name, mesh)
+                sharding = NamedSharding(mesh, spec)
+                return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
 
-    target = jax.tree.map_with_path(_build_target, item_meta)
+            target = jax.tree.map_with_path(_build_target, item_meta)
 
-    params = mngr.restore(step, args=ocp.args.StandardRestore(target))
-    if jax.process_index() == 0:
-        print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
+            params = mngr.restore(step, args=ocp.args.StandardRestore(target))
+            if jax.process_index() == 0:
+                print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
 
-    return params
+            return params
