@@ -10,11 +10,11 @@ the assembled pytree to GCS via Orbax.
 Usage:
     # Dry run — print HF→ReLax key mappings and shapes (downloads 1 tensor
     # per shard at most, lightweight):
-    python scripts/orbax_load.py --repo Qwen/Qwen3.5-MoE --dry_run
+    python scripts/orbax_load.py --repo Qwen/Qwen3.5-122B-A10B --dry_run
 
     # Full conversion:
     python scripts/orbax_load.py \
-        --repo Qwen/Qwen3.5-MoE \
+        --repo Qwen/Qwen3.5-122B-A10B \
         --gcs_path gs://my-bucket/qwen3.5-orbax
 """
 
@@ -181,17 +181,21 @@ def main():
         description="Convert Qwen3.5 MoE safetensors to Orbax on GCS"
     )
     parser.add_argument("--repo", required=True,
-                        help="HuggingFace repo id, e.g. Qwen/Qwen3.5-MoE")
+                        help="HuggingFace repo id, e.g. Qwen/Qwen3.5-122B-A10B")
     parser.add_argument("--gcs_path",
                         help="GCS destination, e.g. gs://bucket/checkpoint")
     parser.add_argument("--dry_run", action="store_true",
                         help="Only print HF→ReLax key mappings and shapes, skip writing")
+    parser.add_argument("--temp_dir", default="./temp_npy_weights",
+                        help="Directory for intermediate .npy files. Point to a "
+                             "GCS FUSE mount (e.g. /mnt/gcs/temp_weights) to avoid "
+                             "filling local disk. Defaults to ./temp_npy_weights.")
     args = parser.parse_args()
 
     if not args.dry_run and not args.gcs_path:
         parser.error("--gcs_path is required unless --dry_run is set")
 
-    temp_dir = Path("./temp_npy_weights")
+    temp_dir = Path(args.temp_dir)
     download_dir = Path("./temp_hf_download")
     target_dtype = ml_dtypes.bfloat16
 
@@ -213,16 +217,30 @@ def main():
 
     # ------------------------------------------------------------------
     # PASS 1: download each shard, extract + transform, delete shard
+    # (skipped if temp_dir already contains .npy files)
     # ------------------------------------------------------------------
-    if args.dry_run:
-        print("\n--- DRY RUN: HF key → ReLax key + shape ---")
-    else:
-        print("\n--- PASS 1: Download + extract + transform → local .npy ---")
-        os.makedirs(temp_dir, exist_ok=True)
+    existing_npy = list(temp_dir.glob("*.npy")) if temp_dir.exists() else []
 
     seen_relax_keys: set[str] = set()
 
-    for shard_name in shard_filenames:
+    if existing_npy and not args.dry_run:
+        print(f"\n--- PASS 1: SKIPPED ({len(existing_npy)} .npy files already in {temp_dir}) ---")
+        for npy_path in existing_npy:
+            relax_key = npy_path.stem.replace("__", ".")
+            seen_relax_keys.add(relax_key)
+        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+        if missing:
+            print(f"  WARNING: {len(missing)} ReLax keys not found in temp_dir:")
+            for m in sorted(missing)[:20]:
+                print(f"    {m}")
+    else:
+        if args.dry_run:
+            print("\n--- DRY RUN: HF key → ReLax key + shape ---")
+        else:
+            print("\n--- PASS 1: Download + extract + transform → local .npy ---")
+            os.makedirs(temp_dir, exist_ok=True)
+
+    for shard_name in ([] if existing_npy and not args.dry_run else shard_filenames):
         print(f"\n  Downloading {shard_name} ...")
         local_shard = Path(hf_hub_download(
             args.repo, shard_name, local_dir=download_dir,
@@ -255,12 +273,13 @@ def main():
         if not args.dry_run:
             print(f"  Processed and deleted {shard_name}")
 
-    # Sanity check
-    missing = set(v[0] for v in key_map.values()) - seen_relax_keys
-    if missing:
-        print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
-        for m in sorted(missing)[:20]:
-            print(f"    {m}")
+    # Sanity check (only when Pass 1 ran)
+    if not existing_npy or args.dry_run:
+        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+        if missing:
+            print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
+            for m in sorted(missing)[:20]:
+                print(f"    {m}")
 
     # Clean up download directory
     shutil.rmtree(download_dir, ignore_errors=True)

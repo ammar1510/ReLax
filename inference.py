@@ -1,7 +1,7 @@
 """Inference script for LLaMA models.
 
 Loads a LLaMA model with weights from disk and performs batch inference
-using the ServingLoop event loop pattern.
+using the InferenceEngine event loop pattern.
 
 Usage:
     python inference.py --model_path /path/to/model
@@ -22,7 +22,8 @@ from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.llama.load import load_from_orbax
 from models.llama.tokenizer import Tokenizer
-from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
+from sampling import greedy
 
 DEFAULT_PROMPTS = [
     "What is JAX and how does it differ from PyTorch?",
@@ -84,7 +85,7 @@ def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
 
 
 def generate_batch(
-    serving_loop: ServingLoop,
+    engine: InferenceEngine,
     tokenizer: Tokenizer,
     prompts: List[str],
     verbose: bool = True,
@@ -92,7 +93,7 @@ def generate_batch(
     """Generate text for a batch of prompts using event loop.
 
     Args:
-        serving_loop: ServingLoop instance
+        engine: InferenceEngine instance
         tokenizer: Tokenizer for encoding/decoding
         prompts: List of text prompts
         verbose: Print generation progress
@@ -114,7 +115,7 @@ def generate_batch(
             print(f"            Tokens: {len(prompt_tokens)}")
 
         request = UserRequestPrompt(id=i, text=prompt_tokens)
-        serving_loop.add_request(request)
+        engine.add_request(request)
 
     if verbose:
         print(f"\nProcessing {len(prompts)} requests...\n")
@@ -126,17 +127,17 @@ def generate_batch(
     max_iterations = 10000
 
     pid = jax.process_index()
-    debug = serving_loop.verbose
+    debug = engine.verbose
     for iteration in range(max_iterations):
         if debug:
             print(
                 f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
             )
             sys.stdout.flush()
-        serving_loop.serving_step()
+        engine.serving_step()
 
         newly_completed = (
-            sum(1 for r in serving_loop.results.values() if r.done) - completed
+            sum(1 for r in engine.results.values() if r.done) - completed
         )
         completed += newly_completed
 
@@ -157,8 +158,8 @@ def generate_batch(
     # Decode results
     decoded_results = []
     for i in range(len(prompts)):
-        if i in serving_loop.results and serving_loop.results[i].done:
-            result = serving_loop.results[i]
+        if i in engine.results and engine.results[i].done:
+            result = engine.results[i]
             generated_tokens = result.token_list
             if generated_tokens and hasattr(generated_tokens[0], "item"):
                 generated_tokens = [
@@ -224,7 +225,9 @@ def main():
     )
 
     # Create serving configuration
-    serve_cfg = ServingConfig(
+    engine_cfg = EngineConfig(
+        sampler=greedy,
+        detokenize_fn=tokenizer.decode,
         decode_steps=10,
         decode_batch_size=16,
         prefill_batch_size=4,
@@ -236,19 +239,16 @@ def main():
     # Create serving loop
     print(f"\nInitializing serving loop...")
     sys.stdout.flush()
-    serving_loop = ServingLoop(
-        serve_cfg=serve_cfg,
+    engine = InferenceEngine(
+        engine_cfg=engine_cfg,
         model=model,
         params=params,
         mesh=mesh,
         is_server=(jax.process_index() == 0),
     )
 
-    # Warmup: compile prefill and decode before real inference
-    serving_loop.warmup()
-
     # Run batch generation
-    generate_batch(serving_loop, tokenizer, prompts, verbose=True)
+    generate_batch(engine, tokenizer, prompts, verbose=True)
 
     # Ensure all hosts finish before any process exits
     pid = jax.process_index()

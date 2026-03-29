@@ -82,7 +82,7 @@ class ModelConfig:
             # Check if we should use scaled rope
             use_scaled_rope = rope_scaling.get("rope_type") == "llama3"
         else:
-            max_seqlen = hf_config.get("max_position_embeddings", 8192)
+            max_seqlen = min(hf_config.get("max_position_embeddings", 8192),8192)
             use_scaled_rope = False
 
         # Mapping from Hugging Face config keys to our ModelConfig keys
