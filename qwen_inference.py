@@ -1,7 +1,7 @@
 """Inference script for Qwen3.5 MoE models.
 
 Loads a Qwen3.5 model with weights from disk and performs batch inference
-using the ServingLoop event loop pattern.
+using the InferenceEngine event loop pattern.
 
 Usage:
     python qwen_inference.py --model_path /path/to/Qwen3.5-122B-A10B
@@ -22,7 +22,8 @@ from jax.sharding import Mesh
 from models.qwen.model import Qwen
 from models.qwen.config import QwenConfig
 from models.qwen.load import load_qwen_weights, load_from_orbax
-from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
+from sampling import greedy
 from utils.hybrid_cache import HybridCache, DeltaNetState
 from utils.kvcache import KVCache
 from utils.mesh_helpers import MeshHelper
@@ -170,7 +171,7 @@ def format_prompt(prompt: str, tokenizer) -> List[int]:
 
 
 def generate_batch(
-    serving_loop: ServingLoop,
+    engine: InferenceEngine,
     tokenizer,
     prompts: List[str],
     verbose: bool = True,
@@ -190,7 +191,7 @@ def generate_batch(
             print(f"            Tokens: {len(prompt_tokens)}")
 
         request = UserRequestPrompt(id=i, text=prompt_tokens)
-        serving_loop.add_request(request)
+        engine.add_request(request)
 
     if verbose:
         print(f"\nProcessing {len(prompts)} requests...\n")
@@ -202,14 +203,14 @@ def generate_batch(
     max_iterations = 10000
 
     pid = jax.process_index()
-    debug = serving_loop.verbose
+    debug = engine.verbose
     for iteration in range(max_iterations):
         if debug:
             print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
             sys.stdout.flush()
-        serving_loop.serving_step()
+        engine.serving_step()
 
-        newly_completed = sum(1 for r in serving_loop.results.values() if r.done) - completed
+        newly_completed = sum(1 for r in engine.results.values() if r.done) - completed
         completed += newly_completed
 
         if completed >= len(prompts):
@@ -222,8 +223,8 @@ def generate_batch(
     # Decode results
     decoded_results = []
     for i in range(len(prompts)):
-        if i in serving_loop.results and serving_loop.results[i].done:
-            result = serving_loop.results[i]
+        if i in engine.results and engine.results[i].done:
+            result = engine.results[i]
             generated_tokens = result.token_list
             if generated_tokens and hasattr(generated_tokens[0], 'item'):
                 generated_tokens = [t.item() if hasattr(t, 'item') else t for t in generated_tokens]
@@ -299,7 +300,9 @@ def main():
     cache_factory = make_cache_factory(config, args.max_cache_seqlen, dtype)
 
     # Create serving configuration
-    serve_cfg = ServingConfig(
+    engine_cfg = EngineConfig(
+        sampler=greedy,
+        detokenize_fn=tokenizer.decode,
         decode_steps=10,
         decode_batch_size=16,
         prefill_batch_size=4,
@@ -312,8 +315,8 @@ def main():
     # Create serving loop with Qwen cache callbacks
     print(f"\nInitializing serving loop...")
     sys.stdout.flush()
-    serving_loop = ServingLoop(
-        serve_cfg=serve_cfg,
+    engine = InferenceEngine(
+        engine_cfg=engine_cfg,
         model=model,
         params=params,
         mesh=mesh,
@@ -325,11 +328,8 @@ def main():
         place_cache=qwen_place_cache,
     )
 
-    # Warmup
-    serving_loop.warmup()
-
     # Run batch generation
-    generate_batch(serving_loop, tokenizer, prompts, verbose=True)
+    generate_batch(engine, tokenizer, prompts, verbose=True)
 
     # Ensure all hosts finish before any process exits
     pid = jax.process_index()

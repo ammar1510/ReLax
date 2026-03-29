@@ -30,13 +30,14 @@ from jax.sharding import Mesh
 from pydantic import BaseModel
 
 from inference import load_model
-from models.engine import ServingConfig, ServingLoop, UserRequestPrompt
+from models.engine import EngineConfig, InferenceEngine, UserRequestPrompt
+from sampling import greedy
 from models.sync_server import SyncServer
 
 # ---------------------------------------------------------------------------
 # Global state (set in main() before the server accepts requests)
 # ---------------------------------------------------------------------------
-serving_loop: Optional[ServingLoop] = None
+engine: Optional[InferenceEngine] = None
 tokenizer = None
 max_pending_requests: int = 500
 
@@ -56,18 +57,18 @@ def _next_id() -> int:
 def _inference_loop(shutdown: threading.Event) -> None:
     """Call serving_step() continuously.  Must run on exactly one thread."""
     while not shutdown.is_set():
-        serving_loop.serving_step()
+        engine.serving_step()
 
 
 def _wandb_system_loop(shutdown: threading.Event, interval: float = 5.0) -> None:
     """Periodically log system-level metrics to wandb."""
     while not shutdown.is_set():
-        if serving_loop is not None:
-            active = sum(1 for x in serving_loop.decode_work.active_results if x is not None)
+        if engine is not None:
+            active = sum(1 for x in engine.decode_work.active_results if x is not None)
             wandb.log({
-                "system/pending_requests": serving_loop.pending_prefill_count(),
+                "system/pending_requests": engine.pending_prefill_count(),
                 "system/active_slots": active,
-                "system/decode_call_count": serving_loop._decode_call_count,
+                "system/decode_call_count": engine._decode_call_count,
             })
         shutdown.wait(interval)
 
@@ -112,26 +113,26 @@ async def health():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    if serving_loop.pending_prefill_count() >= max_pending_requests:
+    if engine.pending_prefill_count() >= max_pending_requests:
         raise HTTPException(status_code=429, detail="Too many pending requests")
     req_id = _next_id()
     tokens = _format_chat_prompt(req.messages, tokenizer)
     prompt_tokens_count = len(tokens)
-    if prompt_tokens_count >= serving_loop.serve_cfg.max_cache_seqlen:
+    if prompt_tokens_count >= engine.engine_cfg.max_cache_seqlen:
         raise HTTPException(
             status_code=400,
-            detail=f"Prompt too long ({prompt_tokens_count} tokens), max is {serving_loop.serve_cfg.max_cache_seqlen - 1}",
+            detail=f"Prompt too long ({prompt_tokens_count} tokens), max is {engine.engine_cfg.max_cache_seqlen - 1}",
         )
-    serving_loop.add_request(UserRequestPrompt(id=req_id, text=tokens))
+    engine.add_request(UserRequestPrompt(id=req_id, text=tokens))
 
     start = time.time()
     while True:
         await asyncio.sleep(0.01)
-        result = serving_loop.results.get(req_id)
+        result = engine.results.get(req_id)
         if result is not None and result.done:
             text = tokenizer.decode(result.token_list)
             completion_tokens_count = result.tokens_decoded
-            del serving_loop.results[req_id]
+            del engine.results[req_id]
             latency = time.time() - start
             if wandb.run is not None:
                 wandb.log({
@@ -170,7 +171,7 @@ async def chat_completions(req: ChatCompletionRequest):
 # ---------------------------------------------------------------------------
 
 def main():
-    global serving_loop, tokenizer, max_pending_requests
+    global engine, tokenizer, max_pending_requests
 
     jax.distributed.initialize()
     pid = jax.process_index()
@@ -206,7 +207,9 @@ def main():
     # Load model
     model, params, config, tokenizer = load_model(args.model_path, args.checkpoint_path, mesh)
 
-    serve_cfg = ServingConfig(
+    engine_cfg = EngineConfig(
+        sampler=greedy,
+        detokenize_fn=tokenizer.decode,
         decode_steps=decode_steps,
         decode_batch_size=decode_batch_size,
         prefill_batch_size=prefill_batch_size,
@@ -216,19 +219,13 @@ def main():
         max_cache_seqlen=max_decode_length,
     )
 
-    serving_loop = ServingLoop(
-        serve_cfg=serve_cfg,
+    engine = InferenceEngine(
+        engine_cfg=engine_cfg,
         model=model,
         params=params,
         mesh=mesh,
         is_server=(pid == 0),
     )
-
-    print(f"[P{pid}] Warming up (compiling JIT functions)...")
-    sys.stdout.flush()
-    serving_loop.warmup()
-    print(f"[P{pid}] Warmup complete.")
-    sys.stdout.flush()
 
     # Initialize wandb on P0
     if pid == 0:
