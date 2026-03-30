@@ -278,6 +278,9 @@ def main():
     for relax_key in sorted(seen_relax_keys):
         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
         lazy = np.load(str(npy_path), mmap_mode="r")
+        # np.load mmap may return void16 instead of bfloat16; fix the dtype view
+        if lazy.dtype == np.dtype("V2"):
+            lazy = lazy.view(ml_dtypes.bfloat16)
         _insert_into_pytree(jax_pytree, relax_key, lazy)
 
     print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
