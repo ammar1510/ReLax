@@ -186,12 +186,16 @@ def main():
                         help="GCS destination, e.g. gs://bucket/checkpoint")
     parser.add_argument("--dry_run", action="store_true",
                         help="Only print HF→ReLax key mappings and shapes, skip writing")
+    parser.add_argument("--temp_dir", default="./temp_npy_weights",
+                        help="Directory for intermediate .npy files. Point to a "
+                             "GCS FUSE mount (e.g. /mnt/gcs/temp_weights) to avoid "
+                             "filling local disk. Defaults to ./temp_npy_weights.")
     args = parser.parse_args()
 
     if not args.dry_run and not args.gcs_path:
         parser.error("--gcs_path is required unless --dry_run is set")
 
-    temp_dir = Path("./temp_npy_weights")
+    temp_dir = Path(args.temp_dir)
     download_dir = Path("./temp_hf_download")
     target_dtype = ml_dtypes.bfloat16
 
