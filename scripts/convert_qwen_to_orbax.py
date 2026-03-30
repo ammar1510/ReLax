@@ -217,61 +217,75 @@ def main():
 
     # ------------------------------------------------------------------
     # PASS 1: download each shard, extract + transform, delete shard
+    # (skipped if temp_dir already contains .npy files)
     # ------------------------------------------------------------------
-    if args.dry_run:
-        print("\n--- DRY RUN: HF key → ReLax key + shape ---")
-    else:
-        print("\n--- PASS 1: Download + extract + transform → local .npy ---")
-        os.makedirs(temp_dir, exist_ok=True)
+    existing_npy = list(temp_dir.glob("*.npy")) if temp_dir.exists() else []
 
     seen_relax_keys: set[str] = set()
 
-    for shard_name in shard_filenames:
-        print(f"\n  Downloading {shard_name} ...")
-        local_shard = Path(hf_hub_download(
-            args.repo, shard_name, local_dir=download_dir,
-        ))
+    if existing_npy and not args.dry_run:
+        print(f"\n--- PASS 1: SKIPPED ({len(existing_npy)} .npy files already in {temp_dir}) ---")
+        for npy_path in existing_npy:
+            relax_key = npy_path.stem.replace("__", ".")
+            seen_relax_keys.add(relax_key)
+        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+        if missing:
+            print(f"  WARNING: {len(missing)} ReLax keys not found in temp_dir:")
+            for m in sorted(missing)[:20]:
+                print(f"    {m}")
+    else:
+        if args.dry_run:
+            print("\n--- DRY RUN: HF key → ReLax key + shape ---")
+        else:
+            print("\n--- PASS 1: Download + extract + transform → local .npy ---")
+            os.makedirs(temp_dir, exist_ok=True)
 
-        with safe_open(str(local_shard), framework="np", device="cpu") as f:
-            for hf_key in f.keys():
-                if hf_key not in key_map:
-                    print(f"  [SKIP] Unknown HF key: {hf_key}")
-                    continue
+        for shard_name in shard_filenames:
+            print(f"\n  Downloading {shard_name} ...")
+            local_shard = Path(hf_hub_download(
+                args.repo, shard_name, local_dir=download_dir,
+            ))
 
-                relax_key, xform_kw = key_map[hf_key]
+            with safe_open(str(local_shard), framework="np", device="cpu") as f:
+                for hf_key in f.keys():
+                    if hf_key not in key_map:
+                        print(f"  [SKIP] Unknown HF key: {hf_key}")
+                        continue
 
-                tensor = f.get_tensor(hf_key)
-                tensor = _transform(tensor, **xform_kw)
-                tensor = tensor.astype(target_dtype)
+                    relax_key, xform_kw = key_map[hf_key]
 
-                if args.dry_run:
-                    print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
-                else:
-                    npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-                    np.save(str(npy_path), tensor)
+                    tensor = f.get_tensor(hf_key)
+                    tensor = _transform(tensor, **xform_kw)
+                    tensor = tensor.astype(target_dtype)
 
-                seen_relax_keys.add(relax_key)
-                del tensor
+                    if args.dry_run:
+                        print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
+                    else:
+                        npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+                        np.save(str(npy_path), tensor)
 
-        # Delete the shard to reclaim disk space
-        local_shard.unlink(missing_ok=True)
-        gc.collect()
-        if not args.dry_run:
-            print(f"  Processed and deleted {shard_name}")
+                    seen_relax_keys.add(relax_key)
+                    del tensor
 
-    # Sanity check
-    missing = set(v[0] for v in key_map.values()) - seen_relax_keys
-    if missing:
-        print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
-        for m in sorted(missing)[:20]:
-            print(f"    {m}")
+            # Delete the shard to reclaim disk space
+            local_shard.unlink(missing_ok=True)
+            gc.collect()
+            if not args.dry_run:
+                print(f"  Processed and deleted {shard_name}")
 
-    # Clean up download directory
-    shutil.rmtree(download_dir, ignore_errors=True)
+        # Sanity check
+        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+        if missing:
+            print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
+            for m in sorted(missing)[:20]:
+                print(f"    {m}")
 
-    if args.dry_run:
-        print(f"\nTotal: {len(seen_relax_keys)} tensors mapped")
-        return
+        # Clean up download directory
+        shutil.rmtree(download_dir, ignore_errors=True)
+
+        if args.dry_run:
+            print(f"\nTotal: {len(seen_relax_keys)} tensors mapped")
+            return
 
     # ------------------------------------------------------------------
     # PASS 2: mmap .npy files, build pytree, stream to GCS via Orbax
