@@ -22,6 +22,7 @@ import argparse
 import gc
 import os
 import shutil
+import time
 from pathlib import Path
 
 import ml_dtypes  # noqa: F401 – registers bfloat16 with numpy
@@ -262,7 +263,12 @@ def main():
                         print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
                     else:
                         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+                        nbytes = tensor.nbytes
+                        t0 = time.time()
                         np.save(str(npy_path), tensor)
+                        elapsed = time.time() - t0
+                        print(f"    saved {relax_key}  {tuple(tensor.shape)}  "
+                              f"{nbytes / 1e6:.1f} MB  ({elapsed:.2f}s)")
 
                     seen_relax_keys.add(relax_key)
                     del tensor
@@ -292,16 +298,22 @@ def main():
     # ------------------------------------------------------------------
     print("\n--- PASS 2: Build lazy pytree → Orbax to GCS ---")
     jax_pytree: dict = {}
+    total_bytes = 0
 
-    for relax_key in sorted(seen_relax_keys):
+    sorted_keys = sorted(seen_relax_keys)
+    for idx, relax_key in enumerate(sorted_keys, 1):
         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
         lazy = np.load(str(npy_path), mmap_mode="r")
         # np.load mmap may return void16 instead of bfloat16; fix the dtype view
         if lazy.dtype == np.dtype("V2"):
             lazy = lazy.view(ml_dtypes.bfloat16)
+        nbytes = lazy.nbytes
+        total_bytes += nbytes
+        print(f"  [{idx}/{len(sorted_keys)}] mmap {relax_key}  {tuple(lazy.shape)}  {nbytes / 1e6:.1f} MB")
         _insert_into_pytree(jax_pytree, relax_key, lazy)
 
-    print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
+    print(f"\nLazy pytree assembled: {len(seen_relax_keys)} arrays, "
+          f"total logical size {total_bytes / 1e9:.2f} GB")
 
     shared = args.gcs_path.startswith("gs://")
     if shared:
@@ -314,10 +326,14 @@ def main():
 
     mngr = ocp.CheckpointManager(args.gcs_path, options=options)
 
-    print(f"Streaming to {args.gcs_path} ...")
+    print(f"\nStreaming to {args.gcs_path} ...")
+    t_save_start = time.time()
     mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
+    print("  save() returned, waiting for upload to finish ...")
     mngr.wait_until_finished()
-    print("Upload complete!")
+    elapsed_save = time.time() - t_save_start
+    throughput = total_bytes / elapsed_save / 1e6
+    print(f"Upload complete! ({elapsed_save:.1f}s, ~{throughput:.0f} MB/s)")
 
     # Clean up .npy temp files
     shutil.rmtree(temp_dir, ignore_errors=True)
