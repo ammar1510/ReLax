@@ -22,6 +22,10 @@ import argparse
 import gc
 import os
 import shutil
+
+# Limit tensorstore parallelism to avoid OOM during Orbax upload.
+# Must be set before importing orbax/tensorstore.
+os.environ.setdefault("TENSORSTORE_NUM_THREADS", "2")
 import time
 from pathlib import Path
 
