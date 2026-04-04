@@ -191,6 +191,9 @@ def main():
                         help="Directory for intermediate .npy files. Point to a "
                              "GCS FUSE mount (e.g. /mnt/gcs/temp_weights) to avoid "
                              "filling local disk. Defaults to ./temp_npy_weights.")
+    parser.add_argument("--no_mmap", action="store_true",
+                        help="Load .npy files into RAM instead of memory-mapping. "
+                             "Requires ~244GB RAM but avoids potential dtype issues.")
     args = parser.parse_args()
 
     if not args.dry_run and not args.gcs_path:
@@ -303,14 +306,18 @@ def main():
     sorted_keys = sorted(seen_relax_keys)
     for idx, relax_key in enumerate(sorted_keys, 1):
         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-        lazy = np.load(str(npy_path), mmap_mode="r")
+        if args.no_mmap:
+            arr = np.load(str(npy_path))
+        else:
+            arr = np.load(str(npy_path), mmap_mode="r")
         # np.load mmap may return void16 instead of bfloat16; fix the dtype view
-        if lazy.dtype == np.dtype("V2"):
-            lazy = lazy.view(ml_dtypes.bfloat16)
-        nbytes = lazy.nbytes
+        if arr.dtype == np.dtype("V2"):
+            arr = arr.view(ml_dtypes.bfloat16)
+        nbytes = arr.nbytes
         total_bytes += nbytes
-        print(f"  [{idx}/{len(sorted_keys)}] mmap {relax_key}  {tuple(lazy.shape)}  {nbytes / 1e6:.1f} MB")
-        _insert_into_pytree(jax_pytree, relax_key, lazy)
+        mode = "load" if args.no_mmap else "mmap"
+        print(f"  [{idx}/{len(sorted_keys)}] {mode} {relax_key}  {tuple(arr.shape)}  {nbytes / 1e6:.1f} MB")
+        _insert_into_pytree(jax_pytree, relax_key, arr)
 
     print(f"\nLazy pytree assembled: {len(seen_relax_keys)} arrays, "
           f"total logical size {total_bytes / 1e9:.2f} GB")
