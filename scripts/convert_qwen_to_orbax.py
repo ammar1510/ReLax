@@ -265,9 +265,12 @@ def main():
                     tensor = f.get_tensor(hf_key)
                     tensor = _transform(tensor, **xform_kw)
                     tensor = tensor.astype(target_dtype)
+                    # View as uint16 (same 2 bytes) so TensorStore can
+                    # handle it natively without copying mmap'd data.
+                    tensor = tensor.view(np.uint16)
 
                     if args.dry_run:
-                        print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
+                        print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  bfloat16 (saved as uint16)")
                     else:
                         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
                         nbytes = tensor.nbytes
@@ -314,9 +317,9 @@ def main():
             arr = np.load(str(npy_path))
         else:
             arr = np.load(str(npy_path), mmap_mode="r")
-        # np.load mmap may return void16 instead of bfloat16; fix the dtype view
-        if arr.dtype == np.dtype("V2"):
-            arr = arr.view(ml_dtypes.bfloat16)
+        # Files are saved as uint16 (bit-identical to bfloat16).
+        # Keep as uint16 so TensorStore streams directly from mmap
+        # without copying. View back to bfloat16 at model load time.
         nbytes = arr.nbytes
         total_bytes += nbytes
         mode = "load" if args.no_mmap else "mmap"
