@@ -329,14 +329,16 @@ def main():
 
         # Determine sharding and place directly on TPU
         spec = MeshHelper.param_sharding(arr, relax_key, mesh)
+        t0 = time.time()
         jax_arr = jax.device_put(arr, NamedSharding(mesh, spec))
+        dt = time.time() - t0
         del arr  # free host RAM immediately
 
         _insert_into_pytree(params, relax_key, jax_arr)
 
-        if idx % 50 == 0 or idx == len(sorted_keys):
-            print(f"  [{idx}/{len(sorted_keys)}] {relax_key}  "
-                  f"{tuple(jax_arr.shape)}  sharding={spec}")
+        print(f"  [{idx}/{len(sorted_keys)}] {relax_key}  "
+              f"{tuple(jax_arr.shape)}  {spec}  "
+              f"{jax_arr.nbytes / 1e6:.1f} MB  ({dt:.2f}s)")
 
     jax.block_until_ready(params)
     elapsed_shard = time.time() - t_shard

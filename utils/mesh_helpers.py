@@ -197,13 +197,19 @@ class MeshHelper:
         if tp is None or "norm" in name or "freqs_cis" in name or "shared_expert_gate" in name:
             return PS()
         if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
-            spec = [None] * ndim
-            spec[1] = tp
-            return PS(*spec)
+            shard_axis = 1
+            if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
+                spec = [None] * ndim
+                spec[shard_axis] = tp
+                return PS(*spec)
+            return PS()
         if any(k in name for k in ("down", "output", "wo")):
-            spec = [None] * ndim
-            spec[0] = tp
-            return PS(*spec)
+            shard_axis = 0
+            if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
+                spec = [None] * ndim
+                spec[shard_axis] = tp
+                return PS(*spec)
+            return PS()
         return PS()
 
     @staticmethod
