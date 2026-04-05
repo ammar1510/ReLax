@@ -346,10 +346,13 @@ def main():
         save_concurrent_gb=20,
         save_device_host_concurrent_gb=10,
     )
+    registry = ocp.DefaultCheckpointHandlerRegistry()
+    registry.add("default", ocp.args.StandardSave, handler)
+    registry.add("default", ocp.args.StandardRestore, handler)
     mngr = ocp.CheckpointManager(
         args.gcs_path,
         options=options,
-        checkpointers=ocp.Checkpointer(handler),
+        handler_registry=registry,
     )
 
     print(f"\nStreaming to {args.gcs_path} ...")
