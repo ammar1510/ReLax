@@ -186,10 +186,8 @@ def main():
                         help="Print HF→ReLax key mappings and shapes only")
     parser.add_argument("--temp_dir", required=True,
                         help="Directory for intermediate .npy files")
-    parser.add_argument("--dp", type=int, default=2,
-                        help="Data-parallel mesh dimension (default: 2)")
-    parser.add_argument("--tp", type=int, default=8,
-                        help="Tensor-parallel mesh dimension (default: 8)")
+    parser.add_argument("--tp", type=int, default=16,
+                        help="Tensor-parallel mesh dimension (default: 16)")
     args = parser.parse_args()
 
     temp_dir = Path(args.temp_dir)
@@ -289,22 +287,28 @@ def main():
     # ------------------------------------------------------------------
     import jax
     import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding
-    from utils.mesh_helpers import MeshHelper
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
     from models.sync_server import SyncServer
 
     print(f"\n--- STAGE 2: Load and shard onto TPU tensor-by-tensor "
-          f"(dp={args.dp}, tp={args.tp}) ---")
+          f"(tp={args.tp}) ---")
 
-    # Create TPU mesh
+    # Create TP-only mesh
     devices = jax.devices()
-    expected = args.dp * args.tp
-    assert len(devices) == expected, (
-        f"Expected {expected} devices (dp={args.dp} × tp={args.tp}), "
-        f"got {len(devices)}"
+    assert len(devices) == args.tp, (
+        f"Expected {args.tp} devices (tp={args.tp}), got {len(devices)}"
     )
-    mesh = Mesh(np.array(devices).reshape(args.dp, args.tp), ("dp", "tp"))
+    mesh = Mesh(np.array(devices), ("tp",))
     print(f"Mesh: {mesh.shape} on {len(devices)} device(s)")
+
+    def _auto_shard_spec(shape: tuple, tp: int) -> PS:
+        """Find the first axis divisible by tp and shard on it; else replicate."""
+        for axis in range(len(shape)):
+            if shape[axis] % tp == 0:
+                spec = [None] * len(shape)
+                spec[axis] = "tp"
+                return PS(*spec)
+        return PS()
 
     # Load each .npy, shard onto TPU, discard numpy array immediately.
     # Barrier before each device_put ensures all hosts are ready.
@@ -327,8 +331,8 @@ def main():
         # Sync all hosts before placing on device
         SyncServer.barrier("shard_param", idx)
 
-        # Determine sharding and place directly on TPU
-        spec = MeshHelper.param_sharding(arr, relax_key, mesh)
+        # Shard on first divisible axis, else replicate
+        spec = _auto_shard_spec(arr.shape, args.tp)
         t0 = time.time()
         jax_arr = jax.device_put(arr, NamedSharding(mesh, spec))
         dt = time.time() - t0
