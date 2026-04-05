@@ -17,6 +17,7 @@ dependencies = [
   "uvicorn[standard]",
   "google-cloud-storage",
   "gcsfs"
+  "ml-dtypes"
 ]
 
 [project.optional-dependencies]
