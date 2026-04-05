@@ -198,6 +198,10 @@ def main():
     parser.add_argument("--no_mmap", action="store_true",
                         help="Load .npy files into RAM instead of memory-mapping. "
                              "Requires ~244GB RAM but avoids potential dtype issues.")
+    parser.add_argument("--orbax_dir",
+                        help="Local directory for Orbax checkpoint output. "
+                             "Use this to write locally (e.g. to tmpfs) then copy "
+                             "to GCS manually. Overrides --gcs_path for the save.")
     args = parser.parse_args()
 
     if not args.dry_run and not args.gcs_path:
@@ -338,7 +342,15 @@ def main():
     else:
         options = ocp.CheckpointManagerOptions()
 
-    mngr = ocp.CheckpointManager(args.gcs_path, options=options)
+    handler = ocp.PyTreeCheckpointHandler(
+        save_concurrent_gb=20,
+        save_device_host_concurrent_gb=10,
+    )
+    mngr = ocp.CheckpointManager(
+        args.gcs_path,
+        options=options,
+        checkpointers=ocp.Checkpointer(handler),
+    )
 
     print(f"\nStreaming to {args.gcs_path} ...")
     t_save_start = time.time()
