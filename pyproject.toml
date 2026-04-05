@@ -16,7 +16,7 @@ dependencies = [
   "fastapi",
   "uvicorn[standard]",
   "google-cloud-storage",
-  "gcsfs"
+  "gcsfs",
   "ml-dtypes"
 ]
 
