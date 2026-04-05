@@ -346,18 +346,15 @@ def main():
         save_concurrent_gb=20,
         save_device_host_concurrent_gb=10,
     )
-    registry = ocp.DefaultCheckpointHandlerRegistry()
-    registry.add("default", ocp.args.StandardSave, handler)
-    registry.add("default", ocp.args.StandardRestore, handler)
     mngr = ocp.CheckpointManager(
         args.gcs_path,
         options=options,
-        handler_registry=registry,
+        checkpointers=ocp.Checkpointer(handler),
     )
 
     print(f"\nStreaming to {args.gcs_path} ...")
     t_save_start = time.time()
-    mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
+    mngr.save(step=0, args=ocp.args.PyTreeSave(jax_pytree))
     print("  save() returned, waiting for upload to finish ...")
     mngr.wait_until_finished()
     elapsed_save = time.time() - t_save_start
