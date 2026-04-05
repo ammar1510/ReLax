@@ -196,14 +196,14 @@ class MeshHelper:
         ndim = len(x.shape) if not hasattr(x, "ndim") else x.ndim
         if tp is None or "norm" in name or "freqs_cis" in name or "shared_expert_gate" in name:
             return PS()
-        if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
+        if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up", "in_proj")):
             shard_axis = 1
             if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
                 spec = [None] * ndim
                 spec[shard_axis] = tp
                 return PS(*spec)
             return PS()
-        if any(k in name for k in ("down", "output", "wo")):
+        if any(k in name for k in ("down", "output", "wo", "out_proj")):
             shard_axis = 0
             if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
                 spec = [None] * ndim
