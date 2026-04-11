@@ -132,6 +132,11 @@ class SlidingAttentionBlock(nn.Module):
             "post_feedforward_layernorm", nn.initializers.ones, (cfg.dim,), dt
         )
 
+        # Per-layer residual scalar
+        self.layer_scalar = self.param(
+            "layer_scalar", nn.initializers.ones, (), dt
+        )
+
     def __call__(
         self,
         x: jax.Array,
@@ -180,7 +185,8 @@ class SlidingAttentionBlock(nn.Module):
 
         # Attention scores
         xq_t = xq.transpose(0, 2, 1, 3)
-        scores = jnp.einsum("bhqd,bhkd->bhqk", xq_t, keys) / jnp.sqrt(float(hd))
+        # QK norm replaces traditional 1/sqrt(d) scaling
+        scores = jnp.einsum("bhqd,bhkd->bhqk", xq_t, keys)
 
         attn_mask = mask[:, None, :, :]
         scores = jnn.softmax(scores.astype(jnp.float32), where=attn_mask, axis=-1).astype(
@@ -202,6 +208,9 @@ class SlidingAttentionBlock(nn.Module):
         ffn_output = feed_forward(h_ffn, self.feed_forward_params, cfg.activation_fn)
         ffn_output = rms_norm(ffn_output, self.post_feedforward_layernorm, eps=cfg.rms_norm_eps)
         x = residual + ffn_output
+
+        # Per-layer scalar
+        x = x * self.layer_scalar
 
         return x, updated_cache
 
@@ -255,6 +264,11 @@ class GlobalAttentionBlock(nn.Module):
             "post_feedforward_layernorm", nn.initializers.ones, (cfg.dim,), dt
         )
 
+        # Per-layer residual scalar
+        self.layer_scalar = self.param(
+            "layer_scalar", nn.initializers.ones, (), dt
+        )
+
     def __call__(
         self,
         x: jax.Array,
@@ -275,12 +289,10 @@ class GlobalAttentionBlock(nn.Module):
         xq = jnp.einsum("bsd,dhc->bshc", h, self.wq)
         xk = jnp.einsum("bsd,dkc->bskc", h, self.wk)
 
-        # QK norm
+        # QK norm (with learned scale); V norm (no scale) on same raw projection
         xq = rms_norm(xq, self.q_norm, eps=cfg.rms_norm_eps)
+        xv = rms_norm_no_scale(xk, eps=cfg.rms_norm_eps)
         xk = rms_norm(xk, self.k_norm, eps=cfg.rms_norm_eps)
-
-        # K = V (attention_k_eq_v)
-        xv = xk
 
         # Partial RoPE (25% of global_head_dim)
         start_positions = kv_cache.seq_positions
@@ -305,7 +317,8 @@ class GlobalAttentionBlock(nn.Module):
 
         # Attention scores
         xq_t = xq.transpose(0, 2, 1, 3)
-        scores = jnp.einsum("bhqd,bhkd->bhqk", xq_t, keys) / jnp.sqrt(float(ghd))
+        # QK norm replaces traditional 1/sqrt(d) scaling
+        scores = jnp.einsum("bhqd,bhkd->bhqk", xq_t, keys)
 
         attn_mask = mask[:, None, :, :]
         scores = jnn.softmax(scores.astype(jnp.float32), where=attn_mask, axis=-1).astype(
@@ -327,6 +340,9 @@ class GlobalAttentionBlock(nn.Module):
         ffn_output = feed_forward(h_ffn, self.feed_forward_params, cfg.activation_fn)
         ffn_output = rms_norm(ffn_output, self.post_feedforward_layernorm, eps=cfg.rms_norm_eps)
         x = residual + ffn_output
+
+        # Per-layer scalar
+        x = x * self.layer_scalar
 
         return x, updated_cache
 

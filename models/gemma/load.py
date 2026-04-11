@@ -144,6 +144,11 @@ def _convert_layer(
         _get(hf_weights, f"{lp}.post_feedforward_layernorm.weight")
     )
 
+    # Per-layer residual scalar
+    scalar_key = f"{lp}.layer_scalar"
+    if scalar_key in hf_weights:
+        layer["layer_scalar"] = _to_f32(_get(hf_weights, scalar_key))
+
     return layer
 
 

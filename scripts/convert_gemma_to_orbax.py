@@ -146,6 +146,9 @@ def _build_key_map(config: GemmaConfig, prefix: str) -> dict[str, tuple[str, dic
             f"{lk}.post_feedforward_layernorm", {}
         )
 
+        # Per-layer residual scalar
+        key_map[f"{lp}.layer_scalar"] = (f"{lk}.layer_scalar", {})
+
     return key_map
 
 
