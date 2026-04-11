@@ -176,7 +176,21 @@ def _download_config(repo_id: str, cache_dir: Path) -> Path:
 
 def _peek_hf_keys(repo_id: str, shard_filenames: list[str],
                    download_dir: Path) -> list[str]:
-    """Download the first shard and return its keys to detect the HF prefix."""
+    """Return weight key names from the safetensors index (no shard download needed)."""
+    import json
+    # Try the sharded index file first -- it lists all keys without downloading weights.
+    for index_name in ("model.safetensors.index.json",
+                       "model.safetensors.index.json"):
+        try:
+            index_path = Path(hf_hub_download(
+                repo_id, index_name, local_dir=download_dir,
+            ))
+            with open(index_path) as fh:
+                data = json.load(fh)
+            return list(data["weight_map"].keys())
+        except Exception:
+            pass
+    # Fallback: download only the first shard (may be large).
     first = Path(hf_hub_download(
         repo_id, shard_filenames[0], local_dir=download_dir,
     ))
