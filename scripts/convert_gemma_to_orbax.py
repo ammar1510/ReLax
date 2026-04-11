@@ -29,8 +29,10 @@ Usage:
 
 import argparse
 import gc
+import json as _json
 import os
 import shutil
+import struct
 import time
 from pathlib import Path
 
@@ -39,8 +41,20 @@ os.environ.setdefault("TENSORSTORE_NUM_THREADS", "2")
 
 import ml_dtypes  # noqa: F401 -- registers bfloat16 with numpy
 import numpy as np
-from huggingface_hub import HfApi, hf_hub_download
+import requests as _requests
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
+from huggingface_hub.utils import build_hf_headers
 from safetensors import safe_open
+
+_SF_DTYPE_MAP = {
+    "F32":  np.float32,
+    "F16":  np.float16,
+    "BF16": ml_dtypes.bfloat16,
+    "I32":  np.int32,
+    "I64":  np.int64,
+    "I8":   np.int8,
+    "U8":   np.uint8,
+}
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -177,26 +191,75 @@ def _download_config(repo_id: str, cache_dir: Path) -> Path:
 def _peek_hf_keys(repo_id: str, shard_filenames: list[str],
                    download_dir: Path) -> list[str]:
     """Return weight key names from the safetensors index (no shard download needed)."""
-    import json
-    # Try the sharded index file first -- it lists all keys without downloading weights.
-    for index_name in ("model.safetensors.index.json",
-                       "model.safetensors.index.json"):
-        try:
-            index_path = Path(hf_hub_download(
-                repo_id, index_name, local_dir=download_dir,
-            ))
-            with open(index_path) as fh:
-                data = json.load(fh)
-            return list(data["weight_map"].keys())
-        except Exception:
-            pass
-    # Fallback: download only the first shard (may be large).
-    first = Path(hf_hub_download(
-        repo_id, shard_filenames[0], local_dir=download_dir,
+    index_path = Path(hf_hub_download(
+        repo_id, "model.safetensors.index.json", local_dir=download_dir,
     ))
-    with safe_open(str(first), framework="np", device="cpu") as f:
-        keys = list(f.keys())
-    return keys
+    with open(index_path) as fh:
+        data = _json.load(fh)
+    return list(data["weight_map"].keys())
+
+
+def _process_shard_via_ranges(
+    repo_id: str,
+    filename: str,
+    key_map: dict,
+    temp_dir: Path,
+    target_dtype,
+) -> set[str]:
+    """
+    Fetch only the tensors we need from a safetensors shard using HTTP range
+    requests.  No full-shard download; processes and saves each tensor as .npy
+    immediately.
+    """
+    url = hf_hub_url(repo_id, filename)
+    session = _requests.Session()
+    session.headers.update(build_hf_headers())
+
+    # --- read 8-byte header length ---
+    r = session.get(url, headers={"Range": "bytes=0-7"})
+    r.raise_for_status()
+    header_size = struct.unpack("<Q", r.content)[0]
+
+    # --- read JSON metadata header ---
+    r = session.get(url, headers={"Range": f"bytes=8-{7 + header_size}"})
+    r.raise_for_status()
+    sf_header = _json.loads(r.content)
+
+    data_base = 8 + header_size  # byte offset where tensor data begins
+    seen: set[str] = set()
+    tensor_keys = [k for k in sf_header if k != "__metadata__"]
+
+    for idx, hf_key in enumerate(tensor_keys, 1):
+        if hf_key not in key_map:
+            print(f"  [SKIP] {hf_key}")
+            continue
+
+        relax_key, xform_kw = key_map[hf_key]
+        meta = sf_header[hf_key]
+        lo, hi = meta["data_offsets"]
+        abs_lo = data_base + lo
+        abs_hi = data_base + hi - 1
+
+        t0 = time.time()
+        r = session.get(url, headers={"Range": f"bytes={abs_lo}-{abs_hi}"})
+        r.raise_for_status()
+
+        np_dtype = _SF_DTYPE_MAP[meta["dtype"]]
+        tensor = np.frombuffer(r.content, dtype=np_dtype).reshape(meta["shape"]).copy()
+        tensor = _transform(tensor, **xform_kw)
+        tensor = tensor.astype(target_dtype)
+
+        npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+        np.save(str(npy_path), tensor)
+        elapsed = time.time() - t0
+
+        mb = tensor.nbytes / 1e6
+        print(f"  [{idx}/{len(tensor_keys)}] {relax_key}  "
+              f"{tuple(tensor.shape)}  {mb:.1f} MB  ({elapsed:.2f}s)")
+        seen.add(relax_key)
+        del tensor, r
+
+    return seen
 
 
 # ---- main ------------------------------------------------------------------
@@ -260,51 +323,33 @@ def main():
         for npy_path in existing_npy:
             relax_key = npy_path.stem.replace("__", ".")
             seen_relax_keys.add(relax_key)
+    elif args.dry_run:
+        # Dry run: just read the index to print key mappings (no download needed).
+        print("\n--- DRY RUN: HF key -> ReLax key + shape (from index) ---")
+        index_path = Path(hf_hub_download(
+            args.repo, "model.safetensors.index.json", local_dir=download_dir,
+        ))
+        with open(index_path) as fh:
+            index_data = _json.load(fh)
+        for hf_key in sorted(index_data["weight_map"]):
+            if hf_key in key_map:
+                relax_key, _ = key_map[hf_key]
+                print(f"  {hf_key}  ->  {relax_key}")
+            else:
+                print(f"  [SKIP] {hf_key}")
+        shutil.rmtree(download_dir, ignore_errors=True)
     else:
-        if args.dry_run:
-            print("\n--- DRY RUN: HF key -> ReLax key + shape ---")
-        else:
-            print("\n--- STAGE 1: Download + transform -> .npy ---")
-            os.makedirs(temp_dir, exist_ok=True)
+        print("\n--- STAGE 1: Streaming tensors via HTTP range requests ---")
+        os.makedirs(temp_dir, exist_ok=True)
 
         for shard_name in shard_filenames:
-            print(f"\n  Downloading {shard_name} ...")
-            local_shard = Path(hf_hub_download(
-                args.repo, shard_name, local_dir=download_dir,
-            ))
-
-            with safe_open(str(local_shard), framework="np",
-                           device="cpu") as f:
-                for hf_key in f.keys():
-                    if hf_key not in key_map:
-                        print(f"  [SKIP] Unknown HF key: {hf_key}")
-                        continue
-
-                    relax_key, xform_kw = key_map[hf_key]
-                    tensor = f.get_tensor(hf_key)
-                    tensor = _transform(tensor, **xform_kw)
-                    tensor = tensor.astype(target_dtype)
-
-                    if args.dry_run:
-                        print(f"  {hf_key}  ->  {relax_key}  "
-                              f"{tuple(tensor.shape)}  {tensor.dtype}")
-                    else:
-                        npy_path = temp_dir / (
-                            relax_key.replace(".", "__") + ".npy"
-                        )
-                        t0 = time.time()
-                        np.save(str(npy_path), tensor)
-                        elapsed = time.time() - t0
-                        print(f"    saved {relax_key}  {tuple(tensor.shape)}  "
-                              f"{tensor.nbytes / 1e6:.1f} MB  ({elapsed:.2f}s)")
-
-                    seen_relax_keys.add(relax_key)
-                    del tensor
-
-            local_shard.unlink(missing_ok=True)
+            print(f"\n  Streaming {shard_name} ...")
+            new_keys = _process_shard_via_ranges(
+                args.repo, shard_name, key_map, temp_dir, target_dtype,
+            )
+            seen_relax_keys.update(new_keys)
             gc.collect()
-            if not args.dry_run:
-                print(f"  Processed and deleted {shard_name}")
+            print(f"  Done with {shard_name} ({len(new_keys)} tensors saved)")
 
         shutil.rmtree(download_dir, ignore_errors=True)
 
