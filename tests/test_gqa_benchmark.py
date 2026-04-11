@@ -117,13 +117,10 @@ class AttentionBenchmarkSuite:
         )
         
         # Create KV cache
-        kv_cache = KVCache.new(
-            n_layers=1,
-            bsz=batch_size,
-            max_seqlen=self.max_seq_len,
-            kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            dtype=dtype,
+        kv_cache = KVCache(
+            k=jnp.zeros((1, batch_size, n_kv_heads, self.max_seq_len, head_dim), dtype=dtype),
+            v=jnp.zeros((1, batch_size, n_kv_heads, self.max_seq_len, head_dim), dtype=dtype),
+            seq_positions=jnp.zeros(batch_size, dtype=jnp.int32),
         )
         
         # For decode scenario, pre-fill cache with some data

@@ -29,10 +29,9 @@ from jax import jit
 
 from jax import random
 
-from utils.kvcache import KVCache
 from utils.padding import take_nearest_bucket, pad_to_bucket, DEFAULT_PREFILL_BUCKETS
-from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
+from utils.cache_protocol import CacheProtocol
 from models.sync_server import SyncServer
 from sampling import greedy
 
@@ -161,35 +160,30 @@ class InferenceEngine:
         model,
         params: FrozenDict,
         mesh: Mesh,
+        cache_cls: type[CacheProtocol],
         max_concurrent_slots: int = 8,
         pad_id: int = 0,
         sampler: Optional[callable] = None,
         rng_seed: int = 0,
         max_cache_seqlen: Optional[int] = None,
-        cache_factory: Optional[callable] = None,
-        cache_slicer: Optional[callable] = None,
-        cache_updater: Optional[callable] = None,
-        mask_cache_extractor: Optional[callable] = None,
-        place_cache: Optional[callable] = None,
     ):
         """Initialize the inference engine.
 
         Args:
-            model: Model instance (LLaMa, Qwen, or any duck-typed model)
+            model: Model instance (LLaMa, Qwen, Gemma, or any duck-typed model)
             params: Model parameters (Flax FrozenDict)
             mesh: JAX mesh for sharded computation
+            cache_cls: Cache class implementing the cache protocol (KVCache, GemmaCache, HybridCache).
+                       Must implement new(config, bsz, max_seqlen), slice(idx),
+                       init_on_mesh(mesh), place_on_mesh(mesh), batch_insert(...).
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
             sampler: Sample function (logits, key) -> token_ids (default: greedy)
             rng_seed: Seed for PRNG key used in stochastic sampling
             max_cache_seqlen: Override model's max_seqlen for KV cache allocation
-            cache_factory: (bsz) -> cache. Defaults to KVCache.new().
-            cache_slicer: (cache, idx) -> single_cache. Defaults to KVCache slicing.
-            cache_updater: (decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens) -> (cache, tokens).
-            mask_cache_extractor: (cache) -> kv_cache_for_mask. Defaults to identity.
-            place_cache: (cache, mesh) -> cache. Defaults to MeshHelper.place_kv_cache.
         """
         self.model = model
+        self.cache_cls = cache_cls
         self.max_slots = max_concurrent_slots
         self.pad_id = pad_id
         self.mesh = mesh
@@ -205,26 +199,17 @@ class InferenceEngine:
         # Cache model config for convenience
         self.config = model.args
 
-        # Cache callbacks (default to KVCache behavior)
-        self.cache_factory = cache_factory or self._default_cache_factory
-        self.cache_slicer = cache_slicer or self._default_cache_slicer
-        self.cache_updater = cache_updater or self._default_cache_updater
-        self.mask_cache_extractor = mask_cache_extractor or (lambda c: c)
-        self.place_cache = place_cache or (lambda c, m: MeshHelper.place_kv_cache(c, m))
-        self.init_cache = lambda c, m: MeshHelper.init_kv_cache_on_mesh(c, m)
-
         sample_fn = self.sampler
 
         # Create jitted core function for batched prefill logic
         @jit
-        def _jitted_prefill_core(params, tokens, true_lengths, cache, mask, rng_key):
+        def _jitted_prefill_core(params, tokens, true_lengths, cache, rng_key):
             # Forward pass through model (positional args for model-agnostic call)
             logits, updated_cache = self.model.apply(
                 {"params": params},
                 tokens,
                 true_lengths,
                 cache,
-                mask,
             )
 
             # Extract logit at position (true_length - 1) for each sequence
@@ -236,37 +221,6 @@ class InferenceEngine:
             return updated_cache, next_tokens
 
         self._jitted_prefill_core = _jitted_prefill_core
-
-    def _default_cache_factory(self, bsz, max_seqlen):
-        return KVCache.new(
-            n_layers=self.config.n_layers,
-            bsz=bsz,
-            max_seqlen=max_seqlen,
-            kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.head_dim,
-            dtype=jnp.dtype(self.config.dtype),
-        )
-
-    def _default_cache_slicer(self, cache, idx):
-        return KVCache(
-            k=cache.k[:, idx : idx + 1, :, :, :],
-            v=cache.v[:, idx : idx + 1, :, :, :],
-            seq_positions=cache.seq_positions[idx : idx + 1],
-        )
-
-    def _default_cache_updater(self, decode_cache, entries, slot_idxs, lens, next_tokens, curr_tokens):
-        idx = jnp.array(slot_idxs)
-        # Batch-update positions and tokens (scalars, no seqlen dimension)
-        new_positions = decode_cache.seq_positions.at[idx].set(jnp.array(lens))
-        new_tokens = curr_tokens.at[idx, 0].set(jnp.array(next_tokens))
-        # Update KV cache per-entry to handle different prefill bucket sizes
-        new_k = decode_cache.k
-        new_v = decode_cache.v
-        for entry, slot_idx in zip(entries, slot_idxs):
-            prefill_seqlen = entry.k.shape[3]
-            new_k = new_k.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.k[:, 0, :, :, :])
-            new_v = new_v.at[:, slot_idx, :, :prefill_seqlen, :].set(entry.v[:, 0, :, :, :])
-        return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
 
     def prefill(
         self,
@@ -292,11 +246,8 @@ class InferenceEngine:
         """
         bsz, bucket_size = tokens.shape
 
-        try:
-            cache = self.cache_factory(bsz, max_seqlen=bucket_size)
-        except TypeError:
-            cache = self.cache_factory(bsz)
-        cache = self.init_cache(cache, self.mesh)
+        cache = self.cache_cls.new(self.config, bsz, bucket_size)
+        cache = cache.init_on_mesh(self.mesh)
 
         tokens = MeshHelper.put_on_mesh(
             tokens,
@@ -309,15 +260,12 @@ class InferenceEngine:
             MeshHelper.batch_axis_spec(self.mesh, rank=1, batch_axis=0),
         )
 
-        mask = build_attn_mask(bucket_size, self.mask_cache_extractor(cache), true_lengths)
-
         self.rng_key, subkey = random.split(self.rng_key)
         updated_cache, next_tokens = self._jitted_prefill_core(
             self.params,
             tokens,
             true_lengths,
             cache,
-            mask,
             subkey,
         )
 
@@ -343,7 +291,6 @@ class InferenceEngine:
 
         # Capture callbacks for use inside JIT
         sample_fn = self.sampler
-        mask_extractor = self.mask_cache_extractor
 
         @partial(jax.jit, static_argnames=("steps", "eos_tokens"), donate_argnames=("cache",))
         def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10, eos_tokens: tuple = ()):
@@ -371,17 +318,12 @@ class InferenceEngine:
 
                 true_lengths = active_mask.astype(jnp.int32)
 
-                # Build attention mask
-                bsz, seqlen = curr_tokens.shape
-                mask = build_attn_mask(seqlen, mask_extractor(cache), true_lengths)
-
                 # Forward pass — params passed from outer scope (JIT arg, not closure capture)
                 logits, updated_cache = engine.model.apply(
                     {"params": params},
                     curr_tokens,
                     true_lengths,
                     cache,
-                    mask,
                 )
 
                 # Sample next tokens
@@ -428,8 +370,8 @@ class InferenceEngine:
         Returns:
             Tuple of (cache, tokens) placed on the mesh
         """
-        cache = self.cache_factory(self.max_slots, max_seqlen=self.max_cache_seqlen)
-        cache = self.init_cache(cache, self.mesh)
+        cache = self.cache_cls.new(self.config, self.max_slots, self.max_cache_seqlen)
+        cache = cache.init_on_mesh(self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = MeshHelper.put_on_mesh(
@@ -477,27 +419,19 @@ class ServingLoop:
         model,
         params: FrozenDict,
         mesh: Mesh,
+        cache_cls: type[CacheProtocol],
         is_server: bool = False,
         verbose: bool = False,
-        cache_factory: Optional[callable] = None,
-        cache_slicer: Optional[callable] = None,
-        cache_updater: Optional[callable] = None,
-        mask_cache_extractor: Optional[callable] = None,
-        place_cache: Optional[callable] = None,
     ):
         """Initialize the serving loop.
 
         Args:
             serve_cfg: Serving configuration
-            model: Model instance (LLaMa, Qwen, or any duck-typed model)
+            model: Model instance (LLaMa, Qwen, Gemma, or any duck-typed model)
             params: Model parameters
             mesh: JAX mesh for sharded computation
+            cache_cls: Cache class implementing the cache protocol (forwarded to InferenceEngine)
             is_server: Whether this process is the server (receives requests)
-            cache_factory: Cache factory callback (forwarded to InferenceEngine)
-            cache_slicer: Cache slicer callback (forwarded to InferenceEngine)
-            cache_updater: Cache updater callback (forwarded to InferenceEngine)
-            mask_cache_extractor: Mask cache extractor callback (forwarded to InferenceEngine)
-            place_cache: Cache placement callback (forwarded to InferenceEngine)
         """
         self.serve_cfg = serve_cfg
         self.model = model
@@ -509,16 +443,12 @@ class ServingLoop:
             model=model,
             params=params,
             mesh=mesh,
+            cache_cls=cache_cls,
             max_concurrent_slots=serve_cfg.decode_batch_size,
             pad_id=serve_cfg.token_pad_idx,
             sampler=serve_cfg.sampler,
             rng_seed=serve_cfg.rng_seed,
             max_cache_seqlen=serve_cfg.max_cache_seqlen,
-            cache_factory=cache_factory,
-            cache_slicer=cache_slicer,
-            cache_updater=cache_updater,
-            mask_cache_extractor=mask_cache_extractor,
-            place_cache=place_cache,
         )
 
         # Initialize decode state
@@ -644,7 +574,7 @@ class ServingLoop:
         Returns:
             Dict with single-sequence cache matching prefill() output format
         """
-        single_cache = self.engine.cache_slicer(batched_result["cache"], idx)
+        single_cache = batched_result["cache"].slice(idx)
 
         return {
             "cache": single_cache,
@@ -663,9 +593,8 @@ class ServingLoop:
         """
         entries, slot_idxs, lens, next_tokens = map(list, zip(*batch_updates))
 
-        new_cache, new_tokens = self.engine.cache_updater(
-            self.decode_work.cache, entries, slot_idxs, lens, next_tokens,
-            self.decode_work.curr_tokens,
+        new_cache, new_tokens = self.decode_work.cache.batch_insert(
+            entries, slot_idxs, lens, next_tokens, self.decode_work.curr_tokens,
         )
         self.decode_work.cache = new_cache
         self.decode_work.curr_tokens = new_tokens
@@ -748,9 +677,7 @@ class ServingLoop:
             if "worker" in self.roles and len(batch_updates) > 0:
                 self._update_cache_and_index(batch_updates)
                 # Re-place on mesh to match warmup sharding (prevents JIT recompilation)
-                self.decode_work.cache = self.engine.place_cache(
-                    self.decode_work.cache, self.mesh
-                )
+                self.decode_work.cache = self.decode_work.cache.place_on_mesh(self.mesh)
                 self.decode_work.curr_tokens = MeshHelper.put_on_mesh(
                     self.decode_work.curr_tokens,
                     self.mesh,

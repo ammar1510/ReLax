@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from utils.kvcache import KVCache
 
@@ -15,10 +16,11 @@ class TestKVCache:
         head_dim = 64
         dtype = jnp.float32
 
-        cache = KVCache.new(n_layers, bsz, max_seq_len, kv_heads, head_dim, dtype=dtype)
+        config = SimpleNamespace(n_layers=n_layers, n_kv_heads=kv_heads, head_dim=head_dim, dtype="float32")
+        cache = KVCache.new(config, bsz, max_seq_len, dtype=dtype)
 
-        assert cache.k.shape == (n_layers, bsz, max_seq_len, kv_heads, head_dim)
-        assert cache.v.shape == (n_layers, bsz, max_seq_len, kv_heads, head_dim)
+        assert cache.k.shape == (n_layers, bsz, kv_heads, max_seq_len, head_dim)
+        assert cache.v.shape == (n_layers, bsz, kv_heads, max_seq_len, head_dim)
         assert cache.k.dtype == dtype
         assert cache.v.dtype == dtype
         assert jnp.all(cache.k == 0)
@@ -32,7 +34,11 @@ class TestKVCache:
         head_dim = 2
         dtype = jnp.float32
 
-        cache = KVCache.new(n_layers, bsz, max_seq_len, kv_heads, head_dim, dtype=dtype)
+        cache = KVCache(
+            k=jnp.zeros((n_layers, bsz, kv_heads, max_seq_len, head_dim), dtype=dtype),
+            v=jnp.zeros((n_layers, bsz, kv_heads, max_seq_len, head_dim), dtype=dtype),
+            seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
+        )
 
         layer_idx = 0
         start_pos = 2
@@ -105,7 +111,11 @@ class TestKVCache:
         head_dim = 2
         dtype = jnp.float32
 
-        cache = KVCache.new(n_layers, bsz, max_seq_len, kv_heads, head_dim, dtype=dtype)
+        cache = KVCache(
+            k=jnp.zeros((n_layers, bsz, kv_heads, max_seq_len, head_dim), dtype=dtype),
+            v=jnp.zeros((n_layers, bsz, kv_heads, max_seq_len, head_dim), dtype=dtype),
+            seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
+        )
 
         layer_idx_to_update = 0
         start_pos_update = 0

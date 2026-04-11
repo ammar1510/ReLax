@@ -411,23 +411,24 @@ class Qwen(nn.Module):
         tokens: jax.Array,
         true_lengths: jax.Array,
         hybrid_cache: HybridCache,
-        mask: jax.Array,
     ):
         """
         Args:
             tokens: [bsz, seqlen] token IDs.
             true_lengths: [bsz] actual non-padded lengths.
             hybrid_cache: HybridCache containing KV cache and DeltaNet state.
-            mask: [bsz, seqlen, max_cache_seqlen] boolean attention mask.
 
         Returns:
             (logits [bsz, seqlen, vocab_size], updated HybridCache)
         """
         cfg = self.args
+        _, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
         kv_cache = hybrid_cache.kv_cache
         deltanet_state = hybrid_cache.deltanet_state
+
+        mask = build_attn_mask(seqlen, kv_cache, true_lengths)
 
         full_attn_idx = 0
         linear_attn_idx = 0

@@ -13,7 +13,6 @@ import jax
 import jax.numpy as jnp
 import jax.nn as jnn
 import flax.linen as nn
-from flax import struct
 
 from utils.ops import (
     precompute_freqs_cis,
@@ -24,6 +23,7 @@ from utils.ops import (
     feed_forward,
 )
 from utils.kvcache import KVCache
+from utils.gemma_cache import GemmaCache
 from utils.gemma_ops import (
     build_sliding_attn_mask,
     rms_norm_no_scale,
@@ -34,52 +34,6 @@ from .config import GemmaConfig
 
 
 _init = nn.initializers.normal(stddev=0.02)
-
-
-# ---------------------------------------------------------------------------
-# Cache
-# ---------------------------------------------------------------------------
-
-
-@struct.dataclass
-class GemmaCache:
-    """Dual KV cache for Gemma's hybrid sliding/global attention."""
-
-    sliding_cache: KVCache  # [n_sliding_layers, bsz, n_kv_heads, max_seqlen, head_dim]
-    global_cache: KVCache  # [n_global_layers, bsz, n_global_kv_heads, max_seqlen, global_head_dim]
-
-    @classmethod
-    def new(
-        cls,
-        config: GemmaConfig,
-        bsz: int,
-        max_seqlen: int,
-        dtype=jnp.bfloat16,
-    ) -> "GemmaCache":
-        return cls(
-            sliding_cache=KVCache.new(
-                n_layers=config.n_sliding_layers,
-                bsz=bsz,
-                max_seqlen=max_seqlen,
-                kv_heads=config.n_kv_heads,
-                head_dim=config.head_dim,
-                dtype=dtype,
-            ),
-            global_cache=KVCache.new(
-                n_layers=config.n_global_layers,
-                bsz=bsz,
-                max_seqlen=max_seqlen,
-                kv_heads=config.n_global_kv_heads,
-                head_dim=config.global_head_dim,
-                dtype=dtype,
-            ),
-        )
-
-    def update_positions(self, true_len: jax.Array) -> "GemmaCache":
-        return GemmaCache(
-            sliding_cache=self.sliding_cache.update_positions(true_len),
-            global_cache=self.global_cache.update_positions(true_len),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -402,14 +356,12 @@ class Gemma(nn.Module):
         tokens: jax.Array,
         true_lengths: jax.Array,
         cache: GemmaCache,
-        mask: jax.Array,
     ):
         """
         Args:
             tokens: [bsz, seqlen] token IDs.
             true_lengths: [bsz] actual non-padded lengths.
             cache: GemmaCache containing sliding and global KV caches.
-            mask: [bsz, seqlen, max_seqlen] boolean attention mask.
 
         Returns:
             (logits [bsz, seqlen, vocab_size], updated GemmaCache)
