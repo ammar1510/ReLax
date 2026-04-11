@@ -1,13 +1,13 @@
 """
-Convert Gemma 4 safetensors weights from HuggingFace to a sharded Orbax
-checkpoint on GCS.
+Convert Gemma 4 safetensors weights from HuggingFace to an Orbax checkpoint
+on GCS.  CPU-only -- no TPU required.
 
-Three stages:
-  1. Download safetensors shards from HF, transform each tensor to .npy,
-     delete the shard to reclaim disk.  (CPU only)
-  2. Load .npy files, build the ReLax param pytree, create a TPU mesh,
-     and shard params onto TPU via auto-sharding.
-  3. Save the sharded pytree to GCS via Orbax.
+Two stages:
+  1. Stream each tensor from HF via HTTP range requests, apply the HF->ReLax
+     transformation (transpose, reshape), save as .npy.  No full shard
+     download; only the bytes for tensors we need are fetched.
+  2. Memory-map every .npy file, assemble the ReLax param pytree, and let
+     Orbax stream the checkpoint to GCS.
 
 Gemma-specific notes:
   - Sliding attention layers have Q/K/V/O projections + QK norms.
@@ -16,15 +16,14 @@ Gemma-specific notes:
   - Sandwich norms: 4 layer norms per layer.
 
 Usage:
-    # Dry run -- print HF->ReLax key mappings and shapes, no writes:
+    # Dry run -- print HF->ReLax key mappings, no writes:
     python scripts/convert_gemma_to_orbax.py \
         --repo google/gemma-4-27b-it --dry_run
 
-    # Full conversion (on a v4-16 TPU):
+    # Full conversion:
     python scripts/convert_gemma_to_orbax.py \
         --repo google/gemma-4-27b-it \
-        --gcs_path gs://my-bucket/gemma4-orbax \
-        --tp 16
+        --gcs_path gs://my-bucket/gemma4-orbax
 """
 
 import argparse
@@ -44,7 +43,6 @@ import numpy as np
 import requests as _requests
 from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 from huggingface_hub.utils import build_hf_headers
-from safetensors import safe_open
 
 _SF_DTYPE_MAP = {
     "F32":  np.float32,
@@ -283,8 +281,6 @@ def main():
                         help="Print HF->ReLax key mappings and shapes only")
     parser.add_argument("--temp_dir", default="./temp_gemma_npy",
                         help="Directory for intermediate .npy files")
-    parser.add_argument("--tp", type=int, default=16,
-                        help="Tensor-parallel mesh dimension (default: 16)")
     args = parser.parse_args()
 
     if not args.dry_run and not args.gcs_path:
@@ -332,7 +328,7 @@ def main():
             seen_relax_keys.add(relax_key)
     elif args.dry_run:
         # Dry run: just read the index to print key mappings (no download needed).
-        print("\n--- DRY RUN: HF key -> ReLax key + shape (from index) ---")
+        print("\n--- DRY RUN: HF key -> ReLax key ---")
         index_path = Path(hf_hub_download(
             args.repo, "model.safetensors.index.json", local_dir=download_dir,
         ))
@@ -342,6 +338,7 @@ def main():
             if hf_key in key_map:
                 relax_key, _ = key_map[hf_key]
                 print(f"  {hf_key}  ->  {relax_key}")
+                seen_relax_keys.add(relax_key)
             else:
                 print(f"  [SKIP] {hf_key}")
         shutil.rmtree(download_dir, ignore_errors=True)
@@ -372,97 +369,28 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # STAGE 2: Load .npy -> shard onto TPU (one tensor at a time)
-    # ------------------------------------------------------------------
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
-    from models.sync_server import SyncServer
-
-    print(f"\n--- STAGE 2: Load and shard onto TPU tensor-by-tensor "
-          f"(tp={args.tp}) ---")
-
-    # Create TP-only mesh
-    devices = jax.devices()
-    assert len(devices) == args.tp, (
-        f"Expected {args.tp} devices (tp={args.tp}), got {len(devices)}"
-    )
-    mesh = Mesh(np.array(devices), ("tp",))
-    print(f"Mesh: {mesh.shape} on {len(devices)} device(s)")
-
-    def _auto_shard_spec(shape: tuple, tp: int) -> PS:
-        """Find the first axis divisible by tp and shard on it; else replicate."""
-        for axis in range(len(shape)):
-            if shape[axis] % tp == 0:
-                spec = [None] * len(shape)
-                spec[axis] = "tp"
-                return PS(*spec)
-        return PS()
-
-    # Load each .npy, shard onto TPU, discard numpy array immediately.
-    params: dict = {}
-    total_bytes = 0
-    t_shard = time.time()
-
-    sorted_keys = sorted(seen_relax_keys)
-    for idx, relax_key in enumerate(sorted_keys, 1):
-        npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-        arr = np.load(str(npy_path))
-        if arr.dtype == np.uint16:
-            arr = arr.view(ml_dtypes.bfloat16)
-        total_bytes += arr.nbytes
-
-        # Convert to bfloat16 if needed
-        if np.issubdtype(arr.dtype, np.floating) and arr.dtype != ml_dtypes.bfloat16:
-            arr = arr.astype(ml_dtypes.bfloat16)
-
-        # Sync all hosts before placing on device
-        SyncServer.barrier("shard_param", idx)
-
-        # Shard on first divisible axis, else replicate
-        spec = _auto_shard_spec(arr.shape, args.tp)
-        t0 = time.time()
-        jax_arr = jax.device_put(arr, NamedSharding(mesh, spec))
-        dt = time.time() - t0
-        del arr  # free host RAM immediately
-
-        _insert_into_pytree(params, relax_key, jax_arr)
-
-        print(f"  [{idx}/{len(sorted_keys)}] {relax_key}  "
-              f"{tuple(jax_arr.shape)}  {spec}  "
-              f"{jax_arr.nbytes / 1e6:.1f} MB  ({dt:.2f}s)")
-
-    jax.block_until_ready(params)
-    elapsed_shard = time.time() - t_shard
-    print(f"\nSharded pytree on TPU: {len(seen_relax_keys)} arrays, "
-          f"{total_bytes / 1e9:.2f} GB ({elapsed_shard:.1f}s)")
-    gc.collect()
-
-    # ------------------------------------------------------------------
-    # STAGE 3: Save sharded params to GCS via Orbax
+    # STAGE 2: mmap .npy files, build lazy pytree, stream to GCS via Orbax
     # ------------------------------------------------------------------
     import orbax.checkpoint as ocp
-    from orbax.checkpoint.options import MultiprocessingOptions
 
-    print(f"\n--- STAGE 3: Orbax save -> {args.gcs_path} ---")
+    print("\n--- STAGE 2: Build lazy pytree -> Orbax (CPU only) ---")
+    params: dict = {}
 
-    shared = args.gcs_path.startswith("gs://")
-    primary = 0 if shared else None
-    options = ocp.CheckpointManagerOptions(
-        multiprocessing_options=MultiprocessingOptions(primary_host=primary),
-    )
-    mngr = ocp.CheckpointManager(args.gcs_path, options=options)
+    for relax_key in sorted(seen_relax_keys):
+        npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
+        lazy = np.load(str(npy_path), mmap_mode="r").view(ml_dtypes.bfloat16)
+        _insert_into_pytree(params, relax_key, lazy)
 
-    print("Saving...")
-    t_save = time.time()
-    mngr.save(step=0, args=ocp.args.StandardSave(params))
-    mngr.wait_until_finished()
-    elapsed_save = time.time() - t_save
-    throughput = total_bytes / elapsed_save / 1e6
-    print(f"Upload complete! ({elapsed_save:.1f}s, ~{throughput:.0f} MB/s)")
+    print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
 
-    if jax.process_index() == 0:
-        print(f"Checkpoint saved to {args.gcs_path}")
+    options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
+    with ocp.CheckpointManager(args.gcs_path, options=options) as mngr:
+        print(f"Streaming to {args.gcs_path} ...")
+        t_save = time.time()
+        mngr.save(step=0, args=ocp.args.StandardSave(params))
+        mngr.wait_until_finished()
+        elapsed_save = time.time() - t_save
+        print(f"Upload complete! ({elapsed_save:.1f}s)")
 
     # Clean up temp files
     shutil.rmtree(temp_dir, ignore_errors=True)
