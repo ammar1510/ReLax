@@ -215,15 +215,23 @@ def _process_shard_via_ranges(
     session = _requests.Session()
     session.headers.update(build_hf_headers())
 
+    # HuggingFace redirects to a CDN URL.  requests drops the Range header
+    # when following redirects, so we resolve the final URL first via a
+    # HEAD request (no body), then make all range requests directly to it.
+    head = session.head(url, allow_redirects=True)
+    head.raise_for_status()
+    cdn_url = head.url
+
+    def _range_get(lo: int, hi: int) -> bytes:
+        r = session.get(cdn_url, headers={"Range": f"bytes={lo}-{hi}"})
+        r.raise_for_status()
+        return r.content
+
     # --- read 8-byte header length ---
-    r = session.get(url, headers={"Range": "bytes=0-7"})
-    r.raise_for_status()
-    header_size = struct.unpack("<Q", r.content)[0]
+    header_size = struct.unpack("<Q", _range_get(0, 7))[0]
 
     # --- read JSON metadata header ---
-    r = session.get(url, headers={"Range": f"bytes=8-{7 + header_size}"})
-    r.raise_for_status()
-    sf_header = _json.loads(r.content)
+    sf_header = _json.loads(_range_get(8, 7 + header_size))
 
     data_base = 8 + header_size  # byte offset where tensor data begins
     seen: set[str] = set()
@@ -241,11 +249,10 @@ def _process_shard_via_ranges(
         abs_hi = data_base + hi - 1
 
         t0 = time.time()
-        r = session.get(url, headers={"Range": f"bytes={abs_lo}-{abs_hi}"})
-        r.raise_for_status()
+        raw = _range_get(abs_lo, abs_hi)
 
         np_dtype = _SF_DTYPE_MAP[meta["dtype"]]
-        tensor = np.frombuffer(r.content, dtype=np_dtype).reshape(meta["shape"]).copy()
+        tensor = np.frombuffer(raw, dtype=np_dtype).reshape(meta["shape"]).copy()
         tensor = _transform(tensor, **xform_kw)
         tensor = tensor.astype(target_dtype)
 
@@ -257,7 +264,7 @@ def _process_shard_via_ranges(
         print(f"  [{idx}/{len(tensor_keys)}] {relax_key}  "
               f"{tuple(tensor.shape)}  {mb:.1f} MB  ({elapsed:.2f}s)")
         seen.add(relax_key)
-        del tensor, r
+        del tensor, raw
 
     return seen
 
