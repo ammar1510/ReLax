@@ -26,12 +26,12 @@ class GemmaTokenizer:
 
         self.vocab_size: int = self.tok.get_vocab_size()
 
-        # Special token IDs
+        # Special token IDs (Gemma 4 format)
         self.bos_id: int = self.tok.token_to_id("<bos>")
         self.eos_id: int = self.tok.token_to_id("<eos>")
         self.pad_id: int = self.tok.token_to_id("<pad>") or 0
-        self.start_of_turn_id: int = self.tok.token_to_id("<start_of_turn>")
-        self.end_of_turn_id: int = self.tok.token_to_id("<end_of_turn>")
+        self.start_of_turn_id: int = self.tok.token_to_id("<|turn>")
+        self.end_of_turn_id: int = self.tok.token_to_id("<turn|>")
 
         # Stop on both eos and end-of-turn
         self.stop_ids: tuple[int, ...] = (self.eos_id, self.end_of_turn_id)

@@ -96,13 +96,13 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
 
 
 def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
-    """Format a user prompt using the Gemma instruction-tuned chat template.
+    """Format a user prompt using the Gemma 4 chat template.
 
-    Produces: <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+    Produces: <bos><|turn>user\n{prompt}<turn|><|turn>model\n
     """
     text = (
-        f"<start_of_turn>user\n{prompt}<end_of_turn>\n"
-        f"<start_of_turn>model\n"
+        f"<|turn>user\n{prompt}<turn|>"
+        f"<|turn>model\n"
     )
     return tokenizer.encode(text, bos=True, eos=False)
 
