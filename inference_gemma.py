@@ -1,17 +1,13 @@
 """Inference script for Gemma 4 models.
 
-Loads a Gemma model with weights from disk and performs batch inference
+Loads a Gemma model from an orbax checkpoint and performs batch inference
 using the ServingLoop event loop pattern.
 
 Usage:
-    # From safetensors (HuggingFace download):
-    python inference_gemma.py --model_path /path/to/gemma
+    python inference_gemma.py --model_path /path/to/gemma --checkpoint_path gs://bucket/gemma-orbax
 
-    # From orbax checkpoint:
-    python inference_gemma.py --model_path /path/to/gemma --checkpoint_path /path/to/orbax
-
-Requires sentencepiece:
-    pip install sentencepiece
+Requires tokenizers:
+    pip install tokenizers
 """
 
 import argparse
@@ -19,7 +15,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import jax
 import numpy as np
@@ -27,7 +23,7 @@ from jax.sharding import Mesh
 
 from models.gemma.model import Gemma
 from models.gemma.config import GemmaConfig
-from models.gemma.load import load_gemma_weights, load_from_orbax
+from models.gemma.load import load_from_orbax
 from models.gemma.tokenizer import GemmaTokenizer
 from utils.gemma_cache import GemmaCache
 from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
@@ -45,18 +41,13 @@ DEFAULT_PROMPTS = [
 # ---------------------------------------------------------------------------
 
 
-def load_model(
-    model_path: str,
-    mesh: Mesh,
-    checkpoint_path: Optional[str] = None,
-):
-    """Load Gemma model, config, tokenizer, and weights.
+def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
+    """Load Gemma model, config, tokenizer, and weights from orbax checkpoint.
 
     Args:
-        model_path: Path to model directory containing config.json and tokenizer.model
+        model_path: Path to model directory containing config.json and tokenizer.json
+        checkpoint_path: Orbax checkpoint path (GCS or local)
         mesh: JAX device mesh for sharded restore
-        checkpoint_path: Orbax checkpoint path (GCS or local). If None, loads
-                         directly from safetensors in model_path.
 
     Returns:
         Tuple of (model, params, config, tokenizer)
@@ -78,13 +69,9 @@ def load_model(
     # Initialize model
     model = Gemma(config)
 
-    # Load weights
-    if checkpoint_path is not None:
-        print(f"Loading weights from orbax checkpoint: {checkpoint_path}...")
-        params = load_from_orbax(checkpoint_path, mesh=mesh)
-    else:
-        print(f"Loading weights from safetensors in {model_path}...")
-        params = load_gemma_weights(str(model_path), config)
+    # Load weights from orbax checkpoint (sharded onto mesh)
+    print(f"Loading weights from {checkpoint_path}...")
+    params = load_from_orbax(checkpoint_path, mesh=mesh)
     print("Weights loaded successfully")
 
     # Load tokenizer
@@ -231,13 +218,13 @@ def main():
         "--model_path",
         type=str,
         required=True,
-        help="Path to model directory (containing config.json, tokenizer.model, *.safetensors)",
+        help="Path to model directory (containing config.json and tokenizer.json)",
     )
     parser.add_argument(
         "--checkpoint_path",
         type=str,
-        default=None,
-        help="Orbax checkpoint path (GCS or local). If omitted, loads safetensors from model_path.",
+        required=True,
+        help="Orbax checkpoint path (GCS or local), e.g. gs://bucket/gemma-orbax",
     )
     parser.add_argument("--dp", type=int, default=2, help="Data-parallel dim")
     parser.add_argument("--tp", type=int, default=8, help="Tensor-parallel dim")
@@ -277,9 +264,7 @@ def main():
     # Load model with weights
     print("Loading model...")
     model, params, config, tokenizer = load_model(
-        args.model_path,
-        mesh,
-        checkpoint_path=args.checkpoint_path,
+        args.model_path, args.checkpoint_path, mesh
     )
 
     # Create serving configuration
