@@ -9,10 +9,10 @@ Key Features:
 - Group-relative advantage calculation (compares within prompt groups)
 - Memory-efficient: caches reference logprobs during rollout
 - On-policy: generates new rollouts each iteration
-- Batched generation via ServingLoop/InferenceEngine
+- Batched generation via InferenceEngine/InferenceEngine
 
 Training Loop:
-1. Rollout: Generate multiple completions per prompt via ServingLoop
+1. Rollout: Generate multiple completions per prompt via InferenceEngine
 2. Reward: Score completions using task-specific reward function
 3. Advantages: Normalize rewards relative to group mean/std
 4. Optimize: Update policy using advantages and KL penalty
@@ -35,7 +35,7 @@ from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
 from utils.kvcache import KVCache
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
@@ -74,7 +74,6 @@ class GRPOConfig:
     pad_token_id: int = 0
     eos_token_ids: Tuple[int, ...] = (2,)
     decode_steps: int = 10  # Tokens per multistep decode call
-    max_cache_seqlen: Optional[int] = None  # KV cache size; defaults to model's max_seqlen if None
 
     def __post_init__(self):
         """Validate configuration."""
@@ -107,12 +106,12 @@ class RolloutBatch:
 
 
 class GRPOTrainer(Trainer):
-    """GRPO trainer using ServingLoop for batched generation."""
+    """GRPO trainer using InferenceEngine for batched generation."""
 
     def __init__(
         self,
         model: LLaMa,
-        config: ModelConfig,
+        model_config: ModelConfig,
         params: FrozenDict,
         grpo_config: GRPOConfig,
         reward_fn: Callable[[List[List[int]], List[Any]], jax.Array],
@@ -139,42 +138,38 @@ class GRPOTrainer(Trainer):
             optax.adam(grpo_config.learning_rate),
         )
 
-        # Setup mesh before sharding
         if mesh is None:
             mesh = Mesh(np.array(jax.devices()).reshape(4, 4), ("dp", "tp"))
         self.mesh = mesh
 
-        # Shard params once; TrainState and ServingLoop share the same sharded copy
-        sharded_params = MeshHelper.shard_params(params, mesh)
+        # Initialize base trainer with params (expected to be pre-sharded by caller)
+        super().__init__(model, params, optimizer, seed)
 
-        # Initialize base trainer with sharded params
-        super().__init__(model, sharded_params, optimizer, seed)
-
-        self.config = config
+        self.config = model_config
         self.grpo_config = grpo_config
         self.reward_fn = reward_fn
-        self.detokenize_fn = detokenize_fn
 
         # Create reference model parameters (frozen copy, also sharded)
-        self.reference_params = jax.tree.map(lambda x: x.copy(), sharded_params)
+        self.reference_params = jax.tree.map(lambda x: x.copy(), params)
 
-        # Create ServingLoop for batched rollout generation
-        serve_cfg = ServingConfig(
+        # Create InferenceEngine for batched rollout generation
+        engine_cfg = EngineConfig(
+            sampler=partial(categorical, temperature=grpo_config.temperature),
+            detokenize_fn=detokenize_fn,
             decode_steps=grpo_config.decode_steps,
             decode_batch_size=grpo_config.rollout_batch_size,
             prefill_batch_size=grpo_config.group_size,
             eos_tokens=grpo_config.eos_token_ids,
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
-            max_cache_seqlen=grpo_config.max_cache_seqlen or config.max_seqlen,
-            sampler=partial(categorical, temperature=grpo_config.temperature),
+            max_cache_seqlen=model_config.max_seqlen,
             rng_seed=seed,
         )
         self.is_main = jax.process_index() == 0
-        self.serving_loop = ServingLoop(
-            serve_cfg=serve_cfg,
+        self.engine = InferenceEngine(
+            engine_cfg=engine_cfg,
             model=model,
-            params=sharded_params,
+            params=params,
             mesh=mesh,
             is_server=self.is_main,
         )
@@ -208,30 +203,30 @@ class GRPOTrainer(Trainer):
 
     # ==================== PHASE 1: ROLLOUT ====================
 
-    def _reset_serving_loop(self):
+    def _reset_engine(self):
         """Reset serving loop state for a new rollout batch.
 
         Note: _it is NOT reset — it must increase monotonically across prompts
         because SyncServer uses _it to namespace KV store keys, and keys are
         global for the lifetime of the process.
         """
-        kv_cache, tokens = self.serving_loop.engine.init_decode_state()
-        self.serving_loop.decode_work.curr_tokens = tokens
-        self.serving_loop.decode_work.cache = kv_cache
-        self.serving_loop.decode_work.active_results = [
+        kv_cache, tokens = self.engine.init_decode_state()
+        self.engine.decode_work.curr_tokens = tokens
+        self.engine.decode_work.cache = kv_cache
+        self.engine.decode_work.active_results = [
             None for _ in range(self.grpo_config.rollout_batch_size)
         ]
-        self.serving_loop.prefill_work.requests = []
-        self.serving_loop.prefill_work.to_prefill = []
-        self.serving_loop.prefill_work.to_decode = []
-        self.serving_loop.results = {}
-        self.serving_loop.decode_output = (None, None)
+        self.engine.prefill_work.requests = []
+        self.engine.prefill_work.to_prefill = []
+        self.engine.prefill_work.to_decode = []
+        self.engine.results = {}
+        self.engine.decode_output = (None, None)
 
     def generate_rollouts(
         self,
         prompts: List[List[int]],
     ) -> RolloutBatch:
-        """Generate rollouts for a batch of prompts using ServingLoop.
+        """Generate rollouts for a batch of prompts using InferenceEngine.
 
         All prompts are enqueued at once. The serving loop runs continuously
         until every completion is done — no per-prompt reset or iteration cap.
@@ -245,10 +240,10 @@ class GRPOTrainer(Trainer):
         total_sequences = len(prompts) * self.grpo_config.group_size
 
         # Point engine to current policy params (already sharded)
-        self.serving_loop.engine.params = self.state.params
+        self.engine.params = self.state.params
 
         # Single reset before the whole rollout batch
-        self._reset_serving_loop()
+        self._reset_engine()
 
         t0 = time.time()
         self._log(f"Rollout: generating {total_sequences} completions "
@@ -259,16 +254,16 @@ class GRPOTrainer(Trainer):
             for pi, prompt_tokens in enumerate(prompts):
                 for g in range(self.grpo_config.group_size):
                     req_id = pi * self.grpo_config.group_size + g
-                    self.serving_loop.add_request(
+                    self.engine.add_request(
                         UserRequestPrompt(id=req_id, text=list(prompt_tokens))
                     )
 
         # Drive the serving loop until every completion is done
         step = 0
         while True:
-            self.serving_loop.serving_step()
+            self.engine.serving_step()
             step += 1
-            results = self.serving_loop.results
+            results = self.engine.results
             if len(results) == total_sequences and all(r.done for r in results.values()):
                 break
 
@@ -281,7 +276,7 @@ class GRPOTrainer(Trainer):
         for pi, prompt_tokens in enumerate(prompts):
             for g in range(self.grpo_config.group_size):
                 req_id = pi * self.grpo_config.group_size + g
-                result = self.serving_loop.results.get(req_id)
+                result = self.engine.results.get(req_id)
                 generated = result.token_list if result is not None else []
                 all_prompt_tokens.append(list(prompt_tokens))
                 all_generated_tokens.append(generated)
@@ -290,7 +285,7 @@ class GRPOTrainer(Trainer):
             for pi in range(len(prompts)):
                 idx = pi * self.grpo_config.group_size
                 sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
-                self._log(f"Sample (prompt {pi}):\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
+                self._log(f"Sample (prompt {pi}):\n{self.engine.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(

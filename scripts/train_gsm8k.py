@@ -27,7 +27,6 @@ from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 ROLLOUT_BATCH_SIZE = 64
 GROUP_SIZE = 16
 MAX_NEW_TOKENS = 512
-MAX_CACHE_SEQLEN = 1024
 TEMPERATURE = 0.8
 NUM_ITERATIONS = 500
 MINIBATCH_SIZE = 16
@@ -155,11 +154,11 @@ def main():
         )
 
     print(f"Loading model from {args.model_path}...")
-    model, params, config, tokenizer = load_model(
+    model, params, model_config, tokenizer = load_model(
         args.model_path, args.checkpoint_path, mesh
     )
     print(
-        f"Model loaded: {config.n_layers}L {config.dim}D {config.n_heads}H {config.n_kv_heads}KVH"
+        f"Model loaded: {model_config.n_layers}L {model_config.dim}D {model_config.n_heads}H {model_config.n_kv_heads}KVH"
     )
 
     print("Loading GSM8K dataset...")
@@ -170,7 +169,6 @@ def main():
         rollout_batch_size=ROLLOUT_BATCH_SIZE,
         group_size=GROUP_SIZE,
         max_new_tokens=MAX_NEW_TOKENS,
-        max_cache_seqlen=MAX_CACHE_SEQLEN,
         temperature=TEMPERATURE,
         num_iterations=NUM_ITERATIONS,
         minibatch_size=MINIBATCH_SIZE,
@@ -183,7 +181,7 @@ def main():
 
     trainer = GRPOTrainer(
         model=model,
-        config=config,
+        model_config=model_config,
         params=params,
         grpo_config=grpo_config,
         reward_fn=make_reward_fn(tokenizer),
