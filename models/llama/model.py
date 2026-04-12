@@ -11,6 +11,7 @@ from utils.ops import (
     grouped_query_attention,
     feed_forward,
     precompute_freqs_cis,
+    build_attn_mask,
     AttentionParams,
     FeedForwardParams,
 )
@@ -155,10 +156,11 @@ class LLaMa(nn.Module):
         tokens: jax.Array,
         true_lengths: jax.Array,
         kv_cache: KVCache,
-        mask: jax.Array,  # [bsz, seqlen, max_seqlen] - attention mask
     ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+
+        mask = build_attn_mask(seqlen, kv_cache, true_lengths)
 
         for layer_idx, layer in enumerate(self.layers):
             h, kv_cache = layer(h, self.freqs_cis, kv_cache, layer_idx, mask)

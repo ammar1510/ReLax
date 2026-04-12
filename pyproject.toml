@@ -16,7 +16,9 @@ dependencies = [
   "fastapi",
   "uvicorn[standard]",
   "google-cloud-storage",
-  "gcsfs"
+  "gcsfs",
+  "ml-dtypes",
+  "tokenizers"
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,19 @@
 import jax
 import jax.numpy as jnp
 from flax import struct
+from functools import partial
+
+
+@partial(jax.jit, static_argnames=['prefill_seqlen'])
+def _jitted_batch_insert(k, v, seq_positions, stacked_k, stacked_v, slot_idxs, lens, next_tokens, curr_tokens, prefill_seqlen):
+    # stacked_k: [n_entries, n_layers, n_kv_heads, prefill_seqlen, head_dim]
+    # k:         [n_layers, bsz, n_kv_heads, max_seqlen, head_dim]
+    # target:    k[:, slot_idxs, :, :prefill_seqlen, :] -> [n_layers, n_entries, n_kv_heads, prefill_seqlen, head_dim]
+    new_k = k.at[:, slot_idxs, :, :prefill_seqlen, :].set(stacked_k.transpose(1, 0, 2, 3, 4))
+    new_v = v.at[:, slot_idxs, :, :prefill_seqlen, :].set(stacked_v.transpose(1, 0, 2, 3, 4))
+    new_positions = seq_positions.at[slot_idxs].set(lens)
+    new_tokens = curr_tokens.at[slot_idxs, 0].set(next_tokens)
+    return new_k, new_v, new_positions, new_tokens
 
 
 @struct.dataclass
@@ -10,19 +23,25 @@ class KVCache:
     seq_positions: jax.Array  # [bsz] - tracks current filled position for each sequence
 
     @classmethod
-    # @functools.partial(jax.jit, static_argnums=(0,1,2,3,4,5)) 
     def new(
         cls,
-        n_layers: int,
+        config,
         bsz: int,
         max_seqlen: int,
-        kv_heads: int,
-        head_dim: int,
-        dtype=jnp.bfloat16,
+        dtype=None,
     ) -> "KVCache":
+        """Allocate an empty KVCache from a model config.
+
+        Args:
+            config: Any model config with n_layers, n_kv_heads, head_dim, dtype fields.
+            bsz: Batch size.
+            max_seqlen: Maximum sequence length.
+            dtype: Data type. Defaults to config.dtype if not provided.
+        """
+        dt = jnp.dtype(dtype if dtype is not None else config.dtype)
         return cls(
-            k=jnp.zeros((n_layers, bsz, kv_heads, max_seqlen, head_dim), dtype=dtype),
-            v=jnp.zeros((n_layers, bsz, kv_heads, max_seqlen, head_dim), dtype=dtype),
+            k=jnp.zeros((config.n_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dt),
+            v=jnp.zeros((config.n_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dt),
             seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
         )
 
@@ -85,3 +104,64 @@ class KVCache:
         responsible for masking for attention computation.
         """
         return self.k[layer_idx], self.v[layer_idx] # [bsz, kv_heads, max_seqlen, head_dim]
+
+    def slice(self, idx: int) -> "KVCache":
+        """Extract a single-sequence cache at batch index idx.
+
+        Args:
+            idx: Batch index to extract.
+        """
+        return KVCache(
+            k=self.k[:, idx : idx + 1, :, :, :],
+            v=self.v[:, idx : idx + 1, :, :, :],
+            seq_positions=self.seq_positions[idx : idx + 1],
+        )
+
+    def init_on_mesh(self, mesh) -> "KVCache":
+        """Create a zero-initialised KVCache sharded on mesh.
+
+        Use this for initial allocation only — values are replaced with
+        per-device zeros without triggering an allgather.
+
+        Args:
+            mesh: JAX device mesh.
+        """
+        from utils.mesh_helpers import MeshHelper
+        return MeshHelper.init_kv_cache_on_mesh(self, mesh)
+
+    def place_on_mesh(self, mesh) -> "KVCache":
+        """Re-shard KVCache onto mesh, preserving existing data.
+
+        Use this after mutating the cache to restore correct sharding
+        before the next JIT-compiled decode step.
+
+        Args:
+            mesh: JAX device mesh.
+        """
+        from utils.mesh_helpers import MeshHelper
+        return MeshHelper.place_kv_cache(self, mesh)
+
+    def batch_insert(self, entries, slot_idxs, lens, next_tokens, curr_tokens):
+        """Scatter prefill results into decode slots.
+
+        Args:
+            entries: List of single-sequence KVCaches from prefill (via slice()).
+            slot_idxs: Decode slot indices to insert into.
+            lens: Prefill sequence lengths for each entry.
+            next_tokens: First generated token for each entry.
+            curr_tokens: Current token array for the decode batch [batch, 1].
+
+        Returns:
+            Tuple of (updated KVCache, updated curr_tokens).
+        """
+        prefill_seqlen = entries[0].k.shape[3]
+        # Stack entries: [n_entries, n_layers, n_kv_heads, prefill_seqlen, head_dim]
+        stacked_k = jnp.stack([e.k[:, 0, :, :, :] for e in entries])
+        stacked_v = jnp.stack([e.v[:, 0, :, :, :] for e in entries])
+        new_k, new_v, new_positions, new_tokens = _jitted_batch_insert(
+            self.k, self.v, self.seq_positions,
+            stacked_k, stacked_v,
+            jnp.array(slot_idxs), jnp.array(lens), jnp.array(next_tokens),
+            curr_tokens, prefill_seqlen,
+        )
+        return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens

@@ -381,14 +381,7 @@ class GRPOTrainer(Trainer):
         bsz, seq_len = tokens.shape
         true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
 
-        kv_cache = KVCache.new(
-            n_layers=self.config.n_layers,
-            bsz=bsz,
-            max_seqlen=seq_len,
-            kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.head_dim,
-            dtype=jnp.bfloat16,
-        )
+        kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16)
         kv_cache = MeshHelper.init_kv_cache_on_mesh(kv_cache, self.mesh)
 
         attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
@@ -520,14 +513,7 @@ class GRPOTrainer(Trainer):
             true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
 
             # Scratch KV cache for forward pass
-            kv_cache = KVCache.new(
-                n_layers=config.n_layers,
-                bsz=bsz,
-                max_seqlen=seq_len,
-                kv_heads=config.n_kv_heads,
-                head_dim=config.head_dim,
-                dtype=jnp.bfloat16,
-            )
+            kv_cache = KVCache.new(config, bsz, seq_len, dtype=jnp.bfloat16)
 
             attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
 

@@ -401,6 +401,8 @@ def feed_forward(
     elif activation_fn == "gelu":
         # Use approximate=False for exact GELU, True for faster approximation
         activated_gate = nn.gelu(gate, approximate=False)
+    elif activation_fn == "gelu_pytorch_tanh":
+        activated_gate = nn.gelu(gate, approximate=True)
     else:
         raise ValueError(f"Unsupported activation function: {activation_fn}")
         # replace error handling with chex

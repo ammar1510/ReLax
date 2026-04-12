@@ -194,16 +194,22 @@ class MeshHelper:
     def param_sharding(x, name: str, mesh: Mesh):
         tp = MeshHelper.get_tp_axis(mesh)
         ndim = len(x.shape) if not hasattr(x, "ndim") else x.ndim
-        if tp is None or "norm" in name or "freqs_cis" in name:
+        if tp is None or "norm" in name or "freqs_cis" in name or "shared_expert_gate" in name:
             return PS()
-        if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up")):
-            spec = [None] * ndim
-            spec[1] = tp
-            return PS(*spec)
-        if any(k in name for k in ("down", "output", "wo")):
-            spec = [None] * ndim
-            spec[0] = tp
-            return PS(*spec)
+        if any(k in name for k in ("wq", "wk", "wv", "embedding", "gate", "up", "in_proj")):
+            shard_axis = 1
+            if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
+                spec = [None] * ndim
+                spec[shard_axis] = tp
+                return PS(*spec)
+            return PS()
+        if any(k in name for k in ("down", "output", "wo", "out_proj")):
+            shard_axis = 0
+            if shard_axis < ndim and x.shape[shard_axis] % mesh.shape[tp] == 0:
+                spec = [None] * ndim
+                spec[shard_axis] = tp
+                return PS(*spec)
+            return PS()
         return PS()
 
     @staticmethod
@@ -222,11 +228,23 @@ class MeshHelper:
 
         def shard_leaf(path, x):
             name = "/".join(_get_key_name(k) for k in path)
-            # Convert float32 params to bfloat16 to save HBM
-            if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
-                x = jnp.asarray(x, dtype=jnp.bfloat16)
+
+            # Already a multi-host distributed array (e.g. from load_from_orbax with mesh).
+            # astype preserves sharding; device_put would trigger allgather → OOM.
+            if isinstance(x, jax.Array) and not x.is_fully_addressable:
+                if jnp.issubdtype(x.dtype, jnp.floating) and x.dtype != jnp.bfloat16:
+                    return x.astype(jnp.bfloat16)
+                return x
+
+            # numpy or host-local JAX array — place onto mesh via callback to avoid
+            # the allgather that jax.device_put triggers on multi-host NamedShardings.
+            x = np.asarray(x)
+            if np.issubdtype(x.dtype, np.floating):
+                import ml_dtypes
+                x = x.astype(ml_dtypes.bfloat16)
             spec = MeshHelper.param_sharding(x, name, mesh)
-            return MeshHelper.put_on_mesh(x, mesh, spec)
+            sharding = NamedSharding(mesh, spec)
+            return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
 
         # shard_params is a collective, all processes must call it
         params = jax.tree.map_with_path(shard_leaf, params)

@@ -1,50 +1,52 @@
 """
-Memory-efficient script to convert Qwen3.5 MoE safetensors weights to an
+Convert Qwen3.5-122B-A10B safetensors weights from HuggingFace to a sharded
 Orbax checkpoint on GCS.
 
-Downloads safetensors shards from HuggingFace one at a time, extracts and
-transforms each tensor into a local .npy file, then deletes the shard.
-After all shards are processed, memory-maps the .npy files and streams
-the assembled pytree to GCS via Orbax.
+Three stages:
+  1. Download safetensors shards from HF, transform each tensor to .npy,
+     delete the shard to reclaim disk.  (CPU only)
+  2. Load .npy files, build the ReLax param pytree, create a TPU mesh,
+     and shard params onto TPU via MeshHelper.shard_params.
+  3. Save the sharded pytree to GCS via Orbax.
 
 Usage:
-    # Dry run — print HF→ReLax key mappings and shapes (downloads 1 tensor
-    # per shard at most, lightweight):
-    python scripts/orbax_load.py --repo Qwen/Qwen3.5-122B-A10B --dry_run
+    # Dry run — print HF→ReLax key mappings and shapes, no writes:
+    python scripts/convert_qwen_to_orbax.py \
+        --repo Qwen/Qwen3.5-122B-A10B --dry_run
 
-    # Full conversion:
-    python scripts/orbax_load.py \
+    # Full conversion (on a v4-16 TPU, 4×4 mesh):
+    python scripts/convert_qwen_to_orbax.py \
         --repo Qwen/Qwen3.5-122B-A10B \
-        --gcs_path gs://my-bucket/qwen3.5-orbax
+        --gcs_path gs://my-bucket/qwen3.5-orbax \
+        --dp 4 --tp 4
 """
 
 import argparse
 import gc
 import os
 import shutil
+import time
 from pathlib import Path
+
+# Limit tensorstore parallelism to avoid OOM during Orbax upload.
+os.environ.setdefault("TENSORSTORE_NUM_THREADS", "2")
 
 import ml_dtypes  # noqa: F401 – registers bfloat16 with numpy
 import numpy as np
-import orbax.checkpoint as ocp
 from huggingface_hub import HfApi, hf_hub_download
 from safetensors import safe_open
 
-# ---------------------------------------------------------------------------
-# We import QwenConfig so we know the exact shapes and layer types.
-# ---------------------------------------------------------------------------
 import sys
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.qwen.config import QwenConfig
 
 
-# ---- HF key prefix for Qwen3.5 MoE text backbone -------------------------
+# ---- HF key prefix --------------------------------------------------------
+
 _HF_PREFIX = "model.language_model.layers"
 
 
 # ---- helpers ---------------------------------------------------------------
-
 
 def _transform(tensor: np.ndarray, *, transpose: bool = False,
                reshape: tuple | None = None,
@@ -61,11 +63,7 @@ def _transform(tensor: np.ndarray, *, transpose: bool = False,
 # ---- per-key transformation table ------------------------------------------
 
 def _build_key_map(config: QwenConfig):
-    """Return a dict mapping every HF key to (relax_key, transform_kwargs).
-
-    This mirrors the logic in models/qwen/load.py but produces flat
-    (dot-separated) ReLax keys so we can save each tensor independently.
-    """
+    """Map every HF safetensors key to (relax_key, transform_kwargs)."""
     key_map: dict[str, tuple[str, dict]] = {}
 
     # --- embeddings & head ---
@@ -90,15 +88,18 @@ def _build_key_map(config: QwenConfig):
             attn = f"{pfx}.self_attn"
             key_map[f"{attn}.q_proj.weight"] = (
                 f"{lk}.wq",
-                {"transpose": True, "reshape": (config.dim, config.n_heads, config.head_dim * 2)},
+                {"transpose": True,
+                 "reshape": (config.dim, config.n_heads, config.head_dim * 2)},
             )
             key_map[f"{attn}.k_proj.weight"] = (
                 f"{lk}.wk",
-                {"transpose": True, "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
+                {"transpose": True,
+                 "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
             )
             key_map[f"{attn}.v_proj.weight"] = (
                 f"{lk}.wv",
-                {"transpose": True, "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
+                {"transpose": True,
+                 "reshape": (config.dim, config.n_kv_heads, config.head_dim)},
             )
             key_map[f"{attn}.o_proj.weight"] = (
                 f"{lk}.wo", {"transpose": True},
@@ -108,7 +109,8 @@ def _build_key_map(config: QwenConfig):
         else:
             # linear attention (Gated DeltaNet)
             attn = f"{pfx}.linear_attn"
-            for proj in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+            for proj in ("in_proj_qkv", "in_proj_z", "in_proj_a",
+                         "in_proj_b", "out_proj"):
                 key_map[f"{attn}.{proj}.weight"] = (
                     f"{lk}.{proj}", {"transpose": True},
                 )
@@ -161,52 +163,46 @@ def _insert_into_pytree(tree: dict, dotted_key: str, value):
 # ---- HuggingFace helpers ---------------------------------------------------
 
 def _list_safetensor_files(repo_id: str) -> list[str]:
-    """List all .safetensors filenames in a HF repo."""
     api = HfApi()
     files = api.list_repo_files(repo_id)
     return sorted(f for f in files if f.endswith(".safetensors"))
 
 
 def _download_config(repo_id: str, cache_dir: Path) -> Path:
-    """Download config.json from a HF repo, return local path."""
-    return Path(hf_hub_download(
-        repo_id, "config.json", local_dir=cache_dir,
-    ))
+    return Path(hf_hub_download(repo_id, "config.json", local_dir=cache_dir))
 
 
 # ---- main ------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Qwen3.5 MoE safetensors to Orbax on GCS"
+        description="Convert Qwen3.5 MoE safetensors → sharded Orbax on GCS"
     )
     parser.add_argument("--repo", required=True,
                         help="HuggingFace repo id, e.g. Qwen/Qwen3.5-122B-A10B")
-    parser.add_argument("--gcs_path",
+    parser.add_argument("--gcs_path", required=True,
                         help="GCS destination, e.g. gs://bucket/checkpoint")
     parser.add_argument("--dry_run", action="store_true",
-                        help="Only print HF→ReLax key mappings and shapes, skip writing")
-    parser.add_argument("--temp_dir", default="./temp_npy_weights",
-                        help="Directory for intermediate .npy files. Point to a "
-                             "GCS FUSE mount (e.g. /mnt/gcs/temp_weights) to avoid "
-                             "filling local disk. Defaults to ./temp_npy_weights.")
+                        help="Print HF→ReLax key mappings and shapes only")
+    parser.add_argument("--temp_dir", required=True,
+                        help="Directory for intermediate .npy files")
+    parser.add_argument("--tp", type=int, default=16,
+                        help="Tensor-parallel mesh dimension (default: 16)")
     args = parser.parse_args()
-
-    if not args.dry_run and not args.gcs_path:
-        parser.error("--gcs_path is required unless --dry_run is set")
 
     temp_dir = Path(args.temp_dir)
     download_dir = Path("./temp_hf_download")
     target_dtype = ml_dtypes.bfloat16
 
-    # Download config.json
+    # ------------------------------------------------------------------
+    # Download config and build key map
+    # ------------------------------------------------------------------
     os.makedirs(download_dir, exist_ok=True)
     config_path = _download_config(args.repo, download_dir)
     config = QwenConfig.from_json_file(str(config_path.parent))
     print(f"Config: {config.n_layers} layers, {config.num_experts} experts, "
           f"dim={config.dim}, head_dim={config.head_dim}")
 
-    # Build the mapping from HF keys → (relax_key, transform)
     key_map = _build_key_map(config)
     print(f"Key map has {len(key_map)} entries")
 
@@ -216,108 +212,171 @@ def main():
     print(f"Found {len(shard_filenames)} safetensors file(s) in {args.repo}")
 
     # ------------------------------------------------------------------
-    # PASS 1: download each shard, extract + transform, delete shard
-    # (skipped if temp_dir already contains .npy files)
+    # STAGE 1: Download shards, transform, save as .npy  (CPU only)
     # ------------------------------------------------------------------
     existing_npy = list(temp_dir.glob("*.npy")) if temp_dir.exists() else []
-
     seen_relax_keys: set[str] = set()
 
     if existing_npy and not args.dry_run:
-        print(f"\n--- PASS 1: SKIPPED ({len(existing_npy)} .npy files already in {temp_dir}) ---")
+        print(f"\n--- STAGE 1: SKIPPED ({len(existing_npy)} .npy files "
+              f"already in {temp_dir}) ---")
         for npy_path in existing_npy:
             relax_key = npy_path.stem.replace("__", ".")
             seen_relax_keys.add(relax_key)
-        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
-        if missing:
-            print(f"  WARNING: {len(missing)} ReLax keys not found in temp_dir:")
-            for m in sorted(missing)[:20]:
-                print(f"    {m}")
     else:
         if args.dry_run:
             print("\n--- DRY RUN: HF key → ReLax key + shape ---")
         else:
-            print("\n--- PASS 1: Download + extract + transform → local .npy ---")
+            print("\n--- STAGE 1: Download + transform → .npy ---")
             os.makedirs(temp_dir, exist_ok=True)
 
-    for shard_name in ([] if existing_npy and not args.dry_run else shard_filenames):
-        print(f"\n  Downloading {shard_name} ...")
-        local_shard = Path(hf_hub_download(
-            args.repo, shard_name, local_dir=download_dir,
-        ))
+        for shard_name in shard_filenames:
+            print(f"\n  Downloading {shard_name} ...")
+            local_shard = Path(hf_hub_download(
+                args.repo, shard_name, local_dir=download_dir,
+            ))
 
-        with safe_open(str(local_shard), framework="np", device="cpu") as f:
-            for hf_key in f.keys():
-                if hf_key not in key_map:
-                    print(f"  [SKIP] Unknown HF key: {hf_key}")
-                    continue
+            with safe_open(str(local_shard), framework="np",
+                           device="cpu") as f:
+                for hf_key in f.keys():
+                    if hf_key not in key_map:
+                        print(f"  [SKIP] Unknown HF key: {hf_key}")
+                        continue
 
-                relax_key, xform_kw = key_map[hf_key]
+                    relax_key, xform_kw = key_map[hf_key]
+                    tensor = f.get_tensor(hf_key)
+                    tensor = _transform(tensor, **xform_kw)
+                    tensor = tensor.astype(target_dtype)
 
-                tensor = f.get_tensor(hf_key)
-                tensor = _transform(tensor, **xform_kw)
-                tensor = tensor.astype(target_dtype)
+                    if args.dry_run:
+                        print(f"  {hf_key}  →  {relax_key}  "
+                              f"{tuple(tensor.shape)}  {tensor.dtype}")
+                    else:
+                        npy_path = temp_dir / (
+                            relax_key.replace(".", "__") + ".npy"
+                        )
+                        t0 = time.time()
+                        np.save(str(npy_path), tensor)
+                        elapsed = time.time() - t0
+                        print(f"    saved {relax_key}  {tuple(tensor.shape)}  "
+                              f"{tensor.nbytes / 1e6:.1f} MB  ({elapsed:.2f}s)")
 
-                if args.dry_run:
-                    print(f"  {hf_key}  →  {relax_key}  {tuple(tensor.shape)}  {tensor.dtype}")
-                else:
-                    npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-                    np.save(str(npy_path), tensor)
+                    seen_relax_keys.add(relax_key)
+                    del tensor
 
-                seen_relax_keys.add(relax_key)
-                del tensor
+            local_shard.unlink(missing_ok=True)
+            gc.collect()
+            if not args.dry_run:
+                print(f"  Processed and deleted {shard_name}")
 
-        # Delete the shard to reclaim disk space
-        local_shard.unlink(missing_ok=True)
-        gc.collect()
-        if not args.dry_run:
-            print(f"  Processed and deleted {shard_name}")
+        shutil.rmtree(download_dir, ignore_errors=True)
 
-    # Sanity check (only when Pass 1 ran)
-    if not existing_npy or args.dry_run:
-        missing = set(v[0] for v in key_map.values()) - seen_relax_keys
-        if missing:
-            print(f"\n  WARNING: {len(missing)} ReLax keys not found in safetensors:")
-            for m in sorted(missing)[:20]:
-                print(f"    {m}")
-
-    # Clean up download directory
-    shutil.rmtree(download_dir, ignore_errors=True)
+    # Sanity check
+    missing = set(v[0] for v in key_map.values()) - seen_relax_keys
+    if missing:
+        print(f"\n  WARNING: {len(missing)} ReLax keys missing:")
+        for m in sorted(missing)[:20]:
+            print(f"    {m}")
 
     if args.dry_run:
         print(f"\nTotal: {len(seen_relax_keys)} tensors mapped")
         return
 
     # ------------------------------------------------------------------
-    # PASS 2: mmap .npy files, build pytree, stream to GCS via Orbax
+    # STAGE 2: Load .npy → shard onto TPU (one tensor at a time)
     # ------------------------------------------------------------------
-    print("\n--- PASS 2: Build lazy pytree → Orbax to GCS ---")
-    jax_pytree: dict = {}
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
+    from models.sync_server import SyncServer
 
-    for relax_key in sorted(seen_relax_keys):
+    print(f"\n--- STAGE 2: Load and shard onto TPU tensor-by-tensor "
+          f"(tp={args.tp}) ---")
+
+    # Create TP-only mesh
+    devices = jax.devices()
+    assert len(devices) == args.tp, (
+        f"Expected {args.tp} devices (tp={args.tp}), got {len(devices)}"
+    )
+    mesh = Mesh(np.array(devices), ("tp",))
+    print(f"Mesh: {mesh.shape} on {len(devices)} device(s)")
+
+    def _auto_shard_spec(shape: tuple, tp: int) -> PS:
+        """Find the first axis divisible by tp and shard on it; else replicate."""
+        for axis in range(len(shape)):
+            if shape[axis] % tp == 0:
+                spec = [None] * len(shape)
+                spec[axis] = "tp"
+                return PS(*spec)
+        return PS()
+
+    # Load each .npy, shard onto TPU, discard numpy array immediately.
+    # Barrier before each device_put ensures all hosts are ready.
+    params: dict = {}
+    total_bytes = 0
+    t_shard = time.time()
+
+    sorted_keys = sorted(seen_relax_keys)
+    for idx, relax_key in enumerate(sorted_keys, 1):
         npy_path = temp_dir / (relax_key.replace(".", "__") + ".npy")
-        lazy = np.load(str(npy_path), mmap_mode="r")
-        _insert_into_pytree(jax_pytree, relax_key, lazy)
+        arr = np.load(str(npy_path))
+        if arr.dtype == np.uint16:
+            arr = arr.view(ml_dtypes.bfloat16)
+        total_bytes += arr.nbytes
 
-    print(f"Lazy pytree assembled ({len(seen_relax_keys)} arrays, ~0 RAM)")
+        # Convert to bfloat16 if needed
+        if np.issubdtype(arr.dtype, np.floating) and arr.dtype != ml_dtypes.bfloat16:
+            arr = arr.astype(ml_dtypes.bfloat16)
+
+        # Sync all hosts before placing on device
+        SyncServer.barrier("shard_param", idx)
+
+        # Shard on first divisible axis, else replicate
+        spec = _auto_shard_spec(arr.shape, args.tp)
+        t0 = time.time()
+        jax_arr = jax.device_put(arr, NamedSharding(mesh, spec))
+        dt = time.time() - t0
+        del arr  # free host RAM immediately
+
+        _insert_into_pytree(params, relax_key, jax_arr)
+
+        print(f"  [{idx}/{len(sorted_keys)}] {relax_key}  "
+              f"{tuple(jax_arr.shape)}  {spec}  "
+              f"{jax_arr.nbytes / 1e6:.1f} MB  ({dt:.2f}s)")
+
+    jax.block_until_ready(params)
+    elapsed_shard = time.time() - t_shard
+    print(f"\nSharded pytree on TPU: {len(seen_relax_keys)} arrays, "
+          f"{total_bytes / 1e9:.2f} GB ({elapsed_shard:.1f}s)")
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # STAGE 3: Save sharded params to GCS via Orbax
+    # ------------------------------------------------------------------
+    import orbax.checkpoint as ocp
+    from orbax.checkpoint.options import MultiprocessingOptions
+
+    print(f"\n--- STAGE 3: Orbax save → {args.gcs_path} ---")
 
     shared = args.gcs_path.startswith("gs://")
-    if shared:
-        from orbax.checkpoint.options import MultiprocessingOptions
-        options = ocp.CheckpointManagerOptions(
-            multiprocessing_options=MultiprocessingOptions(primary_host=0),
-        )
-    else:
-        options = ocp.CheckpointManagerOptions()
-
+    primary = 0 if shared else None
+    options = ocp.CheckpointManagerOptions(
+        multiprocessing_options=MultiprocessingOptions(primary_host=primary),
+    )
     mngr = ocp.CheckpointManager(args.gcs_path, options=options)
 
-    print(f"Streaming to {args.gcs_path} ...")
-    mngr.save(step=0, args=ocp.args.StandardSave(jax_pytree))
+    print("Saving...")
+    t_save = time.time()
+    mngr.save(step=0, args=ocp.args.StandardSave(params))
     mngr.wait_until_finished()
-    print("Upload complete!")
+    elapsed_save = time.time() - t_save
+    throughput = total_bytes / elapsed_save / 1e6
+    print(f"Upload complete! ({elapsed_save:.1f}s, ~{throughput:.0f} MB/s)")
 
-    # Clean up .npy temp files
+    if jax.process_index() == 0:
+        print(f"Checkpoint saved to {args.gcs_path}")
+
+    # Clean up temp files
     shutil.rmtree(temp_dir, ignore_errors=True)
     print("Cleaned up temp files.")
 
