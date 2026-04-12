@@ -88,11 +88,11 @@ def load_model(
     print("Weights loaded successfully")
 
     # Load tokenizer
-    tokenizer_path = model_path / "tokenizer.model"
+    tokenizer_path = model_path / "tokenizer.json"
     if not tokenizer_path.exists():
         raise FileNotFoundError(
             f"Tokenizer not found at {tokenizer_path}\n"
-            f"Expected tokenizer.model in {model_path}"
+            f"Expected tokenizer.json in {model_path}"
         )
 
     print(f"Loading tokenizer from {tokenizer_path}...")
