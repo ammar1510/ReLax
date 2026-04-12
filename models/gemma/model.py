@@ -88,7 +88,7 @@ class SlidingAttentionBlock(nn.Module):
 
         # Per-layer residual scalar
         self.layer_scalar = self.param(
-            "layer_scalar", nn.initializers.ones, (), dt
+            "layer_scalar", nn.initializers.ones, (1,), dt
         )
 
     def __call__(
@@ -220,7 +220,7 @@ class GlobalAttentionBlock(nn.Module):
 
         # Per-layer residual scalar
         self.layer_scalar = self.param(
-            "layer_scalar", nn.initializers.ones, (), dt
+            "layer_scalar", nn.initializers.ones, (1,), dt
         )
 
     def __call__(
