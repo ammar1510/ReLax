@@ -33,6 +33,9 @@ class GemmaTokenizer:
         self.start_of_turn_id: int = self.tok.token_to_id("<|turn>")
         self.end_of_turn_id: int = self.tok.token_to_id("<turn|>")
 
+        # Used as both open and close delimiter for the thinking block
+        self.think_token_id: int | None = self.tok.token_to_id("<|think|>")
+
         # Stop on both eos and end-of-turn
         self.stop_ids: tuple[int, ...] = (self.eos_id, self.end_of_turn_id)
 

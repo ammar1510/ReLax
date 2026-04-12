@@ -107,6 +107,27 @@ def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
     return tokenizer.encode(text, bos=True, eos=False)
 
 
+def split_thinking(tokens: List[int], tokenizer: GemmaTokenizer):
+    """Split a generated token list into (thinking_text, response_text).
+
+    The model wraps its chain-of-thought in <|think|>...<|think|> using
+    token ID tokenizer.think_token_id. Returns (None, full_text) if the
+    token is absent or the pattern is not found.
+    """
+    tid = tokenizer.think_token_id
+    if tid is None:
+        return None, tokenizer.decode(tokens)
+
+    occurrences = [i for i, t in enumerate(tokens) if t == tid]
+    if len(occurrences) < 2:
+        return None, tokenizer.decode(tokens)
+
+    start, end = occurrences[0], occurrences[1]
+    thinking_text = tokenizer.decode(tokens[start + 1 : end])
+    response_text = tokenizer.decode(tokens[end + 1 :])
+    return thinking_text, response_text
+
+
 # ---------------------------------------------------------------------------
 # Batch generation (model-agnostic event loop)
 # ---------------------------------------------------------------------------
@@ -191,12 +212,19 @@ def generate_batch(
                 generated_tokens = [
                     t.item() if hasattr(t, "item") else t for t in generated_tokens
                 ]
-            decoded_text = tokenizer.decode(generated_tokens)
-            decoded_results.append(decoded_text)
+
+            thinking_text, response_text = split_thinking(generated_tokens, tokenizer)
+            decoded_results.append(response_text)
 
             if verbose:
                 print(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
-                print(f"            {decoded_text[:200]}")
+                if thinking_text is not None:
+                    print(f"  --- Thinking ---")
+                    for line in thinking_text.strip().splitlines():
+                        print(f"  {line}")
+                    print(f"  --- Response ---")
+                for line in response_text.strip().splitlines():
+                    print(f"  {line}")
                 print()
         else:
             decoded_results.append("")
@@ -231,7 +259,7 @@ def main():
     parser.add_argument(
         "--max_decode_length",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum number of tokens to generate per request",
     )
     parser.add_argument(
