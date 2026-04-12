@@ -228,11 +228,23 @@ class MeshHelper:
 
         def shard_leaf(path, x):
             name = "/".join(_get_key_name(k) for k in path)
-            # Convert float32 params to bfloat16 to save HBM
-            if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
-                x = jnp.asarray(x, dtype=jnp.bfloat16)
+
+            # Already a multi-host distributed array (e.g. from load_from_orbax with mesh).
+            # astype preserves sharding; device_put would trigger allgather → OOM.
+            if isinstance(x, jax.Array) and not x.is_fully_addressable:
+                if jnp.issubdtype(x.dtype, jnp.floating) and x.dtype != jnp.bfloat16:
+                    return x.astype(jnp.bfloat16)
+                return x
+
+            # numpy or host-local JAX array — place onto mesh via callback to avoid
+            # the allgather that jax.device_put triggers on multi-host NamedShardings.
+            x = np.asarray(x)
+            if np.issubdtype(x.dtype, np.floating):
+                import ml_dtypes
+                x = x.astype(ml_dtypes.bfloat16)
             spec = MeshHelper.param_sharding(x, name, mesh)
-            return MeshHelper.put_on_mesh(x, mesh, spec)
+            sharding = NamedSharding(mesh, spec)
+            return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
 
         # shard_params is a collective, all processes must call it
         params = jax.tree.map_with_path(shard_leaf, params)
