@@ -102,7 +102,7 @@ def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
     Produces: <bos><|turn>user\n{prompt}<turn|><|turn>model\n
     """
     text = (
-        f"<|turn>user\n{prompt}<turn|>"
+        f"<|turn>user\n{prompt}<turn|>\n"
         f"<|turn>model\n"
     )
     return tokenizer.encode(text, bos=True, eos=False)
@@ -111,20 +111,32 @@ def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
 def split_thinking(tokens: List[int], tokenizer: GemmaTokenizer):
     """Split a generated token list into (thinking_text, response_text).
 
-    The model wraps its chain-of-thought in <|think|>...<|think|> using
-    token ID tokenizer.think_token_id. Returns (None, full_text) if the
-    token is absent or the pattern is not found.
+    Gemma 4 wraps thinking in <|channel>thought\\n...\\n<channel|>.
+    Returns (None, full_text) if channel tokens are absent or the
+    pattern is not found.
     """
-    tid = tokenizer.think_token_id
-    if tid is None:
+    start_id = tokenizer.start_channel_id
+    end_id = tokenizer.end_channel_id
+    if start_id is None or end_id is None:
         return None, tokenizer.decode(tokens)
 
-    occurrences = [i for i, t in enumerate(tokens) if t == tid]
-    if len(occurrences) < 2:
+    # Find the first <|channel> ... <channel|> span
+    try:
+        start = tokens.index(start_id)
+    except ValueError:
         return None, tokenizer.decode(tokens)
 
-    start, end = occurrences[0], occurrences[1]
+    try:
+        end = tokens.index(end_id, start + 1)
+    except ValueError:
+        return None, tokenizer.decode(tokens)
+
+    # The tokens between the channel markers include "thought\n...\n";
+    # decode and strip the leading "thought\n" prefix if present.
     thinking_text = tokenizer.decode(tokens[start + 1 : end])
+    if thinking_text.startswith("thought\n"):
+        thinking_text = thinking_text[len("thought\n"):]
+
     response_text = tokenizer.decode(tokens[end + 1 :])
     return thinking_text, response_text
 
