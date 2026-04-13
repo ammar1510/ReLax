@@ -12,6 +12,7 @@ Requires tokenizers:
 
 import argparse
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -170,37 +171,20 @@ def generate_batch(
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
-    # Event loop
-    completed = 0
-    start_time = time.time()
-    max_iterations = 10000
-
+    # Run serving loop in background thread, poll for completion
     pid = jax.process_index()
-    debug = serving_loop.verbose
-    for iteration in range(max_iterations):
-        if debug:
-            print(
-                f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
-            )
-            sys.stdout.flush()
-        serving_loop.serving_step()
+    shutdown = threading.Event()
+    serving_loop.serve_forever(shutdown)
 
-        newly_completed = (
-            sum(1 for r in serving_loop.results.values() if r.done) - completed
-        )
-        completed += newly_completed
+    start_time = time.time()
+    while sum(1 for r in serving_loop.results.values() if r.done) < len(prompts):
+        time.sleep(0.01)
 
-        if completed >= len(prompts):
-            if verbose:
-                elapsed = time.time() - start_time
-                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
-                sys.stdout.flush()
-            if debug:
-                print(
-                    f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}"
-                )
-                sys.stdout.flush()
-            break
+    shutdown.set()
+    if verbose:
+        elapsed = time.time() - start_time
+        print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+        sys.stdout.flush()
 
     # Decode results
     decoded_results = []
