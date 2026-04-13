@@ -694,7 +694,7 @@ class ServingLoop:
         SyncServer.barrier("decode_output", self._it)
         if "worker" in self.roles:
             output_tokens = jax.block_until_ready(process_allgather(output_tokens, tiled=True))
-            output_tokens = np.array(output_tokens)  # [batch, steps]
+            output_tokens = np.array(output_tokens).tolist()  # [batch, steps] as nested list
         else:
             output_tokens = None
 
