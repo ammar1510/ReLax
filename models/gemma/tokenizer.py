@@ -29,7 +29,7 @@ class GemmaTokenizer:
         # Special token IDs (Gemma 4 format)
         self.bos_id: int = self.tok.token_to_id("<bos>")
         self.eos_id: int = self.tok.token_to_id("<eos>")
-        self.pad_id: int = self.tok.token_to_id("<pad>") or 0
+        self.pad_id: int = self.tok.token_to_id("<pad>")
         self.start_of_turn_id: int = self.tok.token_to_id("<|turn>")
         self.end_of_turn_id: int = self.tok.token_to_id("<turn|>")
 
