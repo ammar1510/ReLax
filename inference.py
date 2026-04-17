@@ -149,7 +149,7 @@ def generate_batch(
 
             if verbose:
                 log(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
-                log(f"            {decoded_text[:200]}")
+                log(f"            {decoded_text}")
                 log()
         else:
             decoded_results.append("")
