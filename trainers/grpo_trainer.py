@@ -21,6 +21,7 @@ Training Loop:
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,7 +36,7 @@ from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
 from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
@@ -106,7 +107,7 @@ class RolloutBatch:
 
 
 class GRPOTrainer(Trainer):
-    """GRPO trainer using InferenceEngine for batched generation."""
+    """GRPO trainer using ServingLoop for batched generation."""
 
     def __init__(
         self,
@@ -148,14 +149,14 @@ class GRPOTrainer(Trainer):
         self.config = model_config
         self.grpo_config = grpo_config
         self.reward_fn = reward_fn
+        self.detokenize_fn = detokenize_fn
 
         # Create reference model parameters (frozen copy, also sharded)
         self.reference_params = jax.tree.map(lambda x: x.copy(), params)
 
-        # Create InferenceEngine for batched rollout generation
-        engine_cfg = EngineConfig(
+        # Create ServingLoop for batched rollout generation
+        serve_cfg = ServingConfig(
             sampler=partial(categorical, temperature=grpo_config.temperature),
-            detokenize_fn=detokenize_fn,
             decode_steps=grpo_config.decode_steps,
             decode_batch_size=grpo_config.rollout_batch_size,
             prefill_batch_size=grpo_config.group_size,
@@ -166,13 +167,15 @@ class GRPOTrainer(Trainer):
             rng_seed=seed,
         )
         self.is_main = jax.process_index() == 0
-        self.engine = InferenceEngine(
-            engine_cfg=engine_cfg,
+        self.engine = ServingLoop(
+            serve_cfg=serve_cfg,
             model=model,
             params=params,
             mesh=mesh,
+            cache_cls=KVCache,
             is_server=self.is_main,
         )
+        self.engine.warmup()
 
         # Compile JIT functions
         self._compile_functions()
@@ -210,17 +213,15 @@ class GRPOTrainer(Trainer):
         because SyncServer uses _it to namespace KV store keys, and keys are
         global for the lifetime of the process.
         """
-        kv_cache, tokens = self.engine.init_decode_state()
+        kv_cache, tokens = self.engine.engine.init_decode_state()
         self.engine.decode_work.curr_tokens = tokens
         self.engine.decode_work.cache = kv_cache
         self.engine.decode_work.active_results = [
             None for _ in range(self.grpo_config.rollout_batch_size)
         ]
-        self.engine.prefill_work.requests = []
         self.engine.prefill_work.to_prefill = []
         self.engine.prefill_work.to_decode = []
         self.engine.results = {}
-        self.engine.decode_output = (None, None)
 
     def generate_rollouts(
         self,
@@ -240,7 +241,7 @@ class GRPOTrainer(Trainer):
         total_sequences = len(prompts) * self.grpo_config.group_size
 
         # Point engine to current policy params (already sharded)
-        self.engine.params = self.state.params
+        self.engine.engine.params = self.state.params
 
         # Single reset before the whole rollout batch
         self._reset_engine()
@@ -258,16 +259,15 @@ class GRPOTrainer(Trainer):
                         UserRequestPrompt(id=req_id, text=list(prompt_tokens))
                     )
 
-        # Drive the serving loop until every completion is done
-        step = 0
-        while True:
-            self.engine.serving_step()
-            step += 1
-            results = self.engine.results
-            if len(results) == total_sequences and all(r.done for r in results.values()):
-                break
+        # Drive the serving loop in a background thread, poll for completion
+        shutdown = threading.Event()
+        self.engine.serve_forever(shutdown)
 
-        self._log(f"Rollout: all {total_sequences} completions done in {step} serving steps, "
+        while sum(1 for r in self.engine.results.values() if r.done) < total_sequences:
+            time.sleep(0.01)
+
+        shutdown.set()
+        self._log(f"Rollout: all {total_sequences} completions done in "
                   f"{time.time() - t0:.1f}s")
 
         # Collect results in prompt order
@@ -285,7 +285,7 @@ class GRPOTrainer(Trainer):
             for pi in range(len(prompts)):
                 idx = pi * self.grpo_config.group_size
                 sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
-                self._log(f"Sample (prompt {pi}):\n{self.engine.detokenize_fn(sample_tokens)}\n{'─'*60}")
+                self._log(f"Sample (prompt {pi}):\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
