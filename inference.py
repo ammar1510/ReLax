@@ -183,7 +183,7 @@ def main():
     parser.add_argument(
         "--max_decode_length",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum number of tokens to generate per request",
     )
     args = parser.parse_args()
@@ -216,6 +216,7 @@ def main():
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=args.max_decode_length,
+        max_cache_seqlen=2048
     )
 
     # Create serving loop
