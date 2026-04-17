@@ -836,6 +836,9 @@ class ServingLoop:
         """
 
         def serve_thread():
+            # NOTE: shutdown_signal is per-process, so bg threads can diverge at the
+            # check — some exit while others enter the next serving_step barrier and
+            # block forever, failing once any process calls jax.distributed.shutdown().
             try:
                 while not shutdown_signal.is_set():
                     self.serving_step()
