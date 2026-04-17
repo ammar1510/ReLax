@@ -1,7 +1,7 @@
 """Inference script for LLaMA models.
 
 Loads a LLaMA model with weights from disk and performs batch inference
-using the InferenceEngine event loop pattern.
+using the ServingLoop event loop pattern.
 
 Usage:
     python inference.py --model_path /path/to/model
@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -22,7 +23,8 @@ from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.llama.load import load_from_orbax
 from models.llama.tokenizer import Tokenizer
-from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+from utils.kvcache import KVCache
 from sampling import greedy
 
 DEFAULT_PROMPTS = [
@@ -85,15 +87,15 @@ def format_prompt(prompt: str, tokenizer: Tokenizer) -> List[int]:
 
 
 def generate_batch(
-    engine: InferenceEngine,
+    serving_loop: ServingLoop,
     tokenizer: Tokenizer,
     prompts: List[str],
     verbose: bool = True,
 ) -> List[str]:
-    """Generate text for a batch of prompts using event loop.
+    """Generate text for a batch of prompts using the ServingLoop event loop.
 
     Args:
-        engine: InferenceEngine instance
+        serving_loop: ServingLoop instance
         tokenizer: Tokenizer for encoding/decoding
         prompts: List of text prompts
         verbose: Print generation progress
@@ -115,51 +117,32 @@ def generate_batch(
             print(f"            Tokens: {len(prompt_tokens)}")
 
         request = UserRequestPrompt(id=i, text=prompt_tokens)
-        engine.add_request(request)
+        serving_loop.add_request(request)
 
     if verbose:
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
-    # Event loop
-    completed = 0
-    start_time = time.time()
-    max_iterations = 10000
-
+    # Run serving loop in background thread, poll for completion
     pid = jax.process_index()
-    debug = engine.verbose
-    for iteration in range(max_iterations):
-        if debug:
-            print(
-                f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
-            )
-            sys.stdout.flush()
-        engine.serving_step()
+    shutdown = threading.Event()
+    serving_loop.serve_forever(shutdown)
 
-        newly_completed = (
-            sum(1 for r in engine.results.values() if r.done) - completed
-        )
-        completed += newly_completed
+    start_time = time.time()
+    while sum(1 for r in serving_loop.results.values() if r.done) < len(prompts):
+        time.sleep(0.01)
 
-        if completed >= len(prompts):
-            if verbose:
-                elapsed = time.time() - start_time
-                print(
-                    f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s"
-                )
-                sys.stdout.flush()
-            if debug:
-                print(
-                    f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}"
-                )
-                sys.stdout.flush()
-            break
+    shutdown.set()
+    if verbose:
+        elapsed = time.time() - start_time
+        print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+        sys.stdout.flush()
 
     # Decode results
     decoded_results = []
     for i in range(len(prompts)):
-        if i in engine.results and engine.results[i].done:
-            result = engine.results[i]
+        if i in serving_loop.results and serving_loop.results[i].done:
+            result = serving_loop.results[i]
             generated_tokens = result.token_list
             if generated_tokens and hasattr(generated_tokens[0], "item"):
                 generated_tokens = [
@@ -225,9 +208,8 @@ def main():
     )
 
     # Create serving configuration
-    engine_cfg = EngineConfig(
+    serve_cfg = ServingConfig(
         sampler=greedy,
-        detokenize_fn=tokenizer.decode,
         decode_steps=10,
         decode_batch_size=16,
         prefill_batch_size=4,
@@ -239,16 +221,20 @@ def main():
     # Create serving loop
     print(f"\nInitializing serving loop...")
     sys.stdout.flush()
-    engine = InferenceEngine(
-        engine_cfg=engine_cfg,
+    serving_loop = ServingLoop(
+        serve_cfg=serve_cfg,
         model=model,
         params=params,
         mesh=mesh,
+        cache_cls=KVCache,
         is_server=(jax.process_index() == 0),
     )
 
+    # Warmup: JIT compile prefill and decode before real inference
+    serving_loop.warmup()
+
     # Run batch generation
-    generate_batch(engine, tokenizer, prompts, verbose=True)
+    generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
     # Ensure all hosts finish before any process exits
     pid = jax.process_index()
