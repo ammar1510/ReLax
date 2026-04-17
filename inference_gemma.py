@@ -96,16 +96,29 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
 # ---------------------------------------------------------------------------
 
 
-def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
+def format_prompt(
+    prompt: str, tokenizer: GemmaTokenizer, enable_thinking: bool = False
+) -> List[int]:
     """Format a user prompt using the Gemma 4 chat template.
 
-    Produces: <bos><|turn>user\n{prompt}<turn|><|turn>model\n
+    See gemma4_chat_template.md §2/§3/§8.
+
+    enable_thinking=False (default):
+        <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+        The trailing empty thought block suppresses reasoning — required,
+        otherwise the model produces runaway <|channel>thought\n... output.
+
+    enable_thinking=True:
+        <bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{prompt}<turn|>\n<|turn>model\n
     """
-    text = (
-        f"<|turn>user\n{prompt}<turn|>\n"
-        f"<|turn>model\n"
-    )
-    return tokenizer.encode(text, bos=True, eos=False)
+    parts = []
+    if enable_thinking:
+        parts.append("<|turn>system\n<|think|><turn|>\n")
+    parts.append(f"<|turn>user\n{prompt}<turn|>\n")
+    parts.append("<|turn>model\n")
+    if not enable_thinking:
+        parts.append("<|channel>thought\n<channel|>")
+    return tokenizer.encode("".join(parts), bos=True, eos=False)
 
 
 def split_thinking(tokens: List[int], tokenizer: GemmaTokenizer):
