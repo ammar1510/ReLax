@@ -30,14 +30,15 @@ from jax.sharding import Mesh
 from pydantic import BaseModel
 
 from inference import load_model
-from models.engine import EngineConfig, InferenceEngine, UserRequestPrompt
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
+from utils.kvcache import KVCache
 from sampling import greedy
 from models.sync_server import SyncServer
 
 # ---------------------------------------------------------------------------
 # Global state (set in main() before the server accepts requests)
 # ---------------------------------------------------------------------------
-engine: Optional[InferenceEngine] = None
+engine: Optional[ServingLoop] = None
 tokenizer = None
 max_pending_requests: int = 500
 
@@ -48,16 +49,6 @@ _counter_lock = threading.Lock()
 def _next_id() -> int:
     with _counter_lock:
         return next(_request_counter)
-
-
-# ---------------------------------------------------------------------------
-# Background inference thread
-# ---------------------------------------------------------------------------
-
-def _inference_loop(shutdown: threading.Event) -> None:
-    """Call serving_step() continuously.  Must run on exactly one thread."""
-    while not shutdown.is_set():
-        engine.serving_step()
 
 
 def _wandb_system_loop(shutdown: threading.Event, interval: float = 5.0) -> None:
@@ -118,7 +109,7 @@ async def chat_completions(req: ChatCompletionRequest):
     req_id = _next_id()
     tokens = _format_chat_prompt(req.messages, tokenizer)
     prompt_tokens_count = len(tokens)
-    if prompt_tokens_count >= engine.engine_cfg.max_cache_seqlen:
+    if prompt_tokens_count >= engine.serve_cfg.max_cache_seqlen:
         raise HTTPException(
             status_code=400,
             detail=f"Prompt too long ({prompt_tokens_count} tokens), max is {engine.engine_cfg.max_cache_seqlen - 1}",
@@ -207,9 +198,8 @@ def main():
     # Load model
     model, params, config, tokenizer = load_model(args.model_path, args.checkpoint_path, mesh)
 
-    engine_cfg = EngineConfig(
+    serve_cfg = ServingConfig(
         sampler=greedy,
-        detokenize_fn=tokenizer.decode,
         decode_steps=decode_steps,
         decode_batch_size=decode_batch_size,
         prefill_batch_size=prefill_batch_size,
@@ -219,13 +209,15 @@ def main():
         max_cache_seqlen=max_decode_length,
     )
 
-    engine = InferenceEngine(
-        engine_cfg=engine_cfg,
+    engine = ServingLoop(
+        serve_cfg=serve_cfg,
         model=model,
         params=params,
         mesh=mesh,
+        cache_cls=KVCache,
         is_server=(pid == 0),
     )
+    engine.warmup()
 
     # Initialize wandb on P0
     if pid == 0:
@@ -242,10 +234,7 @@ def main():
 
     # Start background inference thread (all processes)
     shutdown = threading.Event()
-    inference_thread = threading.Thread(
-        target=_inference_loop, args=(shutdown,), daemon=True, name="inference"
-    )
-    inference_thread.start()
+    engine.serve_forever(shutdown)
 
     # Start wandb system metrics thread on P0
     if pid == 0 and wandb.run is not None:
@@ -268,7 +257,7 @@ def main():
         print(f"[P{pid}] Worker process running inference loop")
         sys.stdout.flush()
         try:
-            inference_thread.join()
+            shutdown.wait()
         except KeyboardInterrupt:
             shutdown.set()
 
