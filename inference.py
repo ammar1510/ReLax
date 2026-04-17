@@ -27,6 +27,13 @@ from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
 from sampling import greedy
 
+
+def log(*args, **kwargs):
+    if jax.process_index() == 0:
+        print(*args, **kwargs)
+        sys.stdout.flush()
+
+
 DEFAULT_PROMPTS = [
     "What is JAX and how does it differ from PyTorch?",
     "Explain the transformer architecture in simple terms.",
@@ -48,22 +55,18 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
     """
     model_path = Path(model_path)
 
-    # Load configuration
     config = ModelConfig.from_json_file(str(model_path))
-    print(
+    log(
         f"Loaded config: {config.n_layers} layers, {config.dim} dim, "
         f"{config.n_heads} heads, {config.n_kv_heads} kv_heads, {config.max_seqlen} max_seqlen"
     )
 
-    # Initialize model
     model = LLaMa(config)
 
-    # Load weights from orbax checkpoint (sharded onto mesh)
-    print(f"Loading weights from {checkpoint_path}...")
+    log(f"Loading weights from {checkpoint_path}...")
     params = load_from_orbax(checkpoint_path, mesh=mesh)
-    print("Weights loaded successfully")
+    log("Weights loaded successfully")
 
-    # Load tokenizer
     tokenizer_path = model_path / "original/tokenizer.model"
     if not tokenizer_path.exists():
         raise FileNotFoundError(
@@ -71,10 +74,9 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
             f"Expected tokenizer.model in {model_path}"
         )
 
-    print(f"Loading tokenizer from {tokenizer_path}...")
+    log(f"Loading tokenizer from {tokenizer_path}...")
     tokenizer = Tokenizer(str(tokenizer_path))
-    print(f"Tokenizer loaded (vocab size: {tokenizer.vocab_size})")
-    sys.stdout.flush()
+    log(f"Tokenizer loaded (vocab size: {tokenizer.vocab_size})")
 
     return model, params, config, tokenizer
 
@@ -104,27 +106,23 @@ def generate_batch(
         List of generated texts (one per prompt)
     """
     if verbose:
-        print(f"\n{'='*80}")
-        print(f"Batch Generation: {len(prompts)} prompts")
-        print(f"{'='*80}\n")
+        log(f"\n{'='*80}")
+        log(f"Batch Generation: {len(prompts)} prompts")
+        log(f"{'='*80}\n")
 
-    # Submit all requests
     for i, prompt in enumerate(prompts):
         prompt_tokens = format_prompt(prompt, tokenizer)
 
         if verbose:
-            print(f"[request-{i}] Prompt: {prompt[:60]}...")
-            print(f"            Tokens: {len(prompt_tokens)}")
+            log(f"[request-{i}] Prompt: {prompt[:60]}...")
+            log(f"            Tokens: {len(prompt_tokens)}")
 
         request = UserRequestPrompt(id=i, text=prompt_tokens)
         serving_loop.add_request(request)
 
     if verbose:
-        print(f"\nProcessing {len(prompts)} requests...\n")
-        sys.stdout.flush()
+        log(f"\nProcessing {len(prompts)} requests...\n")
 
-    # Run serving loop in background thread, poll for completion
-    pid = jax.process_index()
     shutdown = threading.Event()
     serving_loop.serve_forever(shutdown)
 
@@ -135,10 +133,8 @@ def generate_batch(
     shutdown.set()
     if verbose:
         elapsed = time.time() - start_time
-        print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
-        sys.stdout.flush()
+        log(f"\nAll {len(prompts)} requests completed in {elapsed:.2f}s")
 
-    # Decode results
     decoded_results = []
     for i in range(len(prompts)):
         if i in serving_loop.results and serving_loop.results[i].done:
@@ -152,9 +148,9 @@ def generate_batch(
             decoded_results.append(decoded_text)
 
             if verbose:
-                print(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
-                print(f"            {decoded_text[:200]}")
-                print()
+                log(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
+                log(f"            {decoded_text[:200]}")
+                log()
         else:
             decoded_results.append("")
 
@@ -190,24 +186,18 @@ def main():
 
     prompts = DEFAULT_PROMPTS
 
-    # Create mesh before loading so weights are sharded during restore
     devices = jax.devices()
     assert (
         len(devices) == args.dp * args.tp
     ), f"Expected {args.dp * args.tp} devices, got {len(devices)}"
     mesh = Mesh(np.array(devices).reshape(args.dp, args.tp), ("dp", "tp"))
 
-    print(f"Created mesh with {len(devices)} device(s): {mesh}")
-    print(f"Process {jax.process_index()}: devices {jax.local_devices()}")
-    sys.stdout.flush()
-
-    # Load model with sharded weights
-    print("Loading model...")
+    log(f"Created mesh with {len(devices)} device(s): {mesh}")
+    log(f"Loading model...")
     model, params, config, tokenizer = load_model(
         args.model_path, args.checkpoint_path, mesh
     )
 
-    # Create serving configuration
     serve_cfg = ServingConfig(
         sampler=greedy,
         decode_steps=10,
@@ -216,12 +206,10 @@ def main():
         eos_tokens=(tokenizer.eot_id,),
         token_pad_idx=tokenizer.pad_id,
         max_decode_length=args.max_decode_length,
-        max_cache_seqlen=2048
+        max_cache_seqlen=2048,
     )
 
-    # Create serving loop
-    print(f"\nInitializing serving loop...")
-    sys.stdout.flush()
+    log(f"\nInitializing serving loop...")
     serving_loop = ServingLoop(
         serve_cfg=serve_cfg,
         model=model,
@@ -231,23 +219,14 @@ def main():
         is_server=(jax.process_index() == 0),
     )
 
-    # Warmup: JIT compile prefill and decode before real inference
     serving_loop.warmup()
 
-    # Run batch generation
     generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
-    # Ensure all hosts finish before any process exits
-    pid = jax.process_index()
-    print(f"[P{pid}] reaching shutdown barrier")
-    sys.stdout.flush()
     from models.sync_server import SyncServer
-
+    log("Reaching shutdown barrier...")
     SyncServer.barrier("shutdown", 0)
-    print(f"[P{pid}] passed shutdown barrier")
-    sys.stdout.flush()
-
-    print(f"\n[P{pid}] Done!")
+    log("Done!")
     jax.distributed.shutdown()
 
 
