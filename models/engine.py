@@ -26,6 +26,7 @@ from flax.core import FrozenDict
 from jax.sharding import Mesh, set_mesh
 import numpy as np
 from jax import jit
+from jax.experimental.multihost_utils import process_allgather
 
 from jax import random
 
@@ -331,13 +332,6 @@ class InferenceEngine:
                 rng_key, subkey = random.split(rng_key)
                 new_tokens = sample_fn(batch_logits, subkey)[:, None]
 
-                # Only update tokens for active slots
-                updated_tokens = jnp.where(
-                    active_mask[:, None],
-                    new_tokens,
-                    curr_tokens,
-                )
-
                 # Disable slots that just produced an EOS token
                 if eos_ids is not None:
                     hit_eos = jnp.any(new_tokens == eos_ids[None, :], axis=-1)  # [batch]
@@ -345,12 +339,20 @@ class InferenceEngine:
                 else:
                     updated_mask = active_mask
 
+                # Freeze carry for inactive slots; slots that just hit EOS still emit new_tokens
+                # (the EOS token itself), and will be frozen to it on subsequent steps.
+                updated_tokens = jnp.where(
+                    active_mask[:, None],
+                    new_tokens,
+                    curr_tokens,
+                )
+
                 # Reshard carry to match input sharding (prevents drift across scan iterations)
                 updated_tokens = jax.lax.with_sharding_constraint(
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
-                return (updated_tokens, updated_mask, updated_cache, rng_key), new_tokens
+                return (updated_tokens, updated_mask, updated_cache, rng_key), updated_tokens
 
             (final_tokens, _, final_cache, _), output_tokens = jax.lax.scan(
                 body, (curr_tokens, active_mask, cache, rng_key), length=steps
@@ -464,9 +466,6 @@ class ServingLoop:
         # Create multistep decode function
         self.multistep_decode_fn = self.engine.make_multistep_decode_fn()
         self._decode_call_count = 0
-
-        # Delayed EOS detection: stores (output_tokens, output_mapping) from previous iteration
-        self.decode_output = (None, None)
 
         # Setup prefill work
         self.prefill_work = PrefillWork([], [])
@@ -599,61 +598,28 @@ class ServingLoop:
         self.decode_work.cache = new_cache
         self.decode_work.curr_tokens = new_tokens
 
-    def _check_done_sequences(self, output_tokens: np.ndarray) -> list[bool]:
-        """Check which sequences are done (EOS or max length).
-
-        Args:
-            output_tokens: Generated tokens [batch, steps]
-
-        Returns:
-            List of booleans indicating done status for each slot
-        """
-        # Check for EOS tokens
-        done = []
-        for i, result in enumerate(self.decode_work.active_results):
-            if result is None:
-                done.append(False)
-                continue
-
-            # Check if any token in this row matches EOS
-            has_eos = np.any(output_tokens[i, :, None] == self.eos_tokens) if len(self.eos_tokens) > 0 else False
-            is_max_length = result.tokens_decoded >= self.serve_cfg.max_decode_length
-
-            done.append(bool(has_eos or is_max_length))
-
-        return done
-
-    def _update_results_and_evict(self, output_tokens_flat: list[int], output_mapping_flat: list[int], done: list[bool]):
+    def _update_results_and_evict(self, output_tokens: np.ndarray):
         """Update results dict with new tokens and evict completed sequences.
 
         Args:
-            output_tokens_flat: Flattened tokens [batch * steps]
-            output_mapping_flat: Flattened request ID mapping [batch * steps]
-            done: Done status for each slot
+            output_tokens: Generated tokens [batch, steps]
         """
-        # Dispatch tokens to results via output_mapping
-        for token, req_id in zip(output_tokens_flat, output_mapping_flat):
-            if req_id >= 0 and req_id in self.results and not self.results[req_id].done:
-                self.results[req_id].token_list.append(token)
-                self.results[req_id].tokens_decoded += 1
-
-        # Evict completed sequences and truncate at EOS
         eos_set = set(self.eos_tokens.tolist()) if len(self.eos_tokens) > 0 else set()
-        for i, result in enumerate(self.decode_work.active_results):
+
+        # Dispatch tokens, evicting slots that hit EOS or max length
+        for i, (result, tokens) in enumerate(zip(self.decode_work.active_results, output_tokens)):
             if result is None:
                 continue
-            if done[i]:
-                # Truncate token_list at first EOS token
-                if eos_set:
-                    for j, tok in enumerate(result.token_list):
-                        if tok in eos_set:
-                            result.token_list = result.token_list[:j]
-                            break
-                result.done = True
-                self.decode_work.active_results[i] = None
-                if self.verbose:
-                    print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
-                    sys.stdout.flush()
+            for token in tokens:
+                if token in eos_set or result.tokens_decoded >= self.serve_cfg.max_decode_length:
+                    result.done = True
+                    self.decode_work.active_results[i] = None
+                    if self.verbose:
+                        print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
+                        sys.stdout.flush()
+                    break
+                self.results[result.id].token_list.append(token)
+                result.tokens_decoded += 1
 
     def decode_step(self):
         """One decode iteration: insert pending prefills + run multistep decode."""
@@ -694,11 +660,6 @@ class ServingLoop:
         # Build active_mask for multistep decode
         active_mask = jnp.array([result is not None for result in self.decode_work.active_results])
 
-        # Build output_mapping: maps [batch, steps] -> request IDs for result dispatch
-        output_mapping = [
-            [getattr(result, "id", -1) for result in self.decode_work.active_results]
-        ] * self.serve_cfg.decode_steps
-        output_mapping = np.array(output_mapping).T  # [batch, steps]
 
         self.engine.rng_key, decode_rng_key = random.split(self.engine.rng_key)
         import time as _time
@@ -728,35 +689,26 @@ class ServingLoop:
                   f"{_elapsed/self.serve_cfg.decode_steps*1000:.1f}ms/token")
             sys.stdout.flush()
 
-        # Phase 3: Delayed EOS detection — process PREVIOUS iteration's output
-        # Swap current output with stored output (allows decode kernel to run async)
-        self.decode_output, (output_tokens, output_mapping) = \
-            (output_tokens, output_mapping), self.decode_output
+        # Phase 3: Process current iteration's output
+        self._log("decode: entering barrier:decode_output")
+        SyncServer.barrier("decode_output", self._it)
+        if "worker" in self.roles:
+            output_tokens = jax.block_until_ready(process_allgather(output_tokens, tiled=True))
+            output_tokens = np.array(output_tokens).tolist()  # [batch, steps] as nested list
+        else:
+            output_tokens = None
 
-        self._log(f"decode: phase3 (has_prev_output={output_tokens is not None})")
-        if output_tokens is not None:
-            self._log("decode: entering barrier:decode_output")
-            SyncServer.barrier("decode_output", self._it)
-            if "worker" in self.roles:
-                output_tokens = jax.block_until_ready(jax.experimental.multihost_utils.process_allgather(output_tokens,tiled=True))
-                output_tokens = np.array(output_tokens)  # [B, steps]
-                done = self._check_done_sequences(output_tokens)
-                output_tokens_flat = output_tokens.reshape(-1).tolist()
-                output_mapping_flat = output_mapping.reshape(-1).tolist()
-            else:
-                output_tokens_flat, output_mapping_flat, done = None, None, None
+        # Broadcast results to all processes
+        self._log("decode: entering broadcast:decode_tokens")
+        output_tokens, = SyncServer.broadcast(
+            "decode_tokens",
+            self._it,
+            (output_tokens,),
+            is_source="coordinator" in self.roles,
+        )
 
-            # Broadcast results to all processes
-            self._log(f"decode: entering broadcast:decode_tokens (done={done})")
-            output_tokens_flat, output_mapping_flat, done = SyncServer.broadcast(
-                "decode_tokens",
-                self._it,
-                (output_tokens_flat, output_mapping_flat, done),
-                is_source="coordinator" in self.roles,
-            )
-
-            # Phase 4: Update results and evict completed sequences
-            self._update_results_and_evict(output_tokens_flat, output_mapping_flat, done)
+        # Phase 4: Update results and evict completed sequences
+        self._update_results_and_evict(output_tokens)
 
     def prefill_step(self):
         """One prefill iteration: batch prefill pending requests."""

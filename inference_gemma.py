@@ -12,6 +12,7 @@ Requires tokenizers:
 
 import argparse
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -95,16 +96,62 @@ def load_model(model_path: str, checkpoint_path: str, mesh: Mesh):
 # ---------------------------------------------------------------------------
 
 
-def format_prompt(prompt: str, tokenizer: GemmaTokenizer) -> List[int]:
+def format_prompt(
+    prompt: str, tokenizer: GemmaTokenizer, enable_thinking: bool = False
+) -> List[int]:
     """Format a user prompt using the Gemma 4 chat template.
 
-    Produces: <bos><|turn>user\n{prompt}<turn|><|turn>model\n
+    See gemma4_chat_template.md §2/§3/§8.
+
+    enable_thinking=False (default):
+        <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+        The trailing empty thought block suppresses reasoning — required,
+        otherwise the model produces runaway <|channel>thought\n... output.
+
+    enable_thinking=True:
+        <bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{prompt}<turn|>\n<|turn>model\n
     """
-    text = (
-        f"<|turn>user\n{prompt}<turn|>"
-        f"<|turn>model\n"
-    )
-    return tokenizer.encode(text, bos=True, eos=False)
+    parts = []
+    if enable_thinking:
+        parts.append("<|turn>system\n<|think|><turn|>\n")
+    parts.append(f"<|turn>user\n{prompt}<turn|>\n")
+    parts.append("<|turn>model\n")
+    if not enable_thinking:
+        parts.append("<|channel>thought\n<channel|>")
+    return tokenizer.encode("".join(parts), bos=True, eos=False)
+
+
+def split_thinking(tokens: List[int], tokenizer: GemmaTokenizer):
+    """Split a generated token list into (thinking_text, response_text).
+
+    Gemma 4 wraps thinking in <|channel>thought\\n...\\n<channel|>.
+    Returns (None, full_text) if channel tokens are absent or the
+    pattern is not found.
+    """
+    start_id = tokenizer.start_channel_id
+    end_id = tokenizer.end_channel_id
+    if start_id is None or end_id is None:
+        return None, tokenizer.decode(tokens)
+
+    # Find the first <|channel> ... <channel|> span
+    try:
+        start = tokens.index(start_id)
+    except ValueError:
+        return None, tokenizer.decode(tokens)
+
+    try:
+        end = tokens.index(end_id, start + 1)
+    except ValueError:
+        return None, tokenizer.decode(tokens)
+
+    # The tokens between the channel markers include "thought\n...\n";
+    # decode and strip the leading "thought\n" prefix if present.
+    thinking_text = tokenizer.decode(tokens[start + 1 : end])
+    if thinking_text.startswith("thought\n"):
+        thinking_text = thinking_text[len("thought\n"):]
+
+    response_text = tokenizer.decode(tokens[end + 1 :])
+    return thinking_text, response_text
 
 
 # ---------------------------------------------------------------------------
@@ -149,37 +196,20 @@ def generate_batch(
         print(f"\nProcessing {len(prompts)} requests...\n")
         sys.stdout.flush()
 
-    # Event loop
-    completed = 0
-    start_time = time.time()
-    max_iterations = 10000
-
+    # Run serving loop in background thread, poll for completion
     pid = jax.process_index()
-    debug = serving_loop.verbose
-    for iteration in range(max_iterations):
-        if debug:
-            print(
-                f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}"
-            )
-            sys.stdout.flush()
-        serving_loop.serving_step()
+    shutdown = threading.Event()
+    serving_loop.serve_forever(shutdown)
 
-        newly_completed = (
-            sum(1 for r in serving_loop.results.values() if r.done) - completed
-        )
-        completed += newly_completed
+    start_time = time.time()
+    while sum(1 for r in serving_loop.results.values() if r.done) < len(prompts):
+        time.sleep(0.01)
 
-        if completed >= len(prompts):
-            if verbose:
-                elapsed = time.time() - start_time
-                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
-                sys.stdout.flush()
-            if debug:
-                print(
-                    f"[P{pid}] BREAKING out of generate_batch loop at iteration={iteration}"
-                )
-                sys.stdout.flush()
-            break
+    shutdown.set()
+    if verbose:
+        elapsed = time.time() - start_time
+        print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+        sys.stdout.flush()
 
     # Decode results
     decoded_results = []
@@ -191,12 +221,19 @@ def generate_batch(
                 generated_tokens = [
                     t.item() if hasattr(t, "item") else t for t in generated_tokens
                 ]
-            decoded_text = tokenizer.decode(generated_tokens)
-            decoded_results.append(decoded_text)
+
+            thinking_text, response_text = split_thinking(generated_tokens, tokenizer)
+            decoded_results.append(response_text)
 
             if verbose:
                 print(f"[request-{i}] Generated {len(generated_tokens)} tokens:")
-                print(f"            {decoded_text[:200]}")
+                if thinking_text is not None:
+                    print(f"  --- Thinking ---")
+                    for line in thinking_text.strip().splitlines():
+                        print(f"  {line}")
+                    print(f"  --- Response ---")
+                for line in response_text.strip().splitlines():
+                    print(f"  {line}")
                 print()
         else:
             decoded_results.append("")
@@ -231,7 +268,7 @@ def main():
     parser.add_argument(
         "--max_decode_length",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum number of tokens to generate per request",
     )
     parser.add_argument(
