@@ -75,6 +75,7 @@ class GRPOConfig:
     pad_token_id: int = 0
     eos_token_ids: Tuple[int, ...] = (2,)
     decode_steps: int = 10  # Tokens per multistep decode call
+    max_cache_seqlen: int = 1024  # KV cache sequence length (prompt + generated tokens)
 
     def __post_init__(self):
         """Validate configuration."""
@@ -163,7 +164,7 @@ class GRPOTrainer(Trainer):
             eos_tokens=grpo_config.eos_token_ids,
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
-            max_cache_seqlen=model_config.max_seqlen,
+            max_cache_seqlen=grpo_config.max_cache_seqlen,
             rng_seed=seed,
         )
         self.is_main = jax.process_index() == 0

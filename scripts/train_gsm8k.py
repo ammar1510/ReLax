@@ -170,6 +170,7 @@ def main():
         rollout_batch_size=ROLLOUT_BATCH_SIZE,
         group_size=GROUP_SIZE,
         max_new_tokens=MAX_NEW_TOKENS,
+        max_cache_seqlen=MAX_CACHE_SEQLEN,
         temperature=TEMPERATURE,
         num_iterations=NUM_ITERATIONS,
         minibatch_size=MINIBATCH_SIZE,
