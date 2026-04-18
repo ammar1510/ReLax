@@ -198,7 +198,6 @@ def generate_batch(
         sys.stdout.flush()
 
     # Event loop
-    completed = 0
     start_time = time.time()
     max_iterations = 10000
 
@@ -206,19 +205,15 @@ def generate_batch(
     debug = engine.verbose
     for iteration in range(max_iterations):
         if debug:
-            print(f"[P{pid}] generate_batch iteration={iteration}, completed={completed}/{len(prompts)}")
+            print(f"[P{pid}] generate_batch iteration={iteration}, completed={engine.done_count}/{len(prompts)}")
             sys.stdout.flush()
-        engine.serving_step()
-
-        newly_completed = sum(1 for r in engine.results.values() if r.done) - completed
-        completed += newly_completed
-
-        if completed >= len(prompts):
-            if verbose:
-                elapsed = time.time() - start_time
-                print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
-                sys.stdout.flush()
+        if engine.serving_step(should_stop=engine.done_count >= len(prompts)):
             break
+
+    if verbose:
+        elapsed = time.time() - start_time
+        print(f"\n[P{pid}] All {len(prompts)} requests completed in {elapsed:.2f}s")
+        sys.stdout.flush()
 
     # Decode results
     decoded_results = []

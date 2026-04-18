@@ -400,9 +400,12 @@ class ServingLoop:
         # Add requests (server process only)
         serving_loop.add_request(UserRequestPrompt(id=1, text=[1, 2, 3]))
 
-        # Event loop (all processes)
-        for _ in range(max_iterations):
-            serving_loop.serving_step()
+        # Event loop (all processes). The server passes `should_stop`; it's
+        # broadcast to all processes so everyone exits on the same iteration.
+        while not serving_loop.serving_step(
+            should_stop=serving_loop.done_count >= len(serving_loop.results)
+        ):
+            pass
 
             # Check results (server process)
             for id, result in serving_loop.results.items():
@@ -467,6 +470,7 @@ class ServingLoop:
 
         # Results tracking
         self.results = {}  # request_id -> DecodeResult
+        self.done_count = 0  # incremented when a result is marked done
         self.pending_requests = []
         self.state_lock = threading.Lock()
 
@@ -608,6 +612,7 @@ class ServingLoop:
             for token in tokens:
                 if token in eos_set or result.tokens_decoded >= self.serve_cfg.max_decode_length:
                     result.done = True
+                    self.done_count += 1
                     self.decode_work.active_results[i] = None
                     if self.verbose:
                         print(f"[ServingLoop] Completed request {result.id} ({result.tokens_decoded} tokens)")
@@ -777,10 +782,18 @@ class ServingLoop:
         print(f"[P{pid}|it={self._it}] {msg}")
         sys.stdout.flush()
 
-    def serving_step(self):
+    def serving_step(self, should_stop: bool = False) -> bool:
         """Main event loop step (call repeatedly).
 
         This method coordinates all processes using SyncServer for multi-host setups.
+
+        Args:
+            should_stop: Only read on the server process. The server broadcasts
+                it to all processes, so every process exits the loop at the same
+                `_it` — no barrier-key divergence across processes.
+
+        Returns:
+            True when the server signalled stop (same value on every process).
         """
         # Sync requests from server process
         self._log("entering barrier:serving_step")
@@ -791,17 +804,23 @@ class ServingLoop:
             with self.state_lock:
                 requests = list(self.pending_requests)
                 self.pending_requests = []
+            payload = {"requests": requests, "should_stop": bool(should_stop)}
         else:
-            requests = None
+            payload = None
 
         self._log("entering broadcast:requests")
-        requests = SyncServer.broadcast(
-            "requests", self._it, requests, is_source="server" in self.roles
+        payload = SyncServer.broadcast(
+            "requests", self._it, payload, is_source="server" in self.roles
         )
 
         # Add new requests to prefill queue
-        for req in requests or []:
+        for req in payload["requests"] or []:
             self.prefill_work.to_prefill.append(UserRequestPrompt(**req))
+
+        # If the server signalled stop, exit before doing any more work this step.
+        if payload["should_stop"]:
+            self._log("serving_step: stop signalled, exiting loop")
+            return True
 
         # Execute decode and prefill
         self._log("entering decode_step")
@@ -809,6 +828,7 @@ class ServingLoop:
         self._log("entering prefill_step")
         self.prefill_step()
         self._log("serving_step done")
+        return False
 
     def pending_prefill_count(self) -> int:
         """Return the number of requests waiting to be prefilled."""
@@ -824,19 +844,20 @@ class ServingLoop:
             self.pending_requests.append(dataclasses.asdict(request))
 
     def serve_forever(self, shutdown_signal: threading.Event):
-        """Optional: wrap serving_step in background thread.
+        """Wrap serving_step in a background thread.
+
+        The server process reads `shutdown_signal` each step and broadcasts the
+        decision through `serving_step`, so every process exits the loop on the
+        same `_it` — no per-process divergence on the shutdown flag.
 
         Args:
-            shutdown_signal: Event to signal shutdown
+            shutdown_signal: Event the caller sets to request shutdown.
         """
 
         def serve_thread():
-            # NOTE: shutdown_signal is per-process, so bg threads can diverge at the
-            # check — some exit while others enter the next serving_step barrier and
-            # block forever, failing once any process calls jax.distributed.shutdown().
             try:
-                while not shutdown_signal.is_set():
-                    self.serving_step()
+                while not self.serving_step(should_stop=shutdown_signal.is_set()):
+                    pass
             except Exception as e:
                 print(f"[ServingLoop] Error: {e}")
                 sys.stdout.flush()

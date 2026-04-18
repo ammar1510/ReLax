@@ -21,7 +21,6 @@ Training Loop:
 import json
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -207,20 +206,9 @@ class GRPOTrainer(Trainer):
 
     def _reset_engine(self):
         """Reset serving loop state for a new rollout batch.
-
-        Note: _it is NOT reset — it must increase monotonically across prompts
-        because SyncServer uses _it to namespace KV store keys, and keys are
-        global for the lifetime of the process.
         """
-        kv_cache, tokens = self.engine.engine.init_decode_state()
-        self.engine.decode_work.curr_tokens = tokens
-        self.engine.decode_work.cache = kv_cache
-        self.engine.decode_work.active_results = [
-            None for _ in range(self.grpo_config.rollout_batch_size)
-        ]
-        self.engine.prefill_work.to_prefill = []
-        self.engine.prefill_work.to_decode = []
         self.engine.results = {}
+        self.engine.done_count = 0
 
     def generate_rollouts(
         self,
@@ -258,14 +246,14 @@ class GRPOTrainer(Trainer):
                         UserRequestPrompt(id=req_id, text=list(prompt_tokens))
                     )
 
-        # Drive the serving loop in a background thread, poll for completion
-        shutdown = threading.Event()
-        self.engine.serve_forever(shutdown)
+        # Server decides when all completions are done; the flag is broadcast
+        # inside serving_step so every process exits the loop at the same `_it`.
+        # No background thread, no shutdown signal, no polling.
+        while not self.engine.serving_step(
+            should_stop=self.engine.done_count >= total_sequences
+        ):
+            pass
 
-        while sum(1 for r in self.engine.results.values() if r.done) < total_sequences:
-            time.sleep(0.01)
-
-        shutdown.set()
         self._log(f"Rollout: all {total_sequences} completions done in "
                   f"{time.time() - t0:.1f}s")
 
