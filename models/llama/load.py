@@ -63,6 +63,8 @@ def load_from_orbax(
 
             # Get array metadata (shapes/dtypes) without loading data
             item_meta = mngr.item_metadata(step)
+            if jax.process_index() == 0:
+                print(f"[load_from_orbax] item_meta type: {type(item_meta)}, value: {item_meta!r:.200}")
 
             def _get_key_name(key) -> str:
                 if hasattr(key, "key"):
