@@ -38,7 +38,6 @@ from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
-from utils.ops import build_attn_mask
 from utils.mesh_helpers import MeshHelper
 from functools import partial
 from sampling import categorical
@@ -383,14 +382,11 @@ class GRPOTrainer(Trainer):
 
         kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16, mesh=self.mesh)
 
-        attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
-
         logits, _ = self.model.apply(
             {"params": params},
             tokens,
             true_lengths=true_lengths,
             kv_cache=kv_cache,
-            mask=attn_mask,
         )
 
         log_probs = jax.nn.log_softmax(logits[:, :-1, :], axis=-1)
@@ -514,15 +510,12 @@ class GRPOTrainer(Trainer):
             # Scratch KV cache for forward pass
             kv_cache = KVCache.new(config, bsz, seq_len, dtype=jnp.bfloat16)
 
-            attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
-
             # Forward pass with current params (differentiable)
             logits, _ = model.apply(
                 {"params": params},
                 tokens,
                 true_lengths=true_lengths,
                 kv_cache=kv_cache,
-                mask=attn_mask,
             )
 
             # Compute per-token logprobs from current policy
