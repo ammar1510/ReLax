@@ -163,14 +163,20 @@ class KVCache:
         Returns:
             Tuple of (updated KVCache, updated curr_tokens).
         """
-        prefill_seqlen = entries[0].k.shape[3]
-        # Stack entries: [n_entries, n_layers, n_kv_heads, prefill_seqlen, head_dim]
-        stacked_k = jnp.stack([e.k[:, 0, :, :, :] for e in entries])
-        stacked_v = jnp.stack([e.v[:, 0, :, :, :] for e in entries])
+        max_prefill_seqlen = max(e.k.shape[3] for e in entries)
+        # Stack entries: [n_entries, n_layers, n_kv_heads, max_prefill_seqlen, head_dim]
+        stacked_k = jnp.stack([
+            jnp.pad(e.k[:, 0, :, :, :], ((0, 0), (0, 0), (0, max_prefill_seqlen - e.k.shape[3]), (0, 0)))
+            for e in entries
+        ])
+        stacked_v = jnp.stack([
+            jnp.pad(e.v[:, 0, :, :, :], ((0, 0), (0, 0), (0, max_prefill_seqlen - e.v.shape[3]), (0, 0)))
+            for e in entries
+        ])
         new_k, new_v, new_positions, new_tokens = _jitted_batch_insert(
             self.k, self.v, self.seq_positions,
             stacked_k, stacked_v,
             jnp.array(slot_idxs), jnp.array(lens), jnp.array(next_tokens),
-            curr_tokens, prefill_seqlen,
+            curr_tokens, max_prefill_seqlen,
         )
         return KVCache(k=new_k, v=new_v, seq_positions=new_positions), new_tokens
