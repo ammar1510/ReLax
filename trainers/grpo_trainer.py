@@ -382,8 +382,7 @@ class GRPOTrainer(Trainer):
         bsz, seq_len = tokens.shape
         true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
 
-        kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16)
-        kv_cache = MeshHelper.init_kv_cache_on_mesh(kv_cache, self.mesh)
+        kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16, mesh=self.mesh)
 
         attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
 

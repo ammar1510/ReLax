@@ -29,6 +29,7 @@ class KVCache:
         bsz: int,
         max_seqlen: int,
         dtype=None,
+        mesh=None,
     ) -> "KVCache":
         """Allocate an empty KVCache from a model config.
 
@@ -37,11 +38,30 @@ class KVCache:
             bsz: Batch size.
             max_seqlen: Maximum sequence length.
             dtype: Data type. Defaults to config.dtype if not provided.
+            mesh: If provided, allocate shards directly on each device without
+                  an intermediate full-sized host or device allocation.
         """
         dt = jnp.dtype(dtype if dtype is not None else config.dtype)
+        k_shape = (config.n_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim)
+        if mesh is not None:
+            from utils.mesh_helpers import MeshHelper
+            from jax.sharding import PartitionSpec as PS
+            dp = "dp" if "dp" in mesh.axis_names else None
+            tp = MeshHelper.get_tp_axis(mesh)
+            if dp is not None:
+                k_spec = PS(None, dp, tp, None, None)
+                pos_spec = PS(dp)
+            else:
+                k_spec = MeshHelper.batch_axis_spec(mesh, rank=5, batch_axis=1)
+                pos_spec = MeshHelper.batch_axis_spec(mesh, rank=1, batch_axis=0)
+            return cls(
+                k=MeshHelper.create_sharded_zeros(k_shape, dt, mesh, k_spec),
+                v=MeshHelper.create_sharded_zeros(k_shape, dt, mesh, k_spec),
+                seq_positions=MeshHelper.create_sharded_zeros((bsz,), jnp.int32, mesh, pos_spec),
+            )
         return cls(
-            k=jnp.zeros((config.n_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dt),
-            v=jnp.zeros((config.n_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dt),
+            k=jnp.zeros(k_shape, dtype=dt),
+            v=jnp.zeros(k_shape, dtype=dt),
             seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
         )
 
@@ -97,6 +117,7 @@ class KVCache:
                 Shape: `(bsz,)`
         """
         return KVCache(k=self.k, v=self.v, seq_positions=self.seq_positions + true_len)
+
     def get_layer(self, layer_idx: int):
         """Retrieves K/V for a specific layer.
 
@@ -116,18 +137,6 @@ class KVCache:
             v=self.v[:, idx : idx + 1, :, :, :],
             seq_positions=self.seq_positions[idx : idx + 1],
         )
-
-    def init_on_mesh(self, mesh) -> "KVCache":
-        """Create a zero-initialised KVCache sharded on mesh.
-
-        Use this for initial allocation only — values are replaced with
-        per-device zeros without triggering an allgather.
-
-        Args:
-            mesh: JAX device mesh.
-        """
-        from utils.mesh_helpers import MeshHelper
-        return MeshHelper.init_kv_cache_on_mesh(self, mesh)
 
     def place_on_mesh(self, mesh) -> "KVCache":
         """Re-shard KVCache onto mesh, preserving existing data.

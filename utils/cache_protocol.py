@@ -5,7 +5,10 @@ must implement these instance methods.  The factory classmethod ``new`` is
 not enforced here because classmethod protocols with Self return types are
 unwieldy in Python's type system; it is documented as a convention:
 
-    cache_cls.new(config, bsz: int, max_seqlen: int, dtype=None) -> cache
+    cache_cls.new(config, bsz: int, max_seqlen: int, dtype=None, mesh=None) -> cache
+
+When mesh is provided, new() must allocate shards directly on each device
+without an intermediate full-sized host or device allocation.
 """
 
 from typing import Protocol, runtime_checkable, Any
@@ -25,14 +28,6 @@ class CacheProtocol(Protocol):
 
         Used by the engine to pull one prefill result out of a batched
         prefill before inserting it into a decode slot.
-        """
-        ...
-
-    def init_on_mesh(self, mesh) -> "CacheProtocol":
-        """Return a zero-initialised copy sharded on mesh.
-
-        Use for initial allocation only — values are replaced with
-        per-device zeros without triggering an allgather.
         """
         ...
 

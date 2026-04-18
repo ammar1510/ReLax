@@ -176,7 +176,7 @@ class InferenceEngine:
             mesh: JAX mesh for sharded computation
             cache_cls: Cache class implementing the cache protocol (KVCache, GemmaCache, HybridCache).
                        Must implement new(config, bsz, max_seqlen), slice(idx),
-                       init_on_mesh(mesh), place_on_mesh(mesh), batch_insert(...).
+                       place_on_mesh(mesh), batch_insert(...).
             max_concurrent_slots: Maximum number of sequences to generate concurrently
             pad_id: Token ID used for padding
             sampler: Sample function (logits, key) -> token_ids (default: greedy)
@@ -244,8 +244,7 @@ class InferenceEngine:
         """
         bsz, bucket_size = tokens.shape
 
-        cache = self.cache_cls.new(self.config, bsz, bucket_size)
-        cache = cache.init_on_mesh(self.mesh)
+        cache = self.cache_cls.new(self.config, bsz, bucket_size, mesh=self.mesh)
 
         tokens = MeshHelper.put_on_mesh(
             tokens,
@@ -369,8 +368,7 @@ class InferenceEngine:
         Returns:
             Tuple of (cache, tokens) placed on the mesh
         """
-        cache = self.cache_cls.new(self.config, self.max_slots, self.max_cache_seqlen)
-        cache = cache.init_on_mesh(self.mesh)
+        cache = self.cache_cls.new(self.config, self.max_slots, self.max_cache_seqlen, mesh=self.mesh)
 
         tokens = jnp.zeros((self.max_slots, 1), dtype=jnp.int32)
         tokens = MeshHelper.put_on_mesh(
