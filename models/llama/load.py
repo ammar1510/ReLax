@@ -63,27 +63,30 @@ def load_from_orbax(
 
             # Get array metadata (shapes/dtypes) without loading data
             item_meta = mngr.item_metadata(step)
-            if jax.process_index() == 0:
-                print(f"[load_from_orbax] item_meta type: {type(item_meta)}, value: {item_meta!r:.200}")
 
-            def _get_key_name(key) -> str:
-                if hasattr(key, "key"):
-                    return str(key.key)
-                elif hasattr(key, "idx"):
-                    return str(key.idx)
-                elif hasattr(key, "name"):
-                    return str(key.name)
-                return str(key)
+            if item_meta is not None:
+                def _get_key_name(key) -> str:
+                    if hasattr(key, "key"):
+                        return str(key.key)
+                    elif hasattr(key, "idx"):
+                        return str(key.idx)
+                    elif hasattr(key, "name"):
+                        return str(key.name)
+                    return str(key)
 
-            def _build_target(path, meta):
-                name = "/".join(_get_key_name(k) for k in path)
-                spec = MeshHelper.param_sharding(meta, name, mesh)
-                sharding = NamedSharding(mesh, spec)
-                return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
+                def _build_target(path, meta):
+                    name = "/".join(_get_key_name(k) for k in path)
+                    spec = MeshHelper.param_sharding(meta, name, mesh)
+                    sharding = NamedSharding(mesh, spec)
+                    return jax.ShapeDtypeStruct(meta.shape, meta.dtype, sharding=sharding)
 
-            target = jax.tree.map_with_path(_build_target, item_meta)
+                target = jax.tree.map_with_path(_build_target, item_meta)
+                params = mngr.restore(step, args=ocp.args.StandardRestore(target))
+            else:
+                # item_metadata unsupported by this checkpoint format — restore numpy then shard
+                params = mngr.restore(step, args=ocp.args.StandardRestore(None))
+                params = MeshHelper.shard_params(params, mesh)
 
-            params = mngr.restore(step, args=ocp.args.StandardRestore(target))
             if jax.process_index() == 0:
                 print(f"Loaded orbax checkpoint from {checkpoint_path} (sharded onto mesh {mesh.axis_names})")
 
