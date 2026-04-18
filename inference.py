@@ -219,8 +219,6 @@ def main():
         is_server=(jax.process_index() == 0),
     )
 
-    serving_loop.warmup()
-
     generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 
     from models.sync_server import SyncServer

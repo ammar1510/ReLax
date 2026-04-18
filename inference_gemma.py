@@ -327,9 +327,6 @@ def main():
         is_server=(jax.process_index() == 0),
     )
 
-    # Warmup: compile prefill and decode before real inference
-    serving_loop.warmup()
-
     # Run batch generation
     generate_batch(serving_loop, tokenizer, prompts, verbose=True)
 

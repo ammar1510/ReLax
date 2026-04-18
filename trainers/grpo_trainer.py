@@ -31,6 +31,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax.core import FrozenDict
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
@@ -173,8 +174,6 @@ class GRPOTrainer(Trainer):
             cache_cls=KVCache,
             is_server=self.is_main,
         )
-        self.engine.warmup()
-
         # Compile JIT functions
         self._compile_functions()
 
@@ -192,13 +191,17 @@ class GRPOTrainer(Trainer):
         rewards: jax.Array,
         n: int = 20,
     ) -> None:
-        """Log the first `n` sequences from the rollout with their rewards."""
+        """Log the first `n` sequences from the rollout with their rewards.
+
+        Every process must participate in the gathers (they are collectives);
+        only the main process prints.
+        """
+        n = min(n, rollout.tokens.shape[0])
+        tokens = np.asarray(process_allgather(rollout.tokens[:n], tiled=True))
+        seq_lengths = np.asarray(process_allgather(rollout.seq_lengths[:n], tiled=True))
+        rewards_np = np.asarray(process_allgather(rewards[:n], tiled=True))
         if not self.is_main:
             return
-        tokens = np.asarray(rollout.tokens)
-        seq_lengths = np.asarray(rollout.seq_lengths)
-        rewards_np = np.asarray(rewards)
-        n = min(n, tokens.shape[0])
         for i in range(n):
             length = int(seq_lengths[i])
             text = self.detokenize_fn(tokens[i, :length].tolist())

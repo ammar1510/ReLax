@@ -482,55 +482,6 @@ class ServingLoop:
         print(f"[ServingLoop] Initialized with roles: {self.roles}")
         sys.stdout.flush()
 
-    def warmup(self):
-        """Trigger JIT compilation of prefill and decode with dummy inputs.
-
-        Call this once before real inference to avoid compilation stalls
-        during the first serving_step.
-        """
-        import time as _time
-        bsz_prefill = self.serve_cfg.prefill_batch_size
-        bsz_decode = self.serve_cfg.decode_batch_size
-
-        # Warmup prefill
-        print("[ServingLoop] Warming up prefill (JIT compiling)...")
-        sys.stdout.flush()
-        t0 = _time.time()
-
-        dummy_tokens = jnp.ones((bsz_prefill, 64), dtype=jnp.int32)
-        dummy_lengths = jnp.full((bsz_prefill,), 10, dtype=jnp.int32)
-        with set_mesh(self.mesh):
-            prefill_result = self.engine.prefill(dummy_tokens, dummy_lengths)
-        jax.block_until_ready(prefill_result["next_tokens"])
-        print(f"[ServingLoop] Prefill compiled in {_time.time() - t0:.1f}s")
-        sys.stdout.flush()
-
-        # Warmup decode
-        print("[ServingLoop] Warming up decode (JIT compiling)...")
-        sys.stdout.flush()
-        t0 = _time.time()
-
-        dummy_active_mask = jnp.ones(bsz_decode, dtype=bool)
-        dummy_rng_key = random.PRNGKey(0)
-        with set_mesh(self.mesh):
-            self.multistep_decode_fn(
-                self.decode_work.curr_tokens,
-                dummy_active_mask,
-                self.engine.params,
-                self.decode_work.cache,
-                dummy_rng_key,
-                steps=self.serve_cfg.decode_steps,
-                eos_tokens=tuple(self.eos_tokens.tolist()),
-            )
-        print(f"[ServingLoop] Decode compiled in {_time.time() - t0:.1f}s")
-        sys.stdout.flush()
-
-        # Re-initialize decode state (discard dummy results)
-        self.decode_work.cache, self.decode_work.curr_tokens = self.engine.init_decode_state()
-
-        print("[ServingLoop] Warmup complete")
-        sys.stdout.flush()
-
     def _determine_roles(self, is_server: bool, mesh: Mesh) -> tuple:
         """Determine this process's roles for multi-host coordination.
 

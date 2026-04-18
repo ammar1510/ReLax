@@ -217,8 +217,6 @@ def main():
         cache_cls=KVCache,
         is_server=(pid == 0),
     )
-    engine.warmup()
-
     # Initialize wandb on P0
     if pid == 0:
         wandb.init(project="relax", config={
