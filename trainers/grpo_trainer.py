@@ -146,26 +146,6 @@ class GRPOTrainer(Trainer):
 
         # Initialize base trainer with params (expected to be pre-sharded by caller)
         super().__init__(model, params, optimizer, seed)
-
-        # --- sharding debug ---
-        if jax.process_index() == 0:
-            def _print_sharding(path, x):
-                name = "/".join(str(k) for k in path)
-                sharding = getattr(x, "sharding", "N/A")
-                print(f"  [sharding] {name}: shape={x.shape} sharding={sharding}")
-
-            print("[GRPOTrainer] === params sharding ===")
-            jax.tree.map_with_path(_print_sharding, self.state.params)
-
-            print("[GRPOTrainer] === opt_state sharding (first leaf of each sub-state) ===")
-            opt_leaves = jax.tree.leaves(self.state.opt_state)
-            for i, leaf in enumerate(opt_leaves[:10]):
-                sharding = getattr(leaf, "sharding", "N/A")
-                print(f"  [sharding] opt_state leaf[{i}]: shape={leaf.shape} sharding={sharding}")
-            if len(opt_leaves) > 10:
-                print(f"  ... ({len(opt_leaves)} total opt_state leaves)")
-        # --- end sharding debug ---
-
         self.config = model_config
         self.grpo_config = grpo_config
         self.reward_fn = reward_fn
