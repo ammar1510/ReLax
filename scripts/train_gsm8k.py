@@ -9,7 +9,7 @@ import json
 import wandb
 import re
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -39,16 +39,22 @@ CHECKPOINT_FREQ = 100
 
 # ── GSM8K answer extraction ────────────────────────────────────────────────────
 
-_ANSWER_RE = re.compile(r"####\s*(.+)")
+# Capture everything after the first `####` up to (but not including) a newline.
+_ANSWER_RE = re.compile(r"####\s*([^\n]*)")
 
 
 def extract_answer(text: str) -> str:
-    """Extract the answer after #### in a GSM8K-formatted string."""
+    """Extract the raw string after the first `####` up to the next newline."""
     match = _ANSWER_RE.search(text)
-    if match is None:
-        return ""
-    # Normalise: strip whitespace and commas (e.g. "1,000" → "1000")
-    return match.group(1).strip().replace(",", "")
+    return match.group(1).strip() if match else ""
+
+
+def to_number(s: str) -> Optional[float]:
+    """Parse a string as a float. Returns None if not parseable."""
+    try:
+        return float(s.strip())
+    except (ValueError, AttributeError):
+        return None
 
 
 # ── Reward function ────────────────────────────────────────────────────────────
@@ -58,9 +64,9 @@ def make_reward_fn(tokenizer: Tokenizer):
     """Return a reward function closed over the tokenizer.
 
     Rewards:
-        1.0  — correct format AND correct answer
-        0.5  — correct format but wrong answer
-        0.0  — no #### marker found
+        1.0  — `####` found AND extracted number equals expected number
+        0.5  — `####` found but numbers differ (or one side is non-numeric)
+        0.0  — no `####` marker in the output
     """
 
     def reward_fn(completions: List[List[int]], ground_truths: List[str]) -> jax.Array:
@@ -70,7 +76,9 @@ def make_reward_fn(tokenizer: Tokenizer):
             extracted = extract_answer(text)
             if extracted == "":
                 rewards.append(0.0)
-            elif extracted == expected:
+                continue
+            got, want = to_number(extracted), to_number(expected)
+            if got is not None and want is not None and got == want:
                 rewards.append(1.0)
             else:
                 rewards.append(0.5)
