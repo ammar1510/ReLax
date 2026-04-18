@@ -192,10 +192,7 @@ class InferenceEngine:
         self.rng_key = random.PRNGKey(rng_seed)
         self.max_cache_seqlen = max_cache_seqlen or model.args.max_seqlen
 
-        # Place params on mesh
-        self.params = jax.block_until_ready(
-            MeshHelper.shard_params(params, self.mesh)
-        )
+        self.params = params
 
         # Cache model config for convenience
         self.config = model.args
