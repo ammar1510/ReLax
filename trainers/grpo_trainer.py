@@ -186,6 +186,27 @@ class GRPOTrainer(Trainer):
         print(f"[GRPOTrainer P{jax.process_index()}] {msg}")
         sys.stdout.flush()
 
+    def _log_samples(
+        self,
+        rollout: "RolloutBatch",
+        rewards: jax.Array,
+        n: int = 20,
+    ) -> None:
+        """Log the first `n` sequences from the rollout with their rewards."""
+        if not self.is_main:
+            return
+        tokens = np.asarray(rollout.tokens)
+        seq_lengths = np.asarray(rollout.seq_lengths)
+        rewards_np = np.asarray(rewards)
+        n = min(n, tokens.shape[0])
+        for i in range(n):
+            length = int(seq_lengths[i])
+            text = self.detokenize_fn(tokens[i, :length].tolist())
+            self._log(
+                f"Sample {i} | reward={float(rewards_np[i]):.4f}:\n"
+                f"{text}\n{'─'*60}"
+            )
+
     def _shard_batch(self, data: Dict[str, jax.Array]) -> Dict[str, jax.Array]:
         """Shard a batch dict along dp on the batch (first) axis."""
         def _shard(x):
@@ -267,12 +288,6 @@ class GRPOTrainer(Trainer):
                 generated = result.token_list if result is not None else []
                 all_prompt_tokens.append(list(prompt_tokens))
                 all_generated_tokens.append(generated)
-
-        if self.is_main:
-            for pi in range(len(prompts)):
-                idx = pi * self.grpo_config.group_size
-                sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
-                self._log(f"Sample (prompt {pi}):\n{self.detokenize_fn(sample_tokens)}\n{'─'*60}")
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
@@ -515,9 +530,13 @@ class GRPOTrainer(Trainer):
             policy_logprobs = jnp.pad(policy_logprobs, ((0, 0), (1, 0)))
             policy_logprobs = policy_logprobs * mask
 
-            # KL divergence: D_KL(policy || reference)
-            kl_div = (policy_logprobs - ref_logprobs) * mask
-            kl_per_seq = jnp.sum(kl_div, axis=-1)
+            # KL divergence D_KL(policy || reference) via Schulman's k3 estimator:
+            # k3 = exp(log_ratio) - log_ratio - 1, where log_ratio = log(π_ref / π_θ).
+            # Always ≥ 0 per token; unbiased estimator of the true KL.
+            log_ratio = (ref_logprobs - policy_logprobs) * mask
+            kl_per_tok = (jnp.exp(log_ratio) - log_ratio - 1) * mask
+            valid_tok_count = jnp.maximum(jnp.sum(mask, axis=-1), 1)
+            kl_per_seq = jnp.sum(kl_per_tok, axis=-1) / valid_tok_count
 
             # Policy gradient loss weighted by advantages
             per_seq_logprobs = jnp.sum(policy_logprobs * mask, axis=-1)
@@ -638,7 +657,20 @@ class GRPOTrainer(Trainer):
             self._log("Phase 2/4: Computing rewards...")
             rewards = self.compute_rewards(rollout, ground_truths)
             mean_reward = float(jnp.mean(rewards))
-            self._log(f"Phase 2/4: Mean reward = {mean_reward:.4f}")
+
+            # Per-group reward variance diagnostics: GRPO has no signal when a
+            # group's completions all get the same reward (advantages collapse
+            # to zero). Flag if most groups are in that state.
+            group_rewards = rewards.reshape(-1, self.grpo_config.group_size)
+            per_group_std = jnp.std(group_rewards, axis=1)
+            mean_group_std = float(jnp.mean(per_group_std))
+            frac_zero_groups = float(jnp.mean(per_group_std < 1e-6))
+            self._log(
+                f"Phase 2/4: mean_reward={mean_reward:.4f} "
+                f"mean_group_std={mean_group_std:.4f} "
+                f"zero-variance groups={frac_zero_groups:.1%}"
+            )
+            self._log_samples(rollout, rewards, n=20)
 
             # Phase 3 & 4: Compute advantages and train
             self._log("Phase 3/4: Computing advantages...")
@@ -649,6 +681,8 @@ class GRPOTrainer(Trainer):
             iteration_metrics = {
                 "iteration": iteration,
                 "mean_reward": mean_reward,
+                "mean_group_std": mean_group_std,
+                "frac_zero_variance_groups": frac_zero_groups,
                 "mean_loss": float(jnp.mean(jnp.array(train_metrics["loss"]))),
                 "mean_pg_loss": float(jnp.mean(jnp.array(train_metrics["pg_loss"]))),
                 "mean_kl_div": float(jnp.mean(jnp.array(train_metrics["kl_div"]))),
@@ -659,7 +693,9 @@ class GRPOTrainer(Trainer):
                       f"loss={iteration_metrics['mean_loss']:.4f} "
                       f"pg_loss={iteration_metrics['mean_pg_loss']:.4f} "
                       f"kl_div={iteration_metrics['mean_kl_div']:.4f} "
-                      f"reward={mean_reward:.4f}")
+                      f"reward={mean_reward:.4f} "
+                      f"group_std={mean_group_std:.4f} "
+                      f"zero_var={frac_zero_groups:.1%}")
 
             if step_callback is not None:
                 step_callback(iteration_metrics)
