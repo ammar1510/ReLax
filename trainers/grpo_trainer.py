@@ -309,7 +309,7 @@ class GRPOTrainer(Trainer):
             pad_len = max_seq_len - seq_len
 
             padded = full_seq + [self.grpo_config.pad_token_id] * pad_len
-            mask = [1.0] * seq_len + [0.0] * pad_len
+            mask = [0.0] * len(prompt_toks) + [1.0] * len(gen_toks) + [0.0] * pad_len
 
             all_tokens.append(padded)
             all_masks.append(mask)
@@ -424,9 +424,9 @@ class GRPOTrainer(Trainer):
 
         token_lists = []
         for i in range(rollout.tokens.shape[0]):
+            prompt_len = int(jnp.argmax(rollout.mask[i]))
             seq_len = int(rollout.seq_lengths[i])
-            token_list = rollout.tokens[i, :seq_len].tolist()
-            token_lists.append(token_list)
+            token_lists.append(rollout.tokens[i, prompt_len:seq_len].tolist())
 
         rewards = self.reward_fn(token_lists, expanded_truths)
         return rewards
