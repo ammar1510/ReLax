@@ -59,7 +59,8 @@ class GRPOConfig:
     minibatch_size: int = 64  # Gradient update batch size
 
     # Loss coefficients
-    kl_coef: float = 0.1  # KL divergence penalty coefficient
+    kl_coef: float = 0.1  # KL divergence penalty coefficient (β in the GRPO paper)
+    clip_epsilon: float = 0.2  # PPO-style importance-ratio clip range (ε in the GRPO paper)
 
     # Reference model settings
     reference_mode: str = "static"  # "static", "ema", or "periodic"
@@ -95,6 +96,9 @@ class RolloutBatch:
 
     # Logprobs from reference model (cached): [num_prompts * group_size, max_seq_len]
     reference_logprobs: jax.Array
+
+    # Logprobs under the rollout-time policy π_θ_old (cached): [num_prompts * group_size, max_seq_len]
+    old_logprobs: jax.Array
 
     # Advantages (group-normalized): [num_prompts * group_size]
     advantages: jax.Array
@@ -329,10 +333,20 @@ class GRPOTrainer(Trainer):
         )
 
         self._log(f"Rollout: reference logprobs computed in {time.time() - t1:.1f}s")
+        t2 = time.time()
+
+        # Cache logprobs under the rollout-time policy (π_θ_old) for the
+        # PPO-style importance ratio during training.
+        old_logprobs = self._compute_logprobs_batch(
+            tokens_arr, mask_arr, self.state.params
+        )
+
+        self._log(f"Rollout: old-policy logprobs computed in {time.time() - t2:.1f}s")
 
         return RolloutBatch(
             tokens=tokens_arr,
             reference_logprobs=reference_logprobs,
+            old_logprobs=old_logprobs,
             advantages=self._shard_array(jnp.zeros(total_sequences)),
             mask=mask_arr,
             seq_lengths=seq_lengths_arr,
@@ -479,24 +493,33 @@ class GRPOTrainer(Trainer):
         Returns:
             Tuple of (updated_state, metrics).
         """
-        return self.train_step_jit(state, batch, self.grpo_config.kl_coef)
+        return self.train_step_jit(
+            state,
+            batch,
+            self.grpo_config.kl_coef,
+            self.grpo_config.clip_epsilon,
+        )
 
     def _train_step_fn(
         self,
         state: TrainState,
         batch: Dict[str, jax.Array],
         kl_coef: float,
+        clip_eps: float,
     ) -> Tuple[TrainState, Dict[str, float]]:
-        """Training step with logprob recomputation from current policy.
+        """Canonical GRPO training step.
 
-        Runs a full forward pass inside the loss function so gradients
-        flow through the current policy params, making multiple PPO epochs
-        meaningful.
+        Implements the DeepSeekMath GRPO objective: per-token PPO-style clipped
+        importance ratio r = π_θ / π_θ_old, reduced as a per-completion token
+        mean then averaged across the batch, plus β · D_KL[π_θ ‖ π_ref] using
+        Schulman's k3 estimator.
 
         Args:
             state: Training state.
-            batch: Minibatch with keys: tokens, mask, advantages, policy_logprobs, reference_logprobs.
-            kl_coef: KL coefficient.
+            batch: Minibatch with keys: tokens, mask, advantages,
+                reference_logprobs, old_logprobs.
+            kl_coef: KL-to-reference coefficient (β).
+            clip_eps: PPO clip range (ε).
 
         Returns:
             Updated state and metrics.
@@ -509,6 +532,7 @@ class GRPOTrainer(Trainer):
             mask = batch["mask"]
             advantages = batch["advantages"]
             ref_logprobs = batch["reference_logprobs"]
+            old_logprobs = batch["old_logprobs"]
 
             bsz, seq_len = tokens.shape
             true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
@@ -524,7 +548,7 @@ class GRPOTrainer(Trainer):
                 kv_cache=kv_cache,
             )
 
-            # Compute per-token logprobs from current policy
+            # Per-token logprobs from current policy
             log_probs = jax.nn.log_softmax(logits[:, :-1, :], axis=-1)
             target_tokens = tokens[:, 1:]
             policy_logprobs = jnp.take_along_axis(
@@ -533,24 +557,47 @@ class GRPOTrainer(Trainer):
             policy_logprobs = jnp.pad(policy_logprobs, ((0, 0), (1, 0)))
             policy_logprobs = policy_logprobs * mask
 
-            # KL divergence D_KL(policy || reference) via Schulman's k3 estimator:
-            # k3 = exp(log_ratio) - log_ratio - 1, where log_ratio = log(π_ref / π_θ).
-            # Always ≥ 0 per token; unbiased estimator of the true KL.
-            log_ratio = (ref_logprobs - policy_logprobs) * mask
-            kl_per_tok = (jnp.exp(log_ratio) - log_ratio - 1) * mask
             valid_tok_count = jnp.maximum(jnp.sum(mask, axis=-1), 1)
+            total_valid_toks = jnp.maximum(jnp.sum(mask), 1.0)
+
+            # PPO-style importance ratio r = π_θ / π_θ_old, per token.
+            # Masked positions have both logprobs = 0, so log_ratio = 0 → ratio = 1;
+            # the final * mask zeros their contribution out.
+            log_ratio_policy = (policy_logprobs - old_logprobs) * mask
+            ratio = jnp.exp(log_ratio_policy)
+
+            # Group-normalized advantage is a scalar per sequence, broadcast per token.
+            adv = advantages[:, None]
+            unclipped = ratio * adv
+            clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+            per_tok_obj = jnp.minimum(unclipped, clipped)
+
+            # Per-completion token mean, then batch mean (canonical GRPO reduction).
+            per_seq_pg = jnp.sum(per_tok_obj * mask, axis=-1) / valid_tok_count
+            pg_loss = -jnp.mean(per_seq_pg)
+
+            # KL divergence D_KL(π_θ ‖ π_ref) via Schulman's k3 estimator,
+            # same per-completion-token-mean reduction as the pg term.
+            log_ratio_ref = (ref_logprobs - policy_logprobs) * mask
+            kl_per_tok = (jnp.exp(log_ratio_ref) - log_ratio_ref - 1) * mask
             kl_per_seq = jnp.sum(kl_per_tok, axis=-1) / valid_tok_count
+            kl_loss = jnp.mean(kl_per_seq)
 
-            # Policy gradient loss weighted by advantages
-            per_seq_logprobs = jnp.sum(policy_logprobs * mask, axis=-1)
-            pg_loss = -jnp.mean(advantages * per_seq_logprobs)
+            total_loss = pg_loss + kl_coef * kl_loss
 
-            total_loss = pg_loss + kl_coef * jnp.mean(kl_per_seq)
+            # Diagnostics: clip_fraction tells you whether clipping is biting;
+            # approx_kl measures how far π_θ has moved from π_θ_old on-rollout
+            # (the signal PPO trainers early-stop on).
+            clipped_mask = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)).astype(jnp.float32)
+            clip_fraction = jnp.sum(clipped_mask * mask) / total_valid_toks
+            approx_kl = jnp.sum(-log_ratio_policy * mask) / total_valid_toks
 
             return total_loss, {
                 "loss": total_loss,
                 "pg_loss": pg_loss,
-                "kl_div": jnp.mean(kl_per_seq),
+                "kl_div": kl_loss,
+                "clip_fraction": clip_fraction,
+                "approx_kl": approx_kl,
             }
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -573,12 +620,19 @@ class GRPOTrainer(Trainer):
         rollout = RolloutBatch(
             tokens=rollout.tokens,
             reference_logprobs=rollout.reference_logprobs,
+            old_logprobs=rollout.old_logprobs,
             advantages=advantages,
             mask=rollout.mask,
             seq_lengths=rollout.seq_lengths,
         )
 
-        all_metrics = {"loss": [], "pg_loss": [], "kl_div": []}
+        all_metrics = {
+            "loss": [],
+            "pg_loss": [],
+            "kl_div": [],
+            "clip_fraction": [],
+            "approx_kl": [],
+        }
 
         num_sequences = rollout.tokens.shape[0]
         num_minibatches = (num_sequences + self.grpo_config.minibatch_size - 1) // self.grpo_config.minibatch_size
@@ -593,6 +647,7 @@ class GRPOTrainer(Trainer):
             batch = self._shard_batch({
                 "tokens": rollout.tokens[batch_indices],
                 "reference_logprobs": rollout.reference_logprobs[batch_indices],
+                "old_logprobs": rollout.old_logprobs[batch_indices],
                 "advantages": rollout.advantages[batch_indices],
                 "mask": rollout.mask[batch_indices],
             })
@@ -689,6 +744,8 @@ class GRPOTrainer(Trainer):
                 "mean_loss": float(jnp.mean(jnp.array(train_metrics["loss"]))),
                 "mean_pg_loss": float(jnp.mean(jnp.array(train_metrics["pg_loss"]))),
                 "mean_kl_div": float(jnp.mean(jnp.array(train_metrics["kl_div"]))),
+                "mean_clip_fraction": float(jnp.mean(jnp.array(train_metrics["clip_fraction"]))),
+                "mean_approx_kl": float(jnp.mean(jnp.array(train_metrics["approx_kl"]))),
             }
             all_iteration_metrics.append(iteration_metrics)
 
@@ -696,6 +753,8 @@ class GRPOTrainer(Trainer):
                       f"loss={iteration_metrics['mean_loss']:.4f} "
                       f"pg_loss={iteration_metrics['mean_pg_loss']:.4f} "
                       f"kl_div={iteration_metrics['mean_kl_div']:.4f} "
+                      f"clip_frac={iteration_metrics['mean_clip_fraction']:.3f} "
+                      f"approx_kl={iteration_metrics['mean_approx_kl']:.4f} "
                       f"reward={mean_reward:.4f} "
                       f"group_std={mean_group_std:.4f} "
                       f"zero_var={frac_zero_groups:.1%}")
