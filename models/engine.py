@@ -87,12 +87,14 @@ class DecodeResult:
     Attributes:
         id: Request ID
         token_list: Generated tokens
+        logprob_list: Per-token logprobs under the sampling policy (same length as token_list)
         tokens_decoded: Number of tokens decoded so far
         done: Whether generation is complete
     """
 
     id: int
     token_list: list[int]
+    logprob_list: list[float] = dataclasses.field(default_factory=list)
     tokens_decoded: int = 0
     done: bool = False
 
@@ -105,6 +107,7 @@ class PrefillResult:
         id: Request ID
         input: Input tokens as numpy array
         next_token: First generated token (from prefill)
+        next_logprob: Logprob of the first generated token under the sampling policy
         cache_entry: KV cache for this sequence
         len: Sequence length
     """
@@ -112,6 +115,7 @@ class PrefillResult:
     id: int
     input: np.ndarray
     next_token: jax.Array
+    next_logprob: jax.Array
     cache_entry: Any
     len: int
 
@@ -216,7 +220,14 @@ class InferenceEngine:
 
             next_tokens = sample_fn(last_logits, rng_key)  # [bsz]
 
-            return updated_cache, next_tokens
+            # Logprob of the sampled token under the sampling policy (used as
+            # π_θ_old by RL trainers so no recomputation is needed later).
+            last_log_probs = jax.nn.log_softmax(last_logits, axis=-1)
+            next_logprobs = jnp.take_along_axis(
+                last_log_probs, next_tokens[:, None], axis=-1
+            ).squeeze(-1)  # [bsz]
+
+            return updated_cache, next_tokens, next_logprobs
 
         self._jitted_prefill_core = _jitted_prefill_core
 
@@ -258,7 +269,7 @@ class InferenceEngine:
         )
 
         self.rng_key, subkey = random.split(self.rng_key)
-        updated_cache, next_tokens = self._jitted_prefill_core(
+        updated_cache, next_tokens, next_logprobs = self._jitted_prefill_core(
             self.params,
             tokens,
             true_lengths,
@@ -269,6 +280,7 @@ class InferenceEngine:
         return {
             "cache": updated_cache,
             "next_tokens": next_tokens,  # [bsz]
+            "next_logprobs": next_logprobs,  # [bsz]
             "seq_lengths": true_lengths,  # [bsz]
         }
 
@@ -303,10 +315,11 @@ class InferenceEngine:
                 eos_tokens: Tuple of EOS token IDs; slots are masked out after generating one
 
             Returns:
-                Tuple of ((curr_tokens, cache), output_tokens) where:
+                Tuple of ((curr_tokens, cache), (output_tokens, output_logprobs)) where:
                     - curr_tokens: Updated current tokens [batch, 1]
                     - cache: Updated KV cache
                     - output_tokens: Generated tokens [batch, steps]
+                    - output_logprobs: Logprobs of the sampled tokens [batch, steps]
             """
             eos_ids = jnp.array(eos_tokens, dtype=curr_tokens.dtype) if eos_tokens else None
 
@@ -328,6 +341,10 @@ class InferenceEngine:
                 rng_key, subkey = random.split(rng_key)
                 new_tokens = sample_fn(batch_logits, subkey)[:, None]
 
+                # Logprob of the sampled token under the sampling policy.
+                log_probs = jax.nn.log_softmax(batch_logits, axis=-1)
+                new_logprobs = jnp.take_along_axis(log_probs, new_tokens, axis=-1)  # [batch, 1]
+
                 # Disable slots that just produced an EOS token
                 if eos_ids is not None:
                     hit_eos = jnp.any(new_tokens == eos_ids[None, :], axis=-1)  # [batch]
@@ -348,17 +365,18 @@ class InferenceEngine:
                     updated_tokens, jax.typeof(curr_tokens).sharding.spec
                 )
 
-                return (updated_tokens, updated_mask, updated_cache, rng_key), updated_tokens
+                return (updated_tokens, updated_mask, updated_cache, rng_key), (updated_tokens, new_logprobs)
 
-            (final_tokens, _, final_cache, _), output_tokens = jax.lax.scan(
+            (final_tokens, _, final_cache, _), (output_tokens, output_logprobs) = jax.lax.scan(
                 body, (curr_tokens, active_mask, cache, rng_key), length=steps
             )
 
-            # output_tokens shape: [steps, batch, 1]
+            # output_tokens / output_logprobs shape: [steps, batch, 1]
             # Transpose to [batch, steps] and squeeze last dim
             output_tokens = output_tokens[:, :, 0].T  # [batch, steps]
+            output_logprobs = output_logprobs[:, :, 0].T  # [batch, steps]
 
-            return (final_tokens, final_cache), output_tokens
+            return (final_tokens, final_cache), (output_tokens, output_logprobs)
 
         return multistep_decode_fn
 
@@ -528,6 +546,7 @@ class ServingLoop:
         return {
             "cache": single_cache,
             "next_token": batched_result["next_tokens"][idx],
+            "next_logprob": batched_result["next_logprobs"][idx],
             "seq_length": batched_result["seq_lengths"][idx],
         }
 
@@ -548,19 +567,22 @@ class ServingLoop:
         self.decode_work.cache = new_cache
         self.decode_work.curr_tokens = new_tokens
 
-    def _update_results_and_evict(self, output_tokens: np.ndarray):
-        """Update results dict with new tokens and evict completed sequences.
+    def _update_results_and_evict(self, output_tokens, output_logprobs):
+        """Update results dict with new tokens/logprobs and evict completed sequences.
 
         Args:
             output_tokens: Generated tokens [batch, steps]
+            output_logprobs: Logprobs of the sampled tokens [batch, steps]
         """
         eos_set = set(self.eos_tokens.tolist()) if len(self.eos_tokens) > 0 else set()
 
         # Dispatch tokens, evicting slots that hit EOS or max length
-        for i, (result, tokens) in enumerate(zip(self.decode_work.active_results, output_tokens)):
+        for i, (result, tokens, logprobs) in enumerate(
+            zip(self.decode_work.active_results, output_tokens, output_logprobs)
+        ):
             if result is None:
                 continue
-            for token in tokens:
+            for token, logprob in zip(tokens, logprobs):
                 if token in eos_set or result.tokens_decoded >= self.serve_cfg.max_decode_length:
                     result.done = True
                     self.done_count += 1
@@ -570,6 +592,7 @@ class ServingLoop:
                         sys.stdout.flush()
                     break
                 self.results[result.id].token_list.append(token)
+                self.results[result.id].logprob_list.append(logprob)
                 result.tokens_decoded += 1
 
     def decode_step(self):
@@ -586,7 +609,13 @@ class ServingLoop:
 
                 result: PrefillResult = self.prefill_work.to_decode.pop(0)
                 first_token = int(result.next_token)
-                self.decode_work.active_results[i] = DecodeResult(result.id, [first_token], tokens_decoded=1)
+                first_logprob = float(result.next_logprob)
+                self.decode_work.active_results[i] = DecodeResult(
+                    result.id,
+                    [first_token],
+                    logprob_list=[first_logprob],
+                    tokens_decoded=1,
+                )
                 self.results[result.id] = self.decode_work.active_results[i]
                 batch_updates.append((result.cache_entry, i, result.len, result.next_token))
 
@@ -616,7 +645,7 @@ class ServingLoop:
         import time as _time
         _t0 = _time.time()
         with set_mesh(self.mesh):
-            (final_tokens, final_cache), output_tokens = self.multistep_decode_fn(
+            (final_tokens, final_cache), (output_tokens, output_logprobs) = self.multistep_decode_fn(
                 self.decode_work.curr_tokens,
                 active_mask,
                 self.engine.params,
@@ -625,7 +654,7 @@ class ServingLoop:
                 steps=self.serve_cfg.decode_steps,
                 eos_tokens=tuple(self.eos_tokens.tolist()),
             )
-            jax.block_until_ready((final_tokens, final_cache, output_tokens))
+            jax.block_until_ready((final_tokens, final_cache, output_tokens, output_logprobs))
 
             # Update decode work
             self.decode_work.curr_tokens = final_tokens
@@ -646,20 +675,23 @@ class ServingLoop:
         if "worker" in self.roles:
             output_tokens = jax.block_until_ready(process_allgather(output_tokens, tiled=True))
             output_tokens = np.array(output_tokens).tolist()  # [batch, steps] as nested list
+            output_logprobs = jax.block_until_ready(process_allgather(output_logprobs, tiled=True))
+            output_logprobs = np.array(output_logprobs).tolist()  # [batch, steps] as nested list
         else:
             output_tokens = None
+            output_logprobs = None
 
         # Broadcast results to all processes
         self._log("decode: entering broadcast:decode_tokens")
-        output_tokens, = SyncServer.broadcast(
+        output_tokens, output_logprobs = SyncServer.broadcast(
             "decode_tokens",
             self._it,
-            (output_tokens,),
+            (output_tokens, output_logprobs),
             is_source="coordinator" in self.roles,
         )
 
         # Phase 4: Update results and evict completed sequences
-        self._update_results_and_evict(output_tokens)
+        self._update_results_and_evict(output_tokens, output_logprobs)
 
     def prefill_step(self):
         """One prefill iteration: batch prefill pending requests."""
@@ -717,6 +749,7 @@ class ServingLoop:
                 req.id,
                 np.array(req.text),
                 individual_result["next_token"],
+                individual_result["next_logprob"],
                 individual_result["cache"],
                 len(req.text),
             )

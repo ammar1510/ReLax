@@ -288,13 +288,16 @@ class GRPOTrainer(Trainer):
         # Collect results in prompt order
         all_prompt_tokens = []
         all_generated_tokens = []
+        all_generated_logprobs = []
         for pi, prompt_tokens in enumerate(prompts):
             for g in range(self.grpo_config.group_size):
                 req_id = pi * self.grpo_config.group_size + g
                 result = self.engine.results.get(req_id)
                 generated = result.token_list if result is not None else []
+                gen_logprobs = result.logprob_list if result is not None else []
                 all_prompt_tokens.append(list(prompt_tokens))
                 all_generated_tokens.append(generated)
+                all_generated_logprobs.append(gen_logprobs)
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
@@ -306,8 +309,11 @@ class GRPOTrainer(Trainer):
         all_tokens = []
         all_masks = []
         all_seq_lengths = []
+        all_old_logprobs = []
 
-        for prompt_toks, gen_toks in zip(all_prompt_tokens, all_generated_tokens):
+        for prompt_toks, gen_toks, gen_logprobs in zip(
+            all_prompt_tokens, all_generated_tokens, all_generated_logprobs
+        ):
             full_seq = prompt_toks + gen_toks
             seq_len = len(full_seq)
             pad_len = max_seq_len - seq_len
@@ -315,33 +321,41 @@ class GRPOTrainer(Trainer):
             padded = full_seq + [self.grpo_config.pad_token_id] * pad_len
             mask = [0.0] * len(prompt_toks) + [1.0] * len(gen_toks) + [0.0] * pad_len
 
+            # old_logprobs[i] = logprob of tokens[i] given tokens[0..i-1] under π_θ_old,
+            # recorded directly by the serving loop during generation. Non-generated
+            # positions (prompt + padding) stay at 0 — they're masked out in the loss.
+            assert len(gen_logprobs) == len(gen_toks), (
+                f"serving loop returned {len(gen_logprobs)} logprobs for "
+                f"{len(gen_toks)} generated tokens — token/logprob streams drifted"
+            )
+            seq_logprobs = (
+                [0.0] * len(prompt_toks)
+                + [float(lp) for lp in gen_logprobs]
+                + [0.0] * pad_len
+            )
+
             all_tokens.append(padded)
             all_masks.append(mask)
             all_seq_lengths.append(seq_len)
+            all_old_logprobs.append(seq_logprobs)
 
         tokens_arr = self._shard_array(jnp.array(all_tokens, dtype=jnp.int32))
         mask_arr = self._shard_array(jnp.array(all_masks, dtype=jnp.float32))
         seq_lengths_arr = self._shard_array(jnp.array(all_seq_lengths, dtype=jnp.int32))
+        old_logprobs = self._shard_array(jnp.array(all_old_logprobs, dtype=jnp.float32))
 
         self._log(f"Rollout: generation done in {time.time() - t0:.1f}s, "
                   f"shape={tokens_arr.shape}, computing reference logprobs...")
         t1 = time.time()
 
-        # Compute reference logprobs (cached for KL penalty during training)
+        # Compute reference logprobs (cached for KL penalty during training).
+        # π_θ_old logprobs are captured inline during sampling, so no extra
+        # forward pass is needed for them.
         reference_logprobs = self._compute_logprobs_batch(
             tokens_arr, mask_arr, self.reference_params
         )
 
         self._log(f"Rollout: reference logprobs computed in {time.time() - t1:.1f}s")
-        t2 = time.time()
-
-        # Cache logprobs under the rollout-time policy (π_θ_old) for the
-        # PPO-style importance ratio during training.
-        old_logprobs = self._compute_logprobs_batch(
-            tokens_arr, mask_arr, self.state.params
-        )
-
-        self._log(f"Rollout: old-policy logprobs computed in {time.time() - t2:.1f}s")
 
         return RolloutBatch(
             tokens=tokens_arr,
