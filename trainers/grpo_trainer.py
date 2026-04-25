@@ -352,7 +352,7 @@ class GRPOTrainer(Trainer):
         # π_θ_old logprobs are captured inline during sampling, so no extra
         # forward pass is needed for them.
         reference_logprobs = self._compute_logprobs_batch(
-            tokens_arr, mask_arr, self.reference_params
+            tokens_arr, mask_arr, seq_lengths_arr, self.reference_params
         )
 
         self._log(f"Rollout: reference logprobs computed in {time.time() - t1:.1f}s")
@@ -370,6 +370,7 @@ class GRPOTrainer(Trainer):
         self,
         tokens: jax.Array,
         mask: jax.Array,
+        seq_lengths: jax.Array,
         params: FrozenDict,
     ) -> jax.Array:
         """Compute log probabilities for a batch of sequences.
@@ -380,7 +381,9 @@ class GRPOTrainer(Trainer):
 
         Args:
             tokens: Token sequences [bsz, seq_len].
-            mask: Validity mask [bsz, seq_len].
+            mask: Loss mask [bsz, seq_len] — 1 on generated positions only.
+            seq_lengths: Full prefix lengths (prompt + generation) [bsz] — used
+                as the model's `true_lengths` so attention sees the whole prefix.
             params: Model parameters.
 
         Returns:
@@ -396,9 +399,10 @@ class GRPOTrainer(Trainer):
             end = min(start + chunk_size, bsz)
             chunk_tokens = self._shard_array(tokens[start:end])
             chunk_mask = self._shard_array(mask[start:end])
+            chunk_seq_lengths = self._shard_array(seq_lengths[start:end])
 
             chunk_logprobs = self._compute_logprobs_chunk(
-                chunk_tokens, chunk_mask, params
+                chunk_tokens, chunk_mask, chunk_seq_lengths, params
             )
             all_logprobs.append(chunk_logprobs)
 
@@ -408,11 +412,12 @@ class GRPOTrainer(Trainer):
         self,
         tokens: jax.Array,
         mask: jax.Array,
+        seq_lengths: jax.Array,
         params: FrozenDict,
     ) -> jax.Array:
         """Compute log probabilities for a single chunk of sequences."""
         bsz, seq_len = tokens.shape
-        true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
+        true_lengths = seq_lengths
 
         kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16, mesh=self.mesh)
 
@@ -549,7 +554,7 @@ class GRPOTrainer(Trainer):
             old_logprobs = batch["old_logprobs"]
 
             bsz, seq_len = tokens.shape
-            true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
+            true_lengths = batch["seq_lengths"]
 
             # Scratch KV cache for forward pass
             kv_cache = KVCache.new(config, bsz, seq_len, dtype=jnp.bfloat16)
@@ -664,6 +669,7 @@ class GRPOTrainer(Trainer):
                 "old_logprobs": rollout.old_logprobs[batch_indices],
                 "advantages": rollout.advantages[batch_indices],
                 "mask": rollout.mask[batch_indices],
+                "seq_lengths": rollout.seq_lengths[batch_indices],
             })
 
             self.state, metrics = self.train_step(
