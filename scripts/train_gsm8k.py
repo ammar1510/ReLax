@@ -8,7 +8,6 @@ import argparse
 import json
 import wandb
 import re
-from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import jax
@@ -34,7 +33,7 @@ MINIBATCH_SIZE = 16
 KL_COEF = 0.1
 LEARNING_RATE = 3e-6
 REFERENCE_MODE = "static"
-OUTPUT_DIR = "./gsm8k_output"
+OUTPUT_DIR = "gs://model-weights-1510/gsm8k_output"
 CHECKPOINT_FREQ = 100
 
 # ── GSM8K answer extraction ────────────────────────────────────────────────────
@@ -129,7 +128,13 @@ def main():
         "--checkpoint_path",
         type=str,
         required=True,
-        help="Orbax checkpoint path (GCS or local)",
+        help="Orbax checkpoint path (GCS)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=OUTPUT_DIR,
+        help="GCS output directory (gs://bucket/path)",
     )
     args = parser.parse_args()
 
@@ -140,9 +145,7 @@ def main():
         f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices"
     )
 
-    output_dir = Path(OUTPUT_DIR)
-    if is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir
 
     if is_main:
         wandb.init(
@@ -215,18 +218,20 @@ def main():
     print(f"Starting GRPO training for {NUM_ITERATIONS} iterations...")
     metrics = trainer.train(
         prompt_dataset=prompt_dataset,
-        checkpoint_dir=str(output_dir / "checkpoints"),
+        checkpoint_dir=output_dir + "/checkpoints",
         checkpoint_freq=CHECKPOINT_FREQ,
         step_callback=wandb_log,
     )
 
     if is_main:
-        metrics_path = output_dir / "metrics.json"
-        with open(metrics_path, "w") as f:
+        import gcsfs
+
+        metrics_path = output_dir + "/metrics.json"
+        with gcsfs.GCSFileSystem().open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"Metrics saved to {metrics_path}")
 
-    trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
+    trainer.save_checkpoint(output_dir + "/final_checkpoint")
     if wandb.run is not None:
         wandb.finish()
 

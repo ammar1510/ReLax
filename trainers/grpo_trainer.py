@@ -38,6 +38,18 @@ from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
 from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
+
+
+def _write_json(path: str, data: dict):
+    import gcsfs
+    with gcsfs.GCSFileSystem().open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _read_json(path: str) -> dict:
+    import gcsfs
+    with gcsfs.GCSFileSystem().open(path, "r") as f:
+        return json.load(f)
 from utils.mesh_helpers import MeshHelper
 from functools import partial
 from sampling import categorical
@@ -823,11 +835,12 @@ class GRPOTrainer(Trainer):
 
         Uses tensorstore-backed array serialization for efficient, sharding-aware
         saves. Metadata (step, config, RNG) is saved as a separate JSON file.
+        Supports both local paths and GCS paths (gs://bucket/...).
 
         Args:
             path: Directory path to save checkpoint files.
         """
-        ckpt_dir = os.path.abspath(path)
+        ckpt_dir = path
         checkpointer = ocp.StandardCheckpointer()
 
         # Save JAX pytrees via Orbax (params, opt_state, ref_params)
@@ -836,7 +849,7 @@ class GRPOTrainer(Trainer):
             "opt_state": self.state.opt_state,
             "ref_params": self.reference_params,
         }
-        checkpointer.save(os.path.join(ckpt_dir, "state"), ckpt_state)
+        checkpointer.save(ckpt_dir + "/state", ckpt_state)
         checkpointer.wait_until_finished()
 
         # Save lightweight metadata as JSON (only rank 0 writes to avoid races)
@@ -850,21 +863,19 @@ class GRPOTrainer(Trainer):
                 },
                 "rng_state": self.rng.tolist(),
             }
-            os.makedirs(ckpt_dir, exist_ok=True)
-            with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
-                json.dump(metadata, f, indent=2)
-
+            _write_json(ckpt_dir + "/metadata.json", metadata)
             print(f"Checkpoint saved to {ckpt_dir} at step {int(self.state.step)}")
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint using Orbax.
 
         Restores model params, optimizer state, reference params, and metadata.
+        Supports both local paths and GCS paths (gs://bucket/...).
 
         Args:
             path: Directory path to load checkpoint from.
         """
-        ckpt_dir = os.path.abspath(path)
+        ckpt_dir = path
         checkpointer = ocp.StandardCheckpointer()
 
         # Build abstract target structure for restoration
@@ -874,15 +885,14 @@ class GRPOTrainer(Trainer):
             "ref_params": self.reference_params,
         }
         ckpt_state = checkpointer.restore(
-            os.path.join(ckpt_dir, "state"),
+            ckpt_dir + "/state",
             args=ocp.args.StandardRestore(target),
         )
 
         self.reference_params = ckpt_state["ref_params"]
 
         # Load metadata
-        with open(os.path.join(ckpt_dir, "metadata.json"), "r") as f:
-            metadata = json.load(f)
+        metadata = _read_json(ckpt_dir + "/metadata.json")
 
         self.state = TrainState(
             step=metadata["step"],
