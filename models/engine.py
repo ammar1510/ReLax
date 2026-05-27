@@ -202,6 +202,8 @@ class InferenceEngine:
         self.config = model.args
 
         sample_fn = self.sampler
+        batched_sample_fn = jax.vmap(sample_fn)
+        keys_sharding_spec = MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0)
 
         # Create jitted core function for batched prefill logic
         @jit
@@ -218,7 +220,12 @@ class InferenceEngine:
             indices = (true_lengths - 1)[:, None, None]  # [bsz, 1, 1]
             last_logits = jnp.take_along_axis(logits, indices, axis=1).squeeze(1)
 
-            next_tokens = sample_fn(last_logits, rng_key)  # [bsz]
+            bsz = last_logits.shape[0]
+            per_seq_keys = random.split(rng_key, bsz)  # [bsz, 2]
+            per_seq_keys = jax.lax.with_sharding_constraint(
+                per_seq_keys, keys_sharding_spec
+            )
+            next_tokens = batched_sample_fn(last_logits, per_seq_keys)  # [bsz]
 
             # Logprob of the sampled token under the sampling policy (used as
             # π_θ_old by RL trainers so no recomputation is needed later).
@@ -300,6 +307,8 @@ class InferenceEngine:
 
         # Capture callbacks for use inside JIT
         sample_fn = self.sampler
+        batched_sample_fn = jax.vmap(sample_fn)
+        keys_sharding_spec = MeshHelper.batch_axis_spec(self.mesh, rank=2, batch_axis=0)
 
         @partial(jax.jit, static_argnames=("steps", "eos_tokens"), donate_argnames=("cache",))
         def multistep_decode_fn(curr_tokens, active_mask, params, cache, rng_key, steps: int = 10, eos_tokens: tuple = ()):
@@ -336,10 +345,15 @@ class InferenceEngine:
                     cache,
                 )
 
-                # Sample next tokens
+                # Sample next tokens — one independent key per batch slot
                 batch_logits = logits[:, 0, :]
                 rng_key, subkey = random.split(rng_key)
-                new_tokens = sample_fn(batch_logits, subkey)[:, None]
+                batch_size = batch_logits.shape[0]
+                per_seq_keys = random.split(subkey, batch_size)  # [batch, 2]
+                per_seq_keys = jax.lax.with_sharding_constraint(
+                    per_seq_keys, keys_sharding_spec
+                )
+                new_tokens = batched_sample_fn(batch_logits, per_seq_keys)[:, None]
 
                 # Logprob of the sampled token under the sampling policy.
                 log_probs = jax.nn.log_softmax(batch_logits, axis=-1)
@@ -708,7 +722,8 @@ class ServingLoop:
             self._log("prefill: no pending requests")
             return
 
-        self._log(f"prefill: processing {len(prefill_batch)} requests")
+        actual_bsz = len(prefill_batch)
+        self._log(f"prefill: processing {actual_bsz} requests")
         # Prepare batched inputs (pad to max length in batch)
         max_len = max(len(req.text) for req in prefill_batch)
         bucket_size = take_nearest_bucket(DEFAULT_PREFILL_BUCKETS, max_len)
@@ -717,23 +732,14 @@ class ServingLoop:
         true_lengths_list = []
 
         for req in prefill_batch:
-            # Convert list to numpy array
             tokens = np.array(req.text)
-            # Add batch dimension and pad
             tokens_with_batch = tokens[None, :]  # [1, seqlen]
             padded = pad_to_bucket(tokens_with_batch, bucket_size, self.engine.pad_id)
             tokens_list.append(padded)
             true_lengths_list.append(len(req.text))
 
-        # Pad batch to prefill_batch_size so batch dim is divisible by dp axis
-        actual_bsz = len(tokens_list)
-        target_bsz = self.serve_cfg.prefill_batch_size
-        for _ in range(target_bsz - actual_bsz):
-            tokens_list.append(np.zeros_like(tokens_list[0]))
-            true_lengths_list.append(0)
-
-        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [target_bsz, bucket_size]
-        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [target_bsz]
+        batched_tokens = jnp.concatenate(tokens_list, axis=0)  # [actual_bsz, bucket_size]
+        batched_true_lengths = jnp.array(true_lengths_list, dtype=jnp.int32)  # [actual_bsz]
 
         # Call prefill
         self._log(f"prefill: calling engine.prefill (shape={batched_tokens.shape})")
