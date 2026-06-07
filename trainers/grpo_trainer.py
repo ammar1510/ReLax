@@ -31,13 +31,25 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax.core import FrozenDict
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh
 
 from models.llama.model import LLaMa
 from models.llama.config import ModelConfig
-from models.engine import InferenceEngine, EngineConfig, UserRequestPrompt
+from models.engine import ServingLoop, ServingConfig, UserRequestPrompt
 from utils.kvcache import KVCache
-from utils.ops import build_attn_mask
+
+
+def _write_json(path: str, data: dict):
+    import gcsfs
+    with gcsfs.GCSFileSystem().open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _read_json(path: str) -> dict:
+    import gcsfs
+    with gcsfs.GCSFileSystem().open(path, "r") as f:
+        return json.load(f)
 from utils.mesh_helpers import MeshHelper
 from functools import partial
 from sampling import categorical
@@ -59,7 +71,8 @@ class GRPOConfig:
     minibatch_size: int = 64  # Gradient update batch size
 
     # Loss coefficients
-    kl_coef: float = 0.1  # KL divergence penalty coefficient
+    kl_coef: float = 0.1  # KL divergence penalty coefficient (β in the GRPO paper)
+    clip_epsilon: float = 0.2  # PPO-style importance-ratio clip range (ε in the GRPO paper)
 
     # Reference model settings
     reference_mode: str = "static"  # "static", "ema", or "periodic"
@@ -74,6 +87,7 @@ class GRPOConfig:
     pad_token_id: int = 0
     eos_token_ids: Tuple[int, ...] = (2,)
     decode_steps: int = 10  # Tokens per multistep decode call
+    max_cache_seqlen: int = 1024  # KV cache sequence length (prompt + generated tokens)
 
     def __post_init__(self):
         """Validate configuration."""
@@ -95,6 +109,9 @@ class RolloutBatch:
     # Logprobs from reference model (cached): [num_prompts * group_size, max_seq_len]
     reference_logprobs: jax.Array
 
+    # Logprobs under the rollout-time policy π_θ_old (cached): [num_prompts * group_size, max_seq_len]
+    old_logprobs: jax.Array
+
     # Advantages (group-normalized): [num_prompts * group_size]
     advantages: jax.Array
 
@@ -106,7 +123,7 @@ class RolloutBatch:
 
 
 class GRPOTrainer(Trainer):
-    """GRPO trainer using InferenceEngine for batched generation."""
+    """GRPO trainer using ServingLoop for batched generation."""
 
     def __init__(
         self,
@@ -144,36 +161,35 @@ class GRPOTrainer(Trainer):
 
         # Initialize base trainer with params (expected to be pre-sharded by caller)
         super().__init__(model, params, optimizer, seed)
-
         self.config = model_config
         self.grpo_config = grpo_config
         self.reward_fn = reward_fn
+        self.detokenize_fn = detokenize_fn
 
         # Create reference model parameters (frozen copy, also sharded)
         self.reference_params = jax.tree.map(lambda x: x.copy(), params)
 
-        # Create InferenceEngine for batched rollout generation
-        engine_cfg = EngineConfig(
+        # Create ServingLoop for batched rollout generation
+        serve_cfg = ServingConfig(
             sampler=partial(categorical, temperature=grpo_config.temperature),
-            detokenize_fn=detokenize_fn,
             decode_steps=grpo_config.decode_steps,
             decode_batch_size=grpo_config.rollout_batch_size,
             prefill_batch_size=grpo_config.group_size,
             eos_tokens=grpo_config.eos_token_ids,
             token_pad_idx=grpo_config.pad_token_id,
             max_decode_length=grpo_config.max_new_tokens,
-            max_cache_seqlen=model_config.max_seqlen,
+            max_cache_seqlen=grpo_config.max_cache_seqlen,
             rng_seed=seed,
         )
         self.is_main = jax.process_index() == 0
-        self.engine = InferenceEngine(
-            engine_cfg=engine_cfg,
+        self.engine = ServingLoop(
+            serve_cfg=serve_cfg,
             model=model,
             params=params,
             mesh=mesh,
+            cache_cls=KVCache,
             is_server=self.is_main,
         )
-
         # Compile JIT functions
         self._compile_functions()
 
@@ -184,6 +200,31 @@ class GRPOTrainer(Trainer):
         """Log with process index prefix and flush."""
         print(f"[GRPOTrainer P{jax.process_index()}] {msg}")
         sys.stdout.flush()
+
+    def _log_samples(
+        self,
+        rollout: "RolloutBatch",
+        rewards: jax.Array,
+        n: int = 20,
+    ) -> None:
+        """Log the first `n` sequences from the rollout with their rewards.
+
+        Every process must participate in the gathers (they are collectives);
+        only the main process prints.
+        """
+        n = min(n, rollout.tokens.shape[0])
+        tokens = np.asarray(process_allgather(rollout.tokens[:n], tiled=True))
+        seq_lengths = np.asarray(process_allgather(rollout.seq_lengths[:n], tiled=True))
+        rewards_np = np.asarray(process_allgather(rewards[:n], tiled=True))
+        if not self.is_main:
+            return
+        for i in range(n):
+            length = int(seq_lengths[i])
+            text = self.detokenize_fn(tokens[i, :length].tolist())
+            self._log(
+                f"Sample {i} | reward={float(rewards_np[i]):.4f}:\n"
+                f"{text}\n{'─'*60}"
+            )
 
     def _shard_batch(self, data: Dict[str, jax.Array]) -> Dict[str, jax.Array]:
         """Shard a batch dict along dp on the batch (first) axis."""
@@ -205,22 +246,9 @@ class GRPOTrainer(Trainer):
 
     def _reset_engine(self):
         """Reset serving loop state for a new rollout batch.
-
-        Note: _it is NOT reset — it must increase monotonically across prompts
-        because SyncServer uses _it to namespace KV store keys, and keys are
-        global for the lifetime of the process.
         """
-        kv_cache, tokens = self.engine.init_decode_state()
-        self.engine.decode_work.curr_tokens = tokens
-        self.engine.decode_work.cache = kv_cache
-        self.engine.decode_work.active_results = [
-            None for _ in range(self.grpo_config.rollout_batch_size)
-        ]
-        self.engine.prefill_work.requests = []
-        self.engine.prefill_work.to_prefill = []
-        self.engine.prefill_work.to_decode = []
         self.engine.results = {}
-        self.engine.decode_output = (None, None)
+        self.engine.done_count = 0
 
     def generate_rollouts(
         self,
@@ -240,7 +268,7 @@ class GRPOTrainer(Trainer):
         total_sequences = len(prompts) * self.grpo_config.group_size
 
         # Point engine to current policy params (already sharded)
-        self.engine.params = self.state.params
+        self.engine.engine.params = self.state.params
 
         # Single reset before the whole rollout batch
         self._reset_engine()
@@ -258,34 +286,30 @@ class GRPOTrainer(Trainer):
                         UserRequestPrompt(id=req_id, text=list(prompt_tokens))
                     )
 
-        # Drive the serving loop until every completion is done
-        step = 0
-        while True:
-            self.engine.serving_step()
-            step += 1
-            results = self.engine.results
-            if len(results) == total_sequences and all(r.done for r in results.values()):
-                break
+        # Server decides when all completions are done; the flag is broadcast
+        # inside serving_step so every process exits the loop at the same `_it`.
+        # No background thread, no shutdown signal, no polling.
+        while not self.engine.serving_step(
+            should_stop=self.engine.done_count >= total_sequences
+        ):
+            pass
 
-        self._log(f"Rollout: all {total_sequences} completions done in {step} serving steps, "
+        self._log(f"Rollout: all {total_sequences} completions done in "
                   f"{time.time() - t0:.1f}s")
 
         # Collect results in prompt order
         all_prompt_tokens = []
         all_generated_tokens = []
+        all_generated_logprobs = []
         for pi, prompt_tokens in enumerate(prompts):
             for g in range(self.grpo_config.group_size):
                 req_id = pi * self.grpo_config.group_size + g
                 result = self.engine.results.get(req_id)
                 generated = result.token_list if result is not None else []
+                gen_logprobs = result.logprob_list if result is not None else []
                 all_prompt_tokens.append(list(prompt_tokens))
                 all_generated_tokens.append(generated)
-
-        if self.is_main:
-            for pi in range(len(prompts)):
-                idx = pi * self.grpo_config.group_size
-                sample_tokens = all_prompt_tokens[idx] + all_generated_tokens[idx]
-                self._log(f"Sample (prompt {pi}):\n{self.engine.detokenize_fn(sample_tokens)}\n{'─'*60}")
+                all_generated_logprobs.append(gen_logprobs)
 
         # Assemble full sequences and pad to common length
         max_seq_len = max(
@@ -297,30 +321,50 @@ class GRPOTrainer(Trainer):
         all_tokens = []
         all_masks = []
         all_seq_lengths = []
+        all_old_logprobs = []
 
-        for prompt_toks, gen_toks in zip(all_prompt_tokens, all_generated_tokens):
+        for prompt_toks, gen_toks, gen_logprobs in zip(
+            all_prompt_tokens, all_generated_tokens, all_generated_logprobs
+        ):
             full_seq = prompt_toks + gen_toks
             seq_len = len(full_seq)
             pad_len = max_seq_len - seq_len
 
             padded = full_seq + [self.grpo_config.pad_token_id] * pad_len
-            mask = [1.0] * seq_len + [0.0] * pad_len
+            mask = [0.0] * len(prompt_toks) + [1.0] * len(gen_toks) + [0.0] * pad_len
+
+            # old_logprobs[i] = logprob of tokens[i] given tokens[0..i-1] under π_θ_old,
+            # recorded directly by the serving loop during generation. Non-generated
+            # positions (prompt + padding) stay at 0 — they're masked out in the loss.
+            assert len(gen_logprobs) == len(gen_toks), (
+                f"serving loop returned {len(gen_logprobs)} logprobs for "
+                f"{len(gen_toks)} generated tokens — token/logprob streams drifted"
+            )
+            seq_logprobs = (
+                [0.0] * len(prompt_toks)
+                + [float(lp) for lp in gen_logprobs]
+                + [0.0] * pad_len
+            )
 
             all_tokens.append(padded)
             all_masks.append(mask)
             all_seq_lengths.append(seq_len)
+            all_old_logprobs.append(seq_logprobs)
 
         tokens_arr = self._shard_array(jnp.array(all_tokens, dtype=jnp.int32))
         mask_arr = self._shard_array(jnp.array(all_masks, dtype=jnp.float32))
         seq_lengths_arr = self._shard_array(jnp.array(all_seq_lengths, dtype=jnp.int32))
+        old_logprobs = self._shard_array(jnp.array(all_old_logprobs, dtype=jnp.float32))
 
         self._log(f"Rollout: generation done in {time.time() - t0:.1f}s, "
                   f"shape={tokens_arr.shape}, computing reference logprobs...")
         t1 = time.time()
 
-        # Compute reference logprobs (cached for KL penalty during training)
+        # Compute reference logprobs (cached for KL penalty during training).
+        # π_θ_old logprobs are captured inline during sampling, so no extra
+        # forward pass is needed for them.
         reference_logprobs = self._compute_logprobs_batch(
-            tokens_arr, mask_arr, self.reference_params
+            tokens_arr, mask_arr, seq_lengths_arr, self.reference_params
         )
 
         self._log(f"Rollout: reference logprobs computed in {time.time() - t1:.1f}s")
@@ -328,6 +372,7 @@ class GRPOTrainer(Trainer):
         return RolloutBatch(
             tokens=tokens_arr,
             reference_logprobs=reference_logprobs,
+            old_logprobs=old_logprobs,
             advantages=self._shard_array(jnp.zeros(total_sequences)),
             mask=mask_arr,
             seq_lengths=seq_lengths_arr,
@@ -337,6 +382,7 @@ class GRPOTrainer(Trainer):
         self,
         tokens: jax.Array,
         mask: jax.Array,
+        seq_lengths: jax.Array,
         params: FrozenDict,
     ) -> jax.Array:
         """Compute log probabilities for a batch of sequences.
@@ -347,7 +393,9 @@ class GRPOTrainer(Trainer):
 
         Args:
             tokens: Token sequences [bsz, seq_len].
-            mask: Validity mask [bsz, seq_len].
+            mask: Loss mask [bsz, seq_len] — 1 on generated positions only.
+            seq_lengths: Full prefix lengths (prompt + generation) [bsz] — used
+                as the model's `true_lengths` so attention sees the whole prefix.
             params: Model parameters.
 
         Returns:
@@ -363,9 +411,10 @@ class GRPOTrainer(Trainer):
             end = min(start + chunk_size, bsz)
             chunk_tokens = self._shard_array(tokens[start:end])
             chunk_mask = self._shard_array(mask[start:end])
+            chunk_seq_lengths = self._shard_array(seq_lengths[start:end])
 
             chunk_logprobs = self._compute_logprobs_chunk(
-                chunk_tokens, chunk_mask, params
+                chunk_tokens, chunk_mask, chunk_seq_lengths, params
             )
             all_logprobs.append(chunk_logprobs)
 
@@ -375,23 +424,20 @@ class GRPOTrainer(Trainer):
         self,
         tokens: jax.Array,
         mask: jax.Array,
+        seq_lengths: jax.Array,
         params: FrozenDict,
     ) -> jax.Array:
         """Compute log probabilities for a single chunk of sequences."""
         bsz, seq_len = tokens.shape
-        true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
+        true_lengths = seq_lengths
 
-        kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16)
-        kv_cache = MeshHelper.init_kv_cache_on_mesh(kv_cache, self.mesh)
-
-        attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
+        kv_cache = KVCache.new(self.config, bsz, seq_len, dtype=jnp.bfloat16, mesh=self.mesh)
 
         logits, _ = self.model.apply(
             {"params": params},
             tokens,
             true_lengths=true_lengths,
             kv_cache=kv_cache,
-            mask=attn_mask,
         )
 
         log_probs = jax.nn.log_softmax(logits[:, :-1, :], axis=-1)
@@ -423,9 +469,9 @@ class GRPOTrainer(Trainer):
 
         token_lists = []
         for i in range(rollout.tokens.shape[0]):
+            prompt_len = int(jnp.argmax(rollout.mask[i]))
             seq_len = int(rollout.seq_lengths[i])
-            token_list = rollout.tokens[i, :seq_len].tolist()
-            token_lists.append(token_list)
+            token_lists.append(rollout.tokens[i, prompt_len:seq_len].tolist())
 
         rewards = self.reward_fn(token_lists, expanded_truths)
         return rewards
@@ -478,24 +524,33 @@ class GRPOTrainer(Trainer):
         Returns:
             Tuple of (updated_state, metrics).
         """
-        return self.train_step_jit(state, batch, self.grpo_config.kl_coef)
+        return self.train_step_jit(
+            state,
+            batch,
+            self.grpo_config.kl_coef,
+            self.grpo_config.clip_epsilon,
+        )
 
     def _train_step_fn(
         self,
         state: TrainState,
         batch: Dict[str, jax.Array],
         kl_coef: float,
+        clip_eps: float,
     ) -> Tuple[TrainState, Dict[str, float]]:
-        """Training step with logprob recomputation from current policy.
+        """Canonical GRPO training step.
 
-        Runs a full forward pass inside the loss function so gradients
-        flow through the current policy params, making multiple PPO epochs
-        meaningful.
+        Implements the DeepSeekMath GRPO objective: per-token PPO-style clipped
+        importance ratio r = π_θ / π_θ_old, reduced as a per-completion token
+        mean then averaged across the batch, plus β · D_KL[π_θ ‖ π_ref] using
+        Schulman's k3 estimator.
 
         Args:
             state: Training state.
-            batch: Minibatch with keys: tokens, mask, advantages, policy_logprobs, reference_logprobs.
-            kl_coef: KL coefficient.
+            batch: Minibatch with keys: tokens, mask, advantages,
+                reference_logprobs, old_logprobs.
+            kl_coef: KL-to-reference coefficient (β).
+            clip_eps: PPO clip range (ε).
 
         Returns:
             Updated state and metrics.
@@ -508,14 +563,13 @@ class GRPOTrainer(Trainer):
             mask = batch["mask"]
             advantages = batch["advantages"]
             ref_logprobs = batch["reference_logprobs"]
+            old_logprobs = batch["old_logprobs"]
 
             bsz, seq_len = tokens.shape
-            true_lengths = jnp.sum(mask, axis=-1).astype(jnp.int32)
+            true_lengths = batch["seq_lengths"]
 
             # Scratch KV cache for forward pass
             kv_cache = KVCache.new(config, bsz, seq_len, dtype=jnp.bfloat16)
-
-            attn_mask = build_attn_mask(seq_len, kv_cache, true_lengths)
 
             # Forward pass with current params (differentiable)
             logits, _ = model.apply(
@@ -523,10 +577,9 @@ class GRPOTrainer(Trainer):
                 tokens,
                 true_lengths=true_lengths,
                 kv_cache=kv_cache,
-                mask=attn_mask,
             )
 
-            # Compute per-token logprobs from current policy
+            # Per-token logprobs from current policy
             log_probs = jax.nn.log_softmax(logits[:, :-1, :], axis=-1)
             target_tokens = tokens[:, 1:]
             policy_logprobs = jnp.take_along_axis(
@@ -535,20 +588,47 @@ class GRPOTrainer(Trainer):
             policy_logprobs = jnp.pad(policy_logprobs, ((0, 0), (1, 0)))
             policy_logprobs = policy_logprobs * mask
 
-            # KL divergence: D_KL(policy || reference)
-            kl_div = (policy_logprobs - ref_logprobs) * mask
-            kl_per_seq = jnp.sum(kl_div, axis=-1)
+            valid_tok_count = jnp.maximum(jnp.sum(mask, axis=-1), 1)
+            total_valid_toks = jnp.maximum(jnp.sum(mask), 1.0)
 
-            # Policy gradient loss weighted by advantages
-            per_seq_logprobs = jnp.sum(policy_logprobs * mask, axis=-1)
-            pg_loss = -jnp.mean(advantages * per_seq_logprobs)
+            # PPO-style importance ratio r = π_θ / π_θ_old, per token.
+            # Masked positions have both logprobs = 0, so log_ratio = 0 → ratio = 1;
+            # the final * mask zeros their contribution out.
+            log_ratio_policy = (policy_logprobs - old_logprobs) * mask
+            ratio = jnp.exp(log_ratio_policy)
 
-            total_loss = pg_loss + kl_coef * jnp.mean(kl_per_seq)
+            # Group-normalized advantage is a scalar per sequence, broadcast per token.
+            adv = advantages[:, None]
+            unclipped = ratio * adv
+            clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+            per_tok_obj = jnp.minimum(unclipped, clipped)
+
+            # Per-completion token mean, then batch mean (canonical GRPO reduction).
+            per_seq_pg = jnp.sum(per_tok_obj * mask, axis=-1) / valid_tok_count
+            pg_loss = -jnp.mean(per_seq_pg)
+
+            # KL divergence D_KL(π_θ ‖ π_ref) via Schulman's k3 estimator,
+            # same per-completion-token-mean reduction as the pg term.
+            log_ratio_ref = (ref_logprobs - policy_logprobs) * mask
+            kl_per_tok = (jnp.exp(log_ratio_ref) - log_ratio_ref - 1) * mask
+            kl_per_seq = jnp.sum(kl_per_tok, axis=-1) / valid_tok_count
+            kl_loss = jnp.mean(kl_per_seq)
+
+            total_loss = pg_loss + kl_coef * kl_loss
+
+            # Diagnostics: clip_fraction tells you whether clipping is biting;
+            # approx_kl measures how far π_θ has moved from π_θ_old on-rollout
+            # (the signal PPO trainers early-stop on).
+            clipped_mask = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)).astype(jnp.float32)
+            clip_fraction = jnp.sum(clipped_mask * mask) / total_valid_toks
+            approx_kl = jnp.sum(-log_ratio_policy * mask) / total_valid_toks
 
             return total_loss, {
                 "loss": total_loss,
                 "pg_loss": pg_loss,
-                "kl_div": jnp.mean(kl_per_seq),
+                "kl_div": kl_loss,
+                "clip_fraction": clip_fraction,
+                "approx_kl": approx_kl,
             }
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -571,12 +651,19 @@ class GRPOTrainer(Trainer):
         rollout = RolloutBatch(
             tokens=rollout.tokens,
             reference_logprobs=rollout.reference_logprobs,
+            old_logprobs=rollout.old_logprobs,
             advantages=advantages,
             mask=rollout.mask,
             seq_lengths=rollout.seq_lengths,
         )
 
-        all_metrics = {"loss": [], "pg_loss": [], "kl_div": []}
+        all_metrics = {
+            "loss": [],
+            "pg_loss": [],
+            "kl_div": [],
+            "clip_fraction": [],
+            "approx_kl": [],
+        }
 
         num_sequences = rollout.tokens.shape[0]
         num_minibatches = (num_sequences + self.grpo_config.minibatch_size - 1) // self.grpo_config.minibatch_size
@@ -591,8 +678,10 @@ class GRPOTrainer(Trainer):
             batch = self._shard_batch({
                 "tokens": rollout.tokens[batch_indices],
                 "reference_logprobs": rollout.reference_logprobs[batch_indices],
+                "old_logprobs": rollout.old_logprobs[batch_indices],
                 "advantages": rollout.advantages[batch_indices],
                 "mask": rollout.mask[batch_indices],
+                "seq_lengths": rollout.seq_lengths[batch_indices],
             })
 
             self.state, metrics = self.train_step(
@@ -658,7 +747,20 @@ class GRPOTrainer(Trainer):
             self._log("Phase 2/4: Computing rewards...")
             rewards = self.compute_rewards(rollout, ground_truths)
             mean_reward = float(jnp.mean(rewards))
-            self._log(f"Phase 2/4: Mean reward = {mean_reward:.4f}")
+
+            # Per-group reward variance diagnostics: GRPO has no signal when a
+            # group's completions all get the same reward (advantages collapse
+            # to zero). Flag if most groups are in that state.
+            group_rewards = rewards.reshape(-1, self.grpo_config.group_size)
+            per_group_std = jnp.std(group_rewards, axis=1)
+            mean_group_std = float(jnp.mean(per_group_std))
+            frac_zero_groups = float(jnp.mean(per_group_std < 1e-6))
+            self._log(
+                f"Phase 2/4: mean_reward={mean_reward:.4f} "
+                f"mean_group_std={mean_group_std:.4f} "
+                f"zero-variance groups={frac_zero_groups:.1%}"
+            )
+            self._log_samples(rollout, rewards, n=20)
 
             # Phase 3 & 4: Compute advantages and train
             self._log("Phase 3/4: Computing advantages...")
@@ -669,9 +771,13 @@ class GRPOTrainer(Trainer):
             iteration_metrics = {
                 "iteration": iteration,
                 "mean_reward": mean_reward,
+                "mean_group_std": mean_group_std,
+                "frac_zero_variance_groups": frac_zero_groups,
                 "mean_loss": float(jnp.mean(jnp.array(train_metrics["loss"]))),
                 "mean_pg_loss": float(jnp.mean(jnp.array(train_metrics["pg_loss"]))),
                 "mean_kl_div": float(jnp.mean(jnp.array(train_metrics["kl_div"]))),
+                "mean_clip_fraction": float(jnp.mean(jnp.array(train_metrics["clip_fraction"]))),
+                "mean_approx_kl": float(jnp.mean(jnp.array(train_metrics["approx_kl"]))),
             }
             all_iteration_metrics.append(iteration_metrics)
 
@@ -679,7 +785,11 @@ class GRPOTrainer(Trainer):
                       f"loss={iteration_metrics['mean_loss']:.4f} "
                       f"pg_loss={iteration_metrics['mean_pg_loss']:.4f} "
                       f"kl_div={iteration_metrics['mean_kl_div']:.4f} "
-                      f"reward={mean_reward:.4f}")
+                      f"clip_frac={iteration_metrics['mean_clip_fraction']:.3f} "
+                      f"approx_kl={iteration_metrics['mean_approx_kl']:.4f} "
+                      f"reward={mean_reward:.4f} "
+                      f"group_std={mean_group_std:.4f} "
+                      f"zero_var={frac_zero_groups:.1%}")
 
             if step_callback is not None:
                 step_callback(iteration_metrics)
@@ -725,11 +835,12 @@ class GRPOTrainer(Trainer):
 
         Uses tensorstore-backed array serialization for efficient, sharding-aware
         saves. Metadata (step, config, RNG) is saved as a separate JSON file.
+        Supports both local paths and GCS paths (gs://bucket/...).
 
         Args:
             path: Directory path to save checkpoint files.
         """
-        ckpt_dir = os.path.abspath(path)
+        ckpt_dir = path
         checkpointer = ocp.StandardCheckpointer()
 
         # Save JAX pytrees via Orbax (params, opt_state, ref_params)
@@ -738,7 +849,7 @@ class GRPOTrainer(Trainer):
             "opt_state": self.state.opt_state,
             "ref_params": self.reference_params,
         }
-        checkpointer.save(os.path.join(ckpt_dir, "state"), ckpt_state)
+        checkpointer.save(ckpt_dir + "/state", ckpt_state)
         checkpointer.wait_until_finished()
 
         # Save lightweight metadata as JSON (only rank 0 writes to avoid races)
@@ -752,21 +863,19 @@ class GRPOTrainer(Trainer):
                 },
                 "rng_state": self.rng.tolist(),
             }
-            os.makedirs(ckpt_dir, exist_ok=True)
-            with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
-                json.dump(metadata, f, indent=2)
-
+            _write_json(ckpt_dir + "/metadata.json", metadata)
             print(f"Checkpoint saved to {ckpt_dir} at step {int(self.state.step)}")
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint using Orbax.
 
         Restores model params, optimizer state, reference params, and metadata.
+        Supports both local paths and GCS paths (gs://bucket/...).
 
         Args:
             path: Directory path to load checkpoint from.
         """
-        ckpt_dir = os.path.abspath(path)
+        ckpt_dir = path
         checkpointer = ocp.StandardCheckpointer()
 
         # Build abstract target structure for restoration
@@ -776,15 +885,14 @@ class GRPOTrainer(Trainer):
             "ref_params": self.reference_params,
         }
         ckpt_state = checkpointer.restore(
-            os.path.join(ckpt_dir, "state"),
+            ckpt_dir + "/state",
             args=ocp.args.StandardRestore(target),
         )
 
         self.reference_params = ckpt_state["ref_params"]
 
         # Load metadata
-        with open(os.path.join(ckpt_dir, "metadata.json"), "r") as f:
-            metadata = json.load(f)
+        metadata = _read_json(ckpt_dir + "/metadata.json")
 
         self.state = TrainState(
             step=metadata["step"],

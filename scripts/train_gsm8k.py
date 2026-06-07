@@ -8,8 +8,7 @@ import argparse
 import json
 import wandb
 import re
-from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -27,27 +26,34 @@ from trainers.grpo_trainer import GRPOTrainer, GRPOConfig
 ROLLOUT_BATCH_SIZE = 64
 GROUP_SIZE = 16
 MAX_NEW_TOKENS = 512
+MAX_CACHE_SEQLEN = 1024
 TEMPERATURE = 0.8
 NUM_ITERATIONS = 500
 MINIBATCH_SIZE = 16
 KL_COEF = 0.1
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 3e-6
 REFERENCE_MODE = "static"
-OUTPUT_DIR = "./gsm8k_output"
+OUTPUT_DIR = "gs://model-weights-1510/gsm8k_output"
 CHECKPOINT_FREQ = 100
 
 # ── GSM8K answer extraction ────────────────────────────────────────────────────
 
-_ANSWER_RE = re.compile(r"####\s*(.+)")
+# Capture everything after the first `####` up to (but not including) a newline.
+_ANSWER_RE = re.compile(r"####\s*([^\n]*)")
 
 
 def extract_answer(text: str) -> str:
-    """Extract the answer after #### in a GSM8K-formatted string."""
+    """Extract the raw string after the first `####` up to the next newline."""
     match = _ANSWER_RE.search(text)
-    if match is None:
-        return ""
-    # Normalise: strip whitespace and commas (e.g. "1,000" → "1000")
-    return match.group(1).strip().replace(",", "")
+    return match.group(1).strip() if match else ""
+
+
+def to_number(s: str) -> Optional[float]:
+    """Parse a string as a float. Returns None if not parseable."""
+    try:
+        return float(s.strip())
+    except (ValueError, AttributeError):
+        return None
 
 
 # ── Reward function ────────────────────────────────────────────────────────────
@@ -57,9 +63,9 @@ def make_reward_fn(tokenizer: Tokenizer):
     """Return a reward function closed over the tokenizer.
 
     Rewards:
-        1.0  — correct format AND correct answer
-        0.5  — correct format but wrong answer
-        0.0  — no #### marker found
+        1.0  — `####` found AND extracted number equals expected number
+        0.5  — `####` found but numbers differ (or one side is non-numeric)
+        0.0  — no `####` marker in the output
     """
 
     def reward_fn(completions: List[List[int]], ground_truths: List[str]) -> jax.Array:
@@ -69,7 +75,9 @@ def make_reward_fn(tokenizer: Tokenizer):
             extracted = extract_answer(text)
             if extracted == "":
                 rewards.append(0.0)
-            elif extracted == expected:
+                continue
+            got, want = to_number(extracted), to_number(expected)
+            if got is not None and want is not None and got == want:
                 rewards.append(1.0)
             else:
                 rewards.append(0.5)
@@ -120,7 +128,13 @@ def main():
         "--checkpoint_path",
         type=str,
         required=True,
-        help="Orbax checkpoint path (GCS or local)",
+        help="Orbax checkpoint path (GCS)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=OUTPUT_DIR,
+        help="GCS output directory (gs://bucket/path)",
     )
     args = parser.parse_args()
 
@@ -131,9 +145,7 @@ def main():
         f"Process {jax.process_index()}: {len(jax.local_devices())} local devices, {len(devices)} total devices"
     )
 
-    output_dir = Path(OUTPUT_DIR)
-    if is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir
 
     if is_main:
         wandb.init(
@@ -169,6 +181,7 @@ def main():
         rollout_batch_size=ROLLOUT_BATCH_SIZE,
         group_size=GROUP_SIZE,
         max_new_tokens=MAX_NEW_TOKENS,
+        max_cache_seqlen=MAX_CACHE_SEQLEN,
         temperature=TEMPERATURE,
         num_iterations=NUM_ITERATIONS,
         minibatch_size=MINIBATCH_SIZE,
@@ -205,18 +218,20 @@ def main():
     print(f"Starting GRPO training for {NUM_ITERATIONS} iterations...")
     metrics = trainer.train(
         prompt_dataset=prompt_dataset,
-        checkpoint_dir=str(output_dir / "checkpoints"),
+        checkpoint_dir=output_dir + "/checkpoints",
         checkpoint_freq=CHECKPOINT_FREQ,
         step_callback=wandb_log,
     )
 
     if is_main:
-        metrics_path = output_dir / "metrics.json"
-        with open(metrics_path, "w") as f:
+        import gcsfs
+
+        metrics_path = output_dir + "/metrics.json"
+        with gcsfs.GCSFileSystem().open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"Metrics saved to {metrics_path}")
 
-    trainer.save_checkpoint(str(output_dir / "final_checkpoint"))
+    trainer.save_checkpoint(output_dir + "/final_checkpoint")
     if wandb.run is not None:
         wandb.finish()
 

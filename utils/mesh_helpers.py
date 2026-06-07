@@ -123,27 +123,6 @@ class MeshHelper:
             mesh, rank=len(cache.seq_positions.shape), batch_axis=0
         )
         return k_spec, v_spec, pos_spec
-
-    @staticmethod
-    def init_kv_cache_on_mesh(
-        cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None
-    ) -> KVCache:
-        """Create a zero KV cache sharded on mesh without allgather.
-
-        Use this for initialization only — the cache values are ignored and
-        replaced with zeros placed directly on each device shard.
-        """
-        if mesh is None:
-            return cache
-        k_spec, v_spec, pos_spec = MeshHelper._kv_cache_specs(cache, mesh, pspec)
-        return KVCache(
-            k=MeshHelper.create_sharded_zeros(cache.k.shape, cache.k.dtype, mesh, k_spec),
-            v=MeshHelper.create_sharded_zeros(cache.v.shape, cache.v.dtype, mesh, v_spec),
-            seq_positions=MeshHelper.create_sharded_zeros(
-                cache.seq_positions.shape, cache.seq_positions.dtype, mesh, pos_spec
-            ),
-        )
-
     @staticmethod
     def place_kv_cache(
         cache: KVCache, mesh: Optional[Mesh], pspec: Optional[PS] = None

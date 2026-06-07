@@ -34,6 +34,7 @@ class GemmaCache:
         bsz: int,
         max_seqlen: int,
         dtype=jnp.bfloat16,
+        mesh=None,
     ) -> "GemmaCache":
         """Allocate an empty GemmaCache from a GemmaConfig.
 
@@ -42,16 +43,43 @@ class GemmaCache:
             bsz: Batch size.
             max_seqlen: Maximum sequence length for both sub-caches.
             dtype: Data type for cache arrays.
+            mesh: If provided, allocate shards directly on each device without
+                  an intermediate full-sized allocation.
         """
+        sliding_shape = (config.n_sliding_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim)
+        global_shape = (config.n_global_layers, bsz, config.n_global_kv_heads, max_seqlen, config.global_head_dim)
+        if mesh is not None:
+            from utils.mesh_helpers import MeshHelper
+            from jax.sharding import PartitionSpec as PS
+            dp = "dp" if "dp" in mesh.axis_names else None
+            tp = MeshHelper.get_tp_axis(mesh)
+            if dp is not None:
+                k_spec = PS(None, dp, tp, None, None)
+                pos_spec = PS(dp)
+            else:
+                k_spec = MeshHelper.batch_axis_spec(mesh, rank=5, batch_axis=1)
+                pos_spec = MeshHelper.batch_axis_spec(mesh, rank=1, batch_axis=0)
+            return cls(
+                sliding_cache=KVCache(
+                    k=MeshHelper.create_sharded_zeros(sliding_shape, dtype, mesh, k_spec),
+                    v=MeshHelper.create_sharded_zeros(sliding_shape, dtype, mesh, k_spec),
+                    seq_positions=MeshHelper.create_sharded_zeros((bsz,), jnp.int32, mesh, pos_spec),
+                ),
+                global_cache=KVCache(
+                    k=MeshHelper.create_sharded_zeros(global_shape, dtype, mesh, k_spec),
+                    v=MeshHelper.create_sharded_zeros(global_shape, dtype, mesh, k_spec),
+                    seq_positions=MeshHelper.create_sharded_zeros((bsz,), jnp.int32, mesh, pos_spec),
+                ),
+            )
         return cls(
             sliding_cache=KVCache(
-                k=jnp.zeros((config.n_sliding_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dtype),
-                v=jnp.zeros((config.n_sliding_layers, bsz, config.n_kv_heads, max_seqlen, config.head_dim), dtype=dtype),
+                k=jnp.zeros(sliding_shape, dtype=dtype),
+                v=jnp.zeros(sliding_shape, dtype=dtype),
                 seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
             ),
             global_cache=KVCache(
-                k=jnp.zeros((config.n_global_layers, bsz, config.n_global_kv_heads, max_seqlen, config.global_head_dim), dtype=dtype),
-                v=jnp.zeros((config.n_global_layers, bsz, config.n_global_kv_heads, max_seqlen, config.global_head_dim), dtype=dtype),
+                k=jnp.zeros(global_shape, dtype=dtype),
+                v=jnp.zeros(global_shape, dtype=dtype),
                 seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
             ),
         )
@@ -87,22 +115,6 @@ class GemmaCache:
                 v=self.global_cache.v[:, idx : idx + 1, :, :, :],
                 seq_positions=self.global_cache.seq_positions[idx : idx + 1],
             ),
-        )
-
-    def init_on_mesh(self, mesh) -> "GemmaCache":
-        """Create a zero-initialised GemmaCache sharded on mesh.
-
-        Use this for initial allocation only — values are replaced with
-        per-device zeros without triggering an allgather.
-
-        Args:
-            mesh: JAX device mesh.
-        """
-        from utils.mesh_helpers import MeshHelper
-
-        return GemmaCache(
-            sliding_cache=MeshHelper.init_kv_cache_on_mesh(self.sliding_cache, mesh),
-            global_cache=MeshHelper.init_kv_cache_on_mesh(self.global_cache, mesh),
         )
 
     def place_on_mesh(self, mesh) -> "GemmaCache":

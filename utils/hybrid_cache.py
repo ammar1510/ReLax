@@ -70,7 +70,7 @@ class HybridCache:
     deltanet_state: DeltaNetState
 
     @classmethod
-    def new(cls, config, bsz: int, max_cache_seqlen: int = None, dtype=jnp.bfloat16):
+    def new(cls, config, bsz: int, max_cache_seqlen: int = None, dtype=jnp.bfloat16, mesh=None):
         """Create an empty hybrid cache from a QwenConfig.
 
         Args:
@@ -78,15 +78,35 @@ class HybridCache:
             bsz: Batch size.
             max_cache_seqlen: Max sequence length for KV cache. Defaults to config.max_seqlen.
             dtype: Data type for cache arrays.
+            mesh: If provided, allocate shards directly on each device without
+                  an intermediate full-sized allocation.
         """
         if max_cache_seqlen is None:
             max_cache_seqlen = config.max_seqlen
 
-        kv = KVCache(
-            k=jnp.zeros((config.n_full_attn_layers, bsz, config.n_kv_heads, max_cache_seqlen, config.head_dim), dtype=dtype),
-            v=jnp.zeros((config.n_full_attn_layers, bsz, config.n_kv_heads, max_cache_seqlen, config.head_dim), dtype=dtype),
-            seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
-        )
+        k_shape = (config.n_full_attn_layers, bsz, config.n_kv_heads, max_cache_seqlen, config.head_dim)
+        if mesh is not None:
+            from utils.mesh_helpers import MeshHelper
+            from jax.sharding import PartitionSpec as PS
+            dp = "dp" if "dp" in mesh.axis_names else None
+            tp = MeshHelper.get_tp_axis(mesh)
+            if dp is not None:
+                k_spec = PS(None, dp, tp, None, None)
+                pos_spec = PS(dp)
+            else:
+                k_spec = MeshHelper.batch_axis_spec(mesh, rank=5, batch_axis=1)
+                pos_spec = MeshHelper.batch_axis_spec(mesh, rank=1, batch_axis=0)
+            kv = KVCache(
+                k=MeshHelper.create_sharded_zeros(k_shape, dtype, mesh, k_spec),
+                v=MeshHelper.create_sharded_zeros(k_shape, dtype, mesh, k_spec),
+                seq_positions=MeshHelper.create_sharded_zeros((bsz,), jnp.int32, mesh, pos_spec),
+            )
+        else:
+            kv = KVCache(
+                k=jnp.zeros(k_shape, dtype=dtype),
+                v=jnp.zeros(k_shape, dtype=dtype),
+                seq_positions=jnp.zeros(bsz, dtype=jnp.int32),
+            )
 
         delta = DeltaNetState.new(
             n_linear_layers=config.n_linear_attn_layers,
@@ -121,33 +141,6 @@ class HybridCache:
                 conv_state=self.deltanet_state.conv_state[:, idx : idx + 1, :, :],
             ),
         )
-
-    def init_on_mesh(self, mesh) -> "HybridCache":
-        """Create a zero-initialised HybridCache sharded on mesh.
-
-        Use this for initial allocation only — values are replaced with
-        per-device zeros without triggering an allgather.
-
-        Args:
-            mesh: JAX device mesh.
-        """
-        from utils.mesh_helpers import MeshHelper
-        kv = MeshHelper.init_kv_cache_on_mesh(self.kv_cache, mesh)
-        state_spec = MeshHelper.batch_axis_spec(
-            mesh, rank=self.deltanet_state.state.ndim, batch_axis=1
-        )
-        conv_spec = MeshHelper.batch_axis_spec(
-            mesh, rank=self.deltanet_state.conv_state.ndim, batch_axis=1
-        )
-        delta = DeltaNetState(
-            state=MeshHelper.create_sharded_zeros(
-                self.deltanet_state.state.shape, self.deltanet_state.state.dtype, mesh, state_spec
-            ),
-            conv_state=MeshHelper.create_sharded_zeros(
-                self.deltanet_state.conv_state.shape, self.deltanet_state.conv_state.dtype, mesh, conv_spec
-            ),
-        )
-        return HybridCache(kv_cache=kv, deltanet_state=delta)
 
     def place_on_mesh(self, mesh) -> "HybridCache":
         """Re-shard HybridCache onto mesh, preserving existing data.
